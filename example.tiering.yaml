@@ -1,0 +1,130 @@
+# tier.py configuration — copy to tiering.yaml and fill in plex.token.
+#
+# Container install:   /mnt/user/appdata/plex-media-tiering/tiering.yaml  (mounted as /config/tiering.yaml)
+# Bare install:        /boot/config/plugins/user.scripts/scripts/plex-media-tiering/tiering.yaml
+#
+# Plex token: see https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/
+# Generate once, paste below. Keep this file mode 600.
+
+plex:
+  url: "http://localhost:32400"
+  token: "REPLACE_WITH_YOUR_PLEX_TOKEN"
+
+libraries:
+  # Names MUST match your Plex library names exactly (case-sensitive).
+  # Add one entry per library you want scored. Mix movie and TV libraries
+  # freely — the script detects type via Plex and picks the right path.
+  - name: "Movies"
+  - name: "TV Shows"
+  # - name: "4K Movies"
+  # - name: "Anime"
+  # - name: "Kids"
+
+thresholds:
+  # WARM -> HOT when score rises above this
+  score_to_hot: 40.0
+  # HOT -> WARM when score drops below this
+  # (dead zone between the two prevents flapping)
+  score_to_warm: 20.0
+  # Never-watched items get HOT protection until they're this old
+  age_grace_days: 180
+  # Recency decay half-life for play weight
+  recency_half_life_days: 90
+  # Recency floor — any item watched within this window stays HOT
+  # regardless of raw score. Stops infrequent-but-current shows (e.g.
+  # show with one episode every few weeks) from being demoted just
+  # because the play count is low. Set to 0 or comment out to disable.
+  hot_recency_days: 730   # ~2 years
+
+# Pinning — overrides that force items to HOT regardless of score.
+# Both lists are case-insensitive. Library matching is exact; title
+# matching is substring (so "Stargate" pins SG-1, Atlantis, Universe,
+# Origins, and the movie). Pinned items show outcome=PIN_HOT.
+pinning:
+  always_hot_libraries:
+    # Examples — uncomment to enable:
+    # - "4K Movies"              # whole 4K library stays on the hot pool
+  always_hot_titles:
+    # Examples — uncomment to enable:
+    # - "The Expanse"            # any title containing 'the expanse'
+    # - "Stargate"               # catches SG-1, Atlantis, Universe, etc.
+
+# Human-readable rotating log. In the container, /config is a bind-mount to
+# /mnt/user/appdata/plex-media-tiering, so the log is readable from the Unraid GUI's
+# file manager or any SMB mount.
+logging:
+  path: "/config/tier.log"
+  level: "INFO"           # DEBUG | INFO | WARNING | ERROR
+  max_bytes: 2000000      # 2 MB per file before rotating
+  backup_count: 5         # keep 5 rotated files (tier.log.1 .. tier.log.5)
+
+# Alerting — at least one of these should be configured so you get notified
+# when the Plex token is rejected or the script crashes.
+notifications:
+  # Generic JSON webhook (Home Assistant, gotify, ntfy, Discord relay, etc.).
+  # Leave url null to disable. The POST body is:
+  #   {source, level, title, message, timestamp}
+  webhook:
+    url: null
+    auth_header: null     # e.g. "Bearer ntfy-token" or "Basic <base64>"
+
+  # Unraid's built-in notifier (shows in the GUI bell + configured agents).
+  # Container installs must bind-mount the notify script path in, OR set
+  # this to false and rely on the webhook instead.
+  unraid:
+    enabled: false
+    notify_script: "/usr/local/emhttp/webGui/scripts/notify"
+
+  # Which conditions should fire an alert
+  on_plex_unreachable: true
+  on_auth_failure: true
+  on_script_error: true
+
+# Paths — used by P1 (tier detection) and P2 (moves). Tier detection
+# activates automatically when hot_pool_mount is set AND at least one
+# array disk is known (explicit or auto-detected). If either is missing,
+# the script falls back to P0 behaviour (SHOULD_BE_* outcomes).
+paths:
+  user_share_prefix: "/mnt/user"
+  # Mount point of your HOT pool as tier.py sees it. ZFS pool, separate
+  # SSD cache, dedicated NVMe — whatever your "fast tier" lives on.
+  # Must be bind-mounted into the container.
+  hot_pool_mount: "/mnt/hot_pool"
+  # Array disks (WARM tier) as tier.py sees them. Empty list = auto-
+  # detect every /mnt/disk[0-9]* that is an actual mount point visible
+  # to the container. Populate explicitly to restrict the set.
+  array_disks: []
+  # Disks to exclude from auto-detection. Useful for retiring drives
+  # that should not accept new writes.
+  array_disk_exclude: []
+  #   - "/mnt/disk7"   # example: drive being retired
+  # Plex-to-tier filesystem path translation.
+  # Plex reports file paths as IT sees them. If Plex runs in a
+  # different container / VM / host than tier.py, those paths won't
+  # resolve locally. List longest-first; the matching plex prefix is
+  # replaced with the corresponding tier prefix.
+  plex_path_map: []
+  #   - plex: "/data/movies"   # what Plex reports
+  #     tier: "/mnt/user/Movies"  # where tier.py can actually see it
+  #   - plex: "/data/tv"
+  #     tier: "/mnt/user/TV Shows"
+
+# Capacity — not used in P0, wired up in P3.
+# Budget-aware promotion/demotion keeps the hot ZFS pool under the ceiling.
+capacity:
+  hot_pool_ceiling_pct: 80      # ZFS performance degrades past this
+  warm_disk_min_free_pct: 15    # skip array disks tighter than this
+
+# Co-location rules — P2 warm-array placement.
+# Series move as a unit; we pick ONE array disk per series so a binge
+# spins up one disk, not many.
+colocation:
+  enforce_single_disk_per_series: true
+  allow_split_fallback: true    # if no single disk fits, log + split
+
+# Safety — not used in P0, wired up in P2/P3.
+safety:
+  min_dest_free_pct: 15
+  max_move_size_per_run_gb: 500
+  refuse_if_plex_unreachable: true
+  skip_currently_playing: true

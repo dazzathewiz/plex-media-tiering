@@ -1,0 +1,194 @@
+<?xml version="1.0"?>
+<!--
+  Community Applications template for the plex-media-tiering image.
+
+  Install path: copy this file to
+    /boot/config/plugins/dockerMan/templates-user/my-plex-media-tiering.xml
+  and Unraid will render it under the Docker tab. OR submit to Community
+  Applications so it shows up in the Apps browser.
+
+  Because plex-media-tiering runs as a ONE-SHOT (the container exits after it prints the
+  report), the container is NOT meant to stay "running" in the Docker tab.
+  Expected lifecycle:
+    - Install via CA -> sets up the /config mount and the media mounts
+    - User Scripts (or cron) triggers `docker start plex-media-tiering` on schedule
+    - Container runs, writes to /config/tier.log, exits
+
+  Mount shapes mirror a Plex container so share layout stays consistent —
+  the same /data/tv, /data/movies, etc. paths Plex uses. P2+ also needs
+  direct /mnt/diskN access for co-located warm writes and direct hot-pool
+  writes; those are added as additional Path entries.
+-->
+<Container version="2">
+  <Name>plex-media-tiering</Name>
+  <Repository>dazzathewiz/plex-media-tiering:latest</Repository>
+  <Registry>https://hub.docker.com/r/dazzathewiz/plex-media-tiering</Registry>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>bash</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/dazzathewiz/plex-media-tiering/issues</Support>
+  <Project>https://github.com/dazzathewiz/plex-media-tiering</Project>
+  <Overview>
+    Plex-driven media tiering for Unraid. Scores movies and TV series by watch
+    history + age, recommends HOT (ZFS pool) vs WARM (parity array), and in
+    P2+ moves files with rsync. One-shot container — triggered on a schedule
+    by User Scripts, not a long-running service. Writes a rotating log to
+    /config/tier.log.
+  </Overview>
+  <Category>MediaApp:Other Tools:Utilities</Category>
+  <WebUI/>
+  <TemplateURL/>
+  <Icon>https://raw.githubusercontent.com/dazzathewiz/plex-media-tiering/main/icon.png</Icon>
+  <ExtraParams>--restart=no</ExtraParams>
+  <PostArgs/>
+  <CPUset/>
+  <DateInstalled/>
+  <DonateText/>
+  <DonateLink/>
+  <Requires/>
+
+  <!-- Default command: read-only analysis. Edit to add "top 50" etc. for
+       trimmed output. P2+ will add the apply flag (DO NOT set this until
+       you have eyeballed a dry run). -->
+  <Arguments>--config /config/tiering.yaml</Arguments>
+
+  <!-- ============== CONFIG VOLUME ============== -->
+  <Config
+    Name="Config"
+    Target="/config"
+    Default="/mnt/user/appdata/plex-media-tiering"
+    Mode="rw"
+    Description="Holds tiering.yaml and rotating tier.log. Edit tiering.yaml from the Unraid GUI or SMB share before first run."
+    Type="Path"
+    Display="always"
+    Required="true"
+    Mask="false">/mnt/user/appdata/plex-media-tiering</Config>
+
+  <!-- ============== MEDIA SHARES (union /mnt/user) ==============
+       These match how a Plex docker is typically configured. Plex sees
+       files under /data/..., tier sees the same tree and can use it to
+       map Plex file paths to physical disks in P1+. -->
+  <Config
+    Name="TV Shows (union share)"
+    Target="/data/tv"
+    Default="/mnt/user/TV Shows"
+    Mode="rw"
+    Description="Plex TV library share. Must match the path Plex uses so tier can correlate."
+    Type="Path"
+    Display="always"
+    Required="true"
+    Mask="false">/mnt/user/TV Shows</Config>
+
+  <Config
+    Name="Movies (union share)"
+    Target="/data/movies"
+    Default="/mnt/user/Movies"
+    Mode="rw"
+    Description="Plex Movies library share."
+    Type="Path"
+    Display="always"
+    Required="true"
+    Mask="false">/mnt/user/Movies</Config>
+
+  <!--
+  <Config
+    Name="4K Movies (union share)"
+    Target="/data/bluray"
+    Default="/mnt/user/4K Movies"
+    Mode="rw"
+    Description="Plex 4K Movies library share."
+    Type="Path"
+    Display="advanced"
+    Required="false"
+    Mask="false">/mnt/user/4K Movies</Config>
+  -->
+
+  <!--
+  <Config
+    Name="Anime (union share)"
+    Target="/data/anime"
+    Default="/mnt/user/Anime"
+    Mode="rw"
+    Description="Plex Anime library share."
+    Type="Path"
+    Display="advanced"
+    Required="false"
+    Mask="false">/mnt/user/Anime</Config>
+  -->
+
+  <!-- ============== DIRECT DISK ACCESS (P2+) ==============
+       Needed so tier can write warm files to a single /mnt/diskN (co-
+       location) and read/write the hot ZFS pool directly. Harmless in P0
+       (unused). -->
+  <Config
+    Name="Hot pool (ZFS)"
+    Target="/mnt/hot_pool"
+    Default="/mnt/hot_pool"
+    Mode="rw"
+    Description="Direct mount of the hot-tier ZFS pool. Matches paths.hot_pool_mount in tiering.yaml. Used from P1 onward."
+    Type="Path"
+    Display="advanced"
+    Required="false"
+    Mask="false">/mnt/hot_pool</Config>
+
+  <Config
+    Name="Array disks (parent)"
+    Target="/mnt/array"
+    Default="/mnt"
+    Mode="rw"
+    Description="Parent mount for /mnt/disk1, /mnt/disk2, ... Used from P2 for co-located warm-tier writes. Harmless in P0."
+    Type="Path"
+    Display="advanced"
+    Required="false"
+    Mask="false">/mnt</Config>
+
+  <!-- ============== UNRAID NOTIFIER (optional) ==============
+       Bind-mount the notify script so notifications.unraid.enabled=true
+       in tiering.yaml can reach it. Leave disabled if you're alerting
+       via webhook instead. -->
+  <Config
+    Name="Unraid notify script"
+    Target="/usr/local/emhttp/webGui/scripts/notify"
+    Default="/usr/local/emhttp/webGui/scripts/notify"
+    Mode="ro"
+    Description="Read-only bind-mount of Unraid's built-in notifier. Only needed if notifications.unraid.enabled=true."
+    Type="Path"
+    Display="advanced"
+    Required="false"
+    Mask="false">/usr/local/emhttp/webGui/scripts/notify</Config>
+
+  <!-- ============== ENV ============== -->
+  <Config
+    Name="TZ"
+    Target="TZ"
+    Default="Australia/Melbourne"
+    Mode=""
+    Description="Timezone for log timestamps."
+    Type="Variable"
+    Display="always"
+    Required="false"
+    Mask="false">Australia/Melbourne</Config>
+
+  <Config
+    Name="PUID"
+    Target="PUID"
+    Default="99"
+    Mode=""
+    Description="User ID (99=nobody on Unraid)."
+    Type="Variable"
+    Display="advanced"
+    Required="false"
+    Mask="false">99</Config>
+
+  <Config
+    Name="PGID"
+    Target="PGID"
+    Default="100"
+    Mode=""
+    Description="Group ID (100=users on Unraid)."
+    Type="Variable"
+    Display="advanced"
+    Required="false"
+    Mask="false">100</Config>
+</Container>

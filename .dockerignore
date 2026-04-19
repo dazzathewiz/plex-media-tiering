@@ -1,0 +1,33 @@
+# Repo hygiene — only ship what the container actually runs.
+.git
+.github
+.gitignore
+.dockerignore
+
+# Docs live in the repo, not the image.
+README.md
+*.md
+docs/
+
+# Config + logs never baked in; they live on the /config volume.
+tiering.yaml
+*.log
+state.json
+
+# Python build junk.
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+venv/
+.venv/
+env/
+.env
+
+# Editor / OS cruft.
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

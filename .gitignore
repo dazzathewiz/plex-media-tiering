@@ -1,0 +1,30 @@
+# Python build artefacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# Virtualenvs
+venv/
+.venv/
+env/
+.env
+
+# Real config + logs (never commit a Plex token)
+tiering.yaml
+*.log
+state.json
+*.bak
+
+# Sample output from runs
+tier-run-*.csv
+tiering.csv
+*.csv
+
+# Editor + OS cruft
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
