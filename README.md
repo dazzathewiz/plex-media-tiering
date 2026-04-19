@@ -153,11 +153,26 @@ GitHub Actions is free on public repos. The workflow builds multi-arch
   touching your account password.
 
 **Tagging strategy:**
-- `:latest` and `:main` — moving tags, auto-updated on every main push.
-  Fine for "track tip-of-branch" during development.
+
+| Event | Tags produced |
+| --- | --- |
+| Push to `main` | `:latest`, `:main`, `:sha-<short>` |
+| Push to other branch (e.g. `dev`) | `:<branch>`, `:sha-<short>` |
+| Pull request (same-repo) | `:pr-<N>`, `:sha-<short>` |
+| Git tag `v1.2.3` | `:1.2.3`, `:1.2`, `:1`, `:latest`, `:sha-<short>` |
+
+- `dazzathewiz/plex-media-tiering:latest` — stable, built from `main`.
+  Point Unraid CA here for rolling updates.
+- `dazzathewiz/plex-media-tiering:pr-<N>` — per-PR test image, useful for
+  manually testing a fix before merging.
+- `dazzathewiz/plex-media-tiering:dev` — rolling dev branch tip, if you
+  push a `dev` branch.
 - `:1.2.3` / `:1.2` / `:1` — created by pushing a `v1.2.3` git tag.
   Point CA at `:1` for patch+minor auto-updates without breaking
   changes.
+
+Fork PRs (external contributors): the workflow builds the image for CI
+validation but does not push to Docker Hub (secrets unavailable).
 
 ## Logging
 
