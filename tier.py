@@ -518,6 +518,43 @@ def translate_plex_path(plex_path: str, path_map) -> str:
     return plex_path
 
 
+def resolve_user_share(
+    path: str,
+    user_share_prefix: str,
+    hot_mount: str,
+    array_disks: List[str],
+) -> str:
+    """Resolve an Unraid user-share path to its actual tier mount point.
+
+    Unraid's FUSE user-share layer presents every file under /mnt/user/
+    regardless of which physical disk or pool backs it. After plex_path_map
+    translation, paths may still start with /mnt/user — classify_path()
+    would return UNKNOWN for all of them because it only knows about
+    hot_pool_mount and /mnt/diskN prefixes.
+
+    This function probes each candidate tier mount in order (HOT first,
+    then WARM disks) looking for <mount>/<relative-path>. First hit wins
+    and the resolved path is returned. If nothing matches, the original
+    path is returned unchanged so classify_path() marks it UNKNOWN.
+
+    Pipeline: translate_plex_path → resolve_user_share → classify_path
+    """
+    if not user_share_prefix or not path:
+        return path
+    prefix = user_share_prefix.rstrip("/") + "/"
+    if not path.startswith(prefix):
+        return path
+    rel = path[len(prefix):]
+    candidates = ([hot_mount] if hot_mount else []) + list(array_disks or [])
+    for mount in candidates:
+        if not mount:
+            continue
+        probe = os.path.join(mount, rel)
+        if os.path.exists(probe):
+            return probe
+    return path
+
+
 def classify_path(
     path: str, hot_mount: str, array_disks: List[str]
 ) -> str:
@@ -544,6 +581,7 @@ def resolve_item_current_tier(
     path_map,
     hot_mount: str,
     array_disks: List[str],
+    user_share_prefix: str = "",
 ) -> Tuple[str, dict]:
     """Majority-bytes rollup of tier for a multi-part item.
 
@@ -566,7 +604,8 @@ def resolve_item_current_tier(
             continue
         total += size
         translated = translate_plex_path(plex_path or "", path_map)
-        tier = classify_path(translated, hot_mount, array_disks)
+        resolved = resolve_user_share(translated, user_share_prefix, hot_mount, array_disks)
+        tier = classify_path(resolved, hot_mount, array_disks)
         totals[tier] += size
     if total == 0:
         return "UNKNOWN", {"HOT": 0.0, "WARM": 0.0, "UNKNOWN": 0.0}
@@ -875,6 +914,7 @@ def _show_history_fallback(show) -> tuple[int, Optional[datetime]]:
 def collect_movies(
     section, library_name: str, now, thresholds, history_index: dict,
     path_map, hot_mount: str, array_disks: List[str],
+    user_share_prefix: str = "",
 ) -> Iterable[Item]:
     # Group by guid to dedupe multi-version uploads (e.g. 4K Extended +
     # 4K + 1080p versions of the same movie that weren't merged in Plex).
@@ -935,7 +975,7 @@ def collect_movies(
             for m in group:
                 parts.extend(_media_parts(getattr(m, "media", None)))
             current_tier, tier_split = resolve_item_current_tier(
-                parts, path_map, hot_mount, array_disks,
+                parts, path_map, hot_mount, array_disks, user_share_prefix,
             )
             if tier_split:
                 breakdown["tier_split"] = tier_split
@@ -959,6 +999,7 @@ def collect_movies(
 def collect_series(
     section, library_name: str, now, thresholds, history_index: dict,
     path_map, hot_mount: str, array_disks: List[str],
+    user_share_prefix: str = "",
 ) -> Iterable[Item]:
     tier_probing = bool(hot_mount) and bool(array_disks)
 
@@ -1026,7 +1067,7 @@ def collect_series(
             for ep in episodes:
                 parts.extend(_media_parts(getattr(ep, "media", None)))
             current_tier, tier_split = resolve_item_current_tier(
-                parts, path_map, hot_mount, array_disks,
+                parts, path_map, hot_mount, array_disks, user_share_prefix,
             )
             if tier_split:
                 breakdown["tier_split"] = tier_split
@@ -1135,6 +1176,7 @@ def collect_all(plex: PlexServer, cfg: dict, filter_libraries) -> List[Item]:
     hot_mount = (paths_cfg.get("hot_pool_mount") or "").rstrip("/")
     array_disks = resolve_array_disks(cfg)
     path_map = paths_cfg.get("plex_path_map") or []
+    user_share_prefix = (paths_cfg.get("user_share_prefix") or "").rstrip("/")
 
     if hot_mount and array_disks:
         log.info(
@@ -1148,6 +1190,8 @@ def collect_all(plex: PlexServer, cfg: dict, filter_libraries) -> List[Item]:
                 "No plex_path_map configured — assuming Plex paths match "
                 "tier.py's view directly."
             )
+        if user_share_prefix:
+            log.info("User-share resolution enabled: prefix=%s", user_share_prefix)
     else:
         log.info(
             "Tier detection disabled (hot_pool_mount=%r, array_disks=%d). "
@@ -1169,14 +1213,14 @@ def collect_all(plex: PlexServer, cfg: dict, filter_libraries) -> List[Item]:
             items.extend(
                 collect_movies(
                     section, name, now, cfg["thresholds"], history_index,
-                    path_map, hot_mount, array_disks,
+                    path_map, hot_mount, array_disks, user_share_prefix,
                 )
             )
         elif section.type == "show":
             items.extend(
                 collect_series(
                     section, name, now, cfg["thresholds"], history_index,
-                    path_map, hot_mount, array_disks,
+                    path_map, hot_mount, array_disks, user_share_prefix,
                 )
             )
         else:
@@ -1554,5 +1598,50 @@ def main() -> int:
         return 4
 
 
+def _test_resolve_user_share():
+    """Inline test: resolve_user_share picks the disk that actually has the file.
+
+    Run with: python3 tier.py --_test
+    (hooked via _maybe_run_tests below)
+    """
+    import tempfile, os as _os
+
+    with tempfile.TemporaryDirectory() as root:
+        # Simulate /mnt/disk1, /mnt/disk3 (disk2 absent), /mnt/hot_pool
+        disk1 = _os.path.join(root, "disk1")
+        disk3 = _os.path.join(root, "disk3")
+        hot   = _os.path.join(root, "hot_pool")
+        for d in (disk1, disk3, hot):
+            _os.makedirs(_os.path.join(d, "Movies"), exist_ok=True)
+
+        # Place the file only on disk3
+        target = _os.path.join(disk3, "Movies", "Foo.mkv")
+        open(target, "w").close()
+
+        user_prefix = "/mnt/user"
+        plex_path    = "/mnt/user/Movies/Foo.mkv"
+        array_disks  = [disk1, disk3]
+
+        result = resolve_user_share(plex_path, user_prefix, hot, array_disks)
+        assert result == target, f"expected {target!r}, got {result!r}"
+
+        # File absent everywhere → original path returned unchanged
+        missing = resolve_user_share("/mnt/user/Movies/Gone.mkv", user_prefix, hot, array_disks)
+        assert missing == "/mnt/user/Movies/Gone.mkv", f"expected original path, got {missing!r}"
+
+        # Non-user-share path → no-op
+        direct = resolve_user_share("/mnt/hot_pool/Movies/Bar.mkv", user_prefix, hot, array_disks)
+        assert direct == "/mnt/hot_pool/Movies/Bar.mkv"
+
+        # Empty prefix → no-op
+        noop = resolve_user_share(plex_path, "", hot, array_disks)
+        assert noop == plex_path
+
+    print("_test_resolve_user_share: OK")
+
+
 if __name__ == "__main__":
+    if "--_test" in sys.argv:
+        _test_resolve_user_share()
+        sys.exit(0)
     sys.exit(main())
