@@ -201,7 +201,7 @@ Rotation: 2 MB per file, 5 backups retained. Tune via `logging:` in
 - **Unraid File Manager tab** (built in since 6.12) — navigate to
   `appdata/plex-media-tiering/tier.log`, preview in-browser. Easiest for quick checks.
 - **`docker logs plex-media-tiering`** from the Docker tab → pencil icon → Log. Shows
-  the same content via the container's stream handler.
+  all INFO lines including the startup messages and the projected-tier footer.
 - **SMB share** — `\\<your-unraid-host>\appdata\plex-media-tiering\tier.log` if you
   prefer a desktop text editor.
 - **P5 future:** a small built-in HTTP log viewer exposed on a container
