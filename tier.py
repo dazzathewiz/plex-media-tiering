@@ -180,7 +180,7 @@ def setup_logging(cfg: dict, quiet: bool = False) -> None:
         )
 
     if not quiet:
-        ch = logging.StreamHandler(sys.stderr)
+        ch = logging.StreamHandler(sys.stdout)
         ch.setFormatter(fmt)
         log.addHandler(ch)
 
