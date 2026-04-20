@@ -161,7 +161,7 @@ This means a user can deploy the P1 image against a legacy P0 config
 with zero outcome regression. Don't break this by making tier detection
 mandatory.
 
-### Plex path translation
+### Plex path translation + Unraid user-share resolution
 
 Plex reports file paths **as Plex sees them**. If Plex runs in a
 separate container / VM / host, those paths won't resolve on the host
@@ -172,6 +172,27 @@ containers.
 
 `translate_plex_path()` does longest-prefix-wins replacement via
 `paths.plex_path_map`. Empty map = no translation = assumes paths match.
+
+After translation, paths that still start with `paths.user_share_prefix`
+(default `/mnt/user`) are handled by a second step: `resolve_user_share()`
+probes each candidate tier mount (HOT first, then each WARM disk) for the
+file's existence and returns the first path that resolves. This is
+necessary on Unraid because Plex is typically given user-share paths
+(`/mnt/user/Movies/…`) regardless of which physical disk backs a file —
+`classify_path()` only knows real mount prefixes, so without this step
+every translated path would return UNKNOWN.
+
+The full per-file pipeline is:
+
+```text
+translate_plex_path → resolve_user_share → classify_path
+```
+
+`resolve_user_share()` is a no-op when `user_share_prefix` is empty or
+the path doesn't start with that prefix, so non-Unraid setups are
+unaffected. If a file doesn't exist on any probed mount the original
+(unresolved) path is returned and `classify_path()` marks it UNKNOWN,
+preserving graceful degradation.
 
 ## Config shape
 
