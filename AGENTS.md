@@ -243,6 +243,16 @@ revocation event, not a quick fix.
 
 ### Before committing
 
+#### Automated in CI
+
+Every push and pull request targeting `main` runs `.github/workflows/test.yml`,
+which executes the three checks below automatically. A failing check blocks
+PR merge (once branch protection is enabled). You do not need to run these
+as a manual ritual, but running them locally first gives a fast-fail loop
+before waiting for CI.
+
+#### Run locally before pushing
+
 ```bash
 # 1. Compile check
 python3 -m py_compile tier.py
@@ -250,9 +260,8 @@ python3 -m py_compile tier.py
 # 2. YAML validity
 python3 -c "import yaml; yaml.safe_load(open('example.tiering.yaml'))"
 
-# 3. No personal info leaking back in
-grep -iE "your|personal|information" tier.py example.tiering.yaml README.md
-#    should return nothing
+# 3. Inline test harness
+python3 tier.py --_test
 ```
 
 When adding non-trivial logic (scoring tweak, new outcome, path handling),
