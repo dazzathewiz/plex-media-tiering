@@ -12,6 +12,9 @@ Phase status:
   P0  (done)        Read-only analysis from Plex catalog + watch history.
   P0.1 (done)       Pinning (library + title), recency floor, projected-
                     tier footer.
+  P0.4 (done)       Added-date floor — promote recently-added movies and
+                    TV shows with fresh episodes to HOT regardless of
+                    play count.
   P1  (this file)   Filesystem probing to detect current tier. Auto-
                     detects array disks, translates Plex-side paths via
                     plex_path_map, rolls multi-part items up by bytes.
@@ -50,7 +53,7 @@ import traceback
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
@@ -88,6 +91,12 @@ DEFAULT_CONFIG = {
         # regardless of raw score. Stops active-but-infrequent shows from
         # being demoted just because the play count is low.
         "hot_recency_days": 730,  # ~2 years
+        # Added-date floor — items added to Plex within this window are
+        # promoted to HOT even if never watched. Plex surfaces recently-
+        # added media on the home screen for roughly this long; tier them
+        # accordingly. Set to 0 or null to disable.
+        "added_floor_days_movies": 45,
+        "added_floor_days_tv": 30,
     },
     "pinning": {
         # Libraries whose contents should stay HOT unconditionally.
@@ -317,6 +326,8 @@ class Item:
     current_tier: str = "UNKNOWN"  # 'HOT' | 'WARM' | 'UNKNOWN'
     # --- decision ---
     outcome: str = "NEUTRAL"       # See decide_outcome() for P0 values
+    # --- added-date floor flag (set by collect_* if floor threshold met) ---
+    recently_added: bool = False
     # --- for --explain ---
     score_breakdown: dict = field(default_factory=dict)
 
@@ -911,6 +922,35 @@ def _show_history_fallback(show) -> tuple[int, Optional[datetime]]:
     return plays, last
 
 
+def _build_recently_active_shows(section, thresholds: dict) -> set:
+    """Return int ratingKeys of shows that have episodes added within the floor window.
+
+    ONE section.search() call per TV library — O(1) per show, avoids
+    iterating show.episodes() which would be thousands of API calls.
+    Returns empty set if added_floor_days_tv is 0/null or the call fails.
+    """
+    days = thresholds.get("added_floor_days_tv")
+    if not days:
+        return set()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=int(days))
+    try:
+        # plexapi compares addedAt__gte against the stored string form of a
+        # Unix timestamp — passing a datetime causes a str >= datetime
+        # TypeError. int seconds is the only form that works.
+        recent_eps = section.search(libtype="episode", addedAt__gte=int(cutoff.timestamp()))
+        return {
+            int(ep.grandparentRatingKey)
+            for ep in recent_eps
+            if getattr(ep, "grandparentRatingKey", None) is not None
+        }
+    except Exception as e:  # noqa: BLE001
+        log.warning(
+            "Added-floor TV search failed for section %r: %s — floor disabled for this section",
+            section.title, e,
+        )
+        return set()
+
+
 def collect_movies(
     section, library_name: str, now, thresholds, history_index: dict,
     path_map, hot_mount: str, array_disks: List[str],
@@ -967,6 +1007,13 @@ def collect_movies(
 
         score, breakdown = heat_score(plays, last, added, now, thresholds)
 
+        # Added-date floor: flag if added within the threshold window.
+        added_floor_days = int(thresholds.get("added_floor_days_movies") or 0)
+        recently_added = bool(
+            added_floor_days
+            and (now - _as_utc(added)).days <= added_floor_days
+        )
+
         # Current tier (P1). Probes only if tier detection is configured.
         current_tier = "UNKNOWN"
         tier_split: Optional[dict] = None
@@ -992,6 +1039,7 @@ def collect_movies(
             score=score,
             current_tier=current_tier,
             outcome="NEUTRAL",  # finalised in post-scoring override pass
+            recently_added=recently_added,
             score_breakdown=breakdown,
         )
 
@@ -1000,6 +1048,7 @@ def collect_series(
     section, library_name: str, now, thresholds, history_index: dict,
     path_map, hot_mount: str, array_disks: List[str],
     user_share_prefix: str = "",
+    recently_active_shows: Optional[set] = None,
 ) -> Iterable[Item]:
     tier_probing = bool(hot_mount) and bool(array_disks)
 
@@ -1059,6 +1108,12 @@ def collect_series(
 
         score, breakdown = heat_score(plays, last, added, now, thresholds)
 
+        # Added-date floor: show is "recently active" if any episode was
+        # added within the threshold window (checked via pre-built set).
+        recently_added = bool(
+            recently_active_shows and rk is not None and rk in recently_active_shows
+        )
+
         # Current tier (P1): majority-bytes rollup across every episode.
         current_tier = "UNKNOWN"
         tier_split: Optional[dict] = None
@@ -1084,6 +1139,7 @@ def collect_series(
             score=score,
             current_tier=current_tier,
             outcome="NEUTRAL",  # finalised in post-scoring override pass
+            recently_added=recently_added,
             score_breakdown=breakdown,
         )
 
@@ -1101,9 +1157,10 @@ def _compute_recommendation(
     Precedence (highest wins):
       1. Library pin       -> HOT, pinned=True
       2. Title pin         -> HOT, pinned=True
-      3. Recency floor     -> HOT if last_played within hot_recency_days
-                              AND raw recommendation is NEUTRAL or WARM.
+      3. Added floor       -> HOT if item.recently_added is True
       4. Raw score         -> HOT / WARM / NEUTRAL via score_recommendation.
+      5. Recency floor     -> HOT if last_played within hot_recency_days
+                              AND raw recommendation is NEUTRAL or WARM.
     """
     pinning = cfg.get("pinning") or {}
     thresholds = cfg.get("thresholds") or {}
@@ -1127,10 +1184,24 @@ def _compute_recommendation(
         if needle_hit:
             return "HOT", True, f"pinned title match: {needle_hit!r}"
 
-    # --- 3. Raw score ---
+    # --- 3. Added-date floor (only promotes, never demotes) ---
+    if item.recently_added:
+        if item.kind == "movie":
+            days_since_added = (now - _as_utc(item.added)).days
+            threshold = thresholds.get("added_floor_days_movies", 45)
+            reason = (
+                f"added-date floor: added {days_since_added}d ago "
+                f"(<= added_floor_days_movies={threshold})"
+            )
+        else:
+            threshold = thresholds.get("added_floor_days_tv", 30)
+            reason = f"added-date floor: recent episode (<= added_floor_days_tv={threshold})"
+        return "HOT", False, reason
+
+    # --- 4. Raw score ---
     raw_rec = score_recommendation(item.score, thresholds)
 
-    # --- 4. Recency floor (only promotes, never demotes) ---
+    # --- 5. Recency floor (only promotes, never demotes) ---
     recency_days = thresholds.get("hot_recency_days")
     if (
         recency_days
@@ -1199,6 +1270,10 @@ def collect_all(plex: PlexServer, cfg: dict, filter_libraries) -> List[Item]:
             hot_mount, len(array_disks),
         )
 
+    thresholds = cfg["thresholds"]
+    floor_movie_count = 0
+    floor_series_count = 0
+
     items: List[Item] = []
     for lib_cfg in cfg["libraries"]:
         name = lib_cfg["name"] if isinstance(lib_cfg, dict) else lib_cfg
@@ -1210,24 +1285,36 @@ def collect_all(plex: PlexServer, cfg: dict, filter_libraries) -> List[Item]:
             print(f"! Could not open library '{name}': {e}", file=sys.stderr)
             continue
         if section.type == "movie":
-            items.extend(
+            new_items = list(
                 collect_movies(
-                    section, name, now, cfg["thresholds"], history_index,
+                    section, name, now, thresholds, history_index,
                     path_map, hot_mount, array_disks, user_share_prefix,
                 )
             )
+            floor_movie_count += sum(1 for it in new_items if it.recently_added)
+            items.extend(new_items)
         elif section.type == "show":
-            items.extend(
+            recently_active_shows = _build_recently_active_shows(section, thresholds)
+            floor_series_count += len(recently_active_shows)
+            new_items = list(
                 collect_series(
-                    section, name, now, cfg["thresholds"], history_index,
+                    section, name, now, thresholds, history_index,
                     path_map, hot_mount, array_disks, user_share_prefix,
+                    recently_active_shows=recently_active_shows,
                 )
             )
+            items.extend(new_items)
         else:
             print(
                 f"! Library '{name}' has unsupported type '{section.type}', skipping",
                 file=sys.stderr,
             )
+
+    if thresholds.get("added_floor_days_movies") or thresholds.get("added_floor_days_tv"):
+        log.info(
+            "Added-floor: %d movies + %d series with recent activity",
+            floor_movie_count, floor_series_count,
+        )
 
     # Post-scoring override pass. Done here (not per-collector) so both
     # movie and series paths share the same rule engine and the summary
@@ -1548,6 +1635,13 @@ def _run(args) -> int:
             f"{k}={v}" for k, v in sorted(s["outcomes"].items())
         )
         log.info("  Outcome counts: %s", outcomes_str)
+        thresholds = cfg["thresholds"]
+        if thresholds.get("added_floor_days_movies") or thresholds.get("added_floor_days_tv"):
+            floor_promotions = sum(
+                1 for it in items
+                if "added-date floor" in it.score_breakdown.get("override", "")
+            )
+            log.info("  Added-floor promotions: %d items", floor_promotions)
 
     return 0
 
@@ -1640,8 +1734,172 @@ def _test_resolve_user_share():
     print("_test_resolve_user_share: OK")
 
 
+def _make_cfg(extra_thresholds=None):
+    """Minimal config dict for test harness."""
+    t = {
+        "score_to_hot": 40.0,
+        "score_to_warm": 20.0,
+        "recency_half_life_days": 90,
+        "age_grace_days": 180,
+        "added_floor_days_movies": 45,
+        "added_floor_days_tv": 30,
+    }
+    if extra_thresholds:
+        t.update(extra_thresholds)
+    return {"pinning": {}, "thresholds": t}
+
+
+def _make_item(**kwargs):
+    """Build an Item with sensible defaults for test harness."""
+    now = datetime.now(timezone.utc)
+    defaults = dict(
+        title="Test Item", year=2024, kind="movie", library="Movies",
+        plays=0, last_played=None,
+        added=now - timedelta(days=200),
+        size_bytes=1_000_000_000,
+        score=25.0,
+        recently_added=False,
+    )
+    defaults.update(kwargs)
+    return Item(**defaults)
+
+
+def _test_added_floor_movie_recent():
+    """movie addedAt=10d ago, 0 plays, score=25 (NEUTRAL) -> HOT via floor"""
+    now = datetime.now(timezone.utc)
+    item = _make_item(added=now - timedelta(days=10), score=25.0, recently_added=True)
+    rec, pinned, reason = _compute_recommendation(item, _make_cfg(), now)
+    assert rec == "HOT", f"expected HOT, got {rec}"
+    assert not pinned
+    assert reason and "added-date floor" in reason
+    print("_test_added_floor_movie_recent: OK")
+
+
+def _test_added_floor_movie_old():
+    """movie addedAt=100d ago -> floor does NOT engage; score=0 -> WARM"""
+    now = datetime.now(timezone.utc)
+    item = _make_item(added=now - timedelta(days=100), score=0.0, recently_added=False)
+    rec, pinned, reason = _compute_recommendation(item, _make_cfg(), now)
+    assert rec == "WARM", f"expected WARM, got {rec}"
+    assert not pinned
+    assert reason is None
+    print("_test_added_floor_movie_old: OK")
+
+
+def _test_added_floor_tv_recent_episode():
+    """show.addedAt=2y ago, recently_added=True (episode 5d ago), 0 plays -> HOT"""
+    now = datetime.now(timezone.utc)
+    item = _make_item(
+        kind="series", library="TV Shows",
+        added=now - timedelta(days=730), score=0.0, recently_added=True,
+    )
+    rec, pinned, reason = _compute_recommendation(item, _make_cfg(), now)
+    assert rec == "HOT", f"expected HOT, got {rec}"
+    assert not pinned
+    assert reason and "added-date floor" in reason
+    print("_test_added_floor_tv_recent_episode: OK")
+
+
+def _test_added_floor_tv_no_recent():
+    """show with no recent episodes -> floor does NOT engage; score=0 -> WARM"""
+    now = datetime.now(timezone.utc)
+    item = _make_item(
+        kind="series", library="TV Shows",
+        added=now - timedelta(days=730), score=0.0, recently_added=False,
+    )
+    rec, pinned, reason = _compute_recommendation(item, _make_cfg(), now)
+    assert rec == "WARM", f"expected WARM, got {rec}"
+    assert not pinned
+    assert reason is None
+    print("_test_added_floor_tv_no_recent: OK")
+
+
+def _test_added_floor_disabled():
+    """added_floor_days_movies=0, recently_added=False, score=25 -> NEUTRAL"""
+    now = datetime.now(timezone.utc)
+    item = _make_item(
+        added=now - timedelta(days=5), score=25.0, recently_added=False,
+    )
+    cfg = _make_cfg({"added_floor_days_movies": 0, "added_floor_days_tv": 0})
+    rec, pinned, reason = _compute_recommendation(item, cfg, now)
+    assert rec == "NEUTRAL", f"expected NEUTRAL, got {rec}"
+    assert not pinned
+    assert reason is None
+    print("_test_added_floor_disabled: OK")
+
+
+def _test_added_floor_preserves_pin():
+    """library-pinned + recently_added=True -> pinned=True, outcome=PIN_HOT"""
+    now = datetime.now(timezone.utc)
+    item = _make_item(
+        library="4K Movies", added=now, score=25.0, recently_added=True,
+    )
+    cfg = _make_cfg()
+    cfg["pinning"] = {"always_hot_libraries": ["4K Movies"]}
+    rec, pinned, reason = _compute_recommendation(item, cfg, now)
+    assert pinned, "expected pinned=True"
+    assert "pinned library" in (reason or "")
+    outcome = _combine_outcome("UNKNOWN", rec, pinned)
+    assert outcome == "PIN_HOT", f"expected PIN_HOT, got {outcome}"
+    print("_test_added_floor_preserves_pin: OK")
+
+
+def _test_added_floor_never_demotes():
+    """recently_added=True, no plays, no hot_recency -> floor fires, outcome=HOT"""
+    now = datetime.now(timezone.utc)
+    item = _make_item(
+        kind="series", library="TV Shows",
+        added=now - timedelta(days=365), score=0.0, recently_added=True,
+        last_played=None,
+    )
+    cfg = _make_cfg({"hot_recency_days": 730})
+    rec, pinned, reason = _compute_recommendation(item, cfg, now)
+    assert rec == "HOT", f"expected HOT, got {rec}"
+    assert not pinned
+    assert reason and "added-date floor" in reason
+    print("_test_added_floor_never_demotes: OK")
+
+
+def _test_added_floor_tv_search_uses_int_timestamp():
+    """_build_recently_active_shows must pass int Unix timestamp to addedAt__gte.
+
+    plexapi's filter evaluation compares addedAt__gte against the stored string
+    form of a Unix timestamp. Passing a datetime object causes:
+      TypeError: '>=' not supported between instances of 'str' and 'datetime.datetime'
+    Only int seconds avoids this — the check here guards against regression.
+    """
+    captured = {}
+
+    class _FakeEp:
+        grandparentRatingKey = 99
+
+    class _FakeSection:
+        title = "TV Shows"
+
+        def search(self, **kwargs):
+            captured.update(kwargs)
+            return [_FakeEp()]
+
+    result = _build_recently_active_shows(_FakeSection(), {"added_floor_days_tv": 30})
+
+    assert "addedAt__gte" in captured, "addedAt__gte not passed to section.search"
+    assert isinstance(captured["addedAt__gte"], int), (
+        f"addedAt__gte must be int (Unix seconds), got {type(captured['addedAt__gte']).__name__}"
+    )
+    assert result == {99}
+    print("_test_added_floor_tv_search_uses_int_timestamp: OK")
+
+
 if __name__ == "__main__":
     if "--_test" in sys.argv:
         _test_resolve_user_share()
+        _test_added_floor_movie_recent()
+        _test_added_floor_movie_old()
+        _test_added_floor_tv_recent_episode()
+        _test_added_floor_tv_no_recent()
+        _test_added_floor_disabled()
+        _test_added_floor_preserves_pin()
+        _test_added_floor_never_demotes()
+        _test_added_floor_tv_search_uses_int_timestamp()
         sys.exit(0)
     sys.exit(main())

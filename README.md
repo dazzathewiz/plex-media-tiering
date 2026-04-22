@@ -15,6 +15,7 @@ prints the analysis table. It still doesn't move anything — that's P2.
 |-------|--------------|--------|
 | P0 | Plex connect + scoring + table output. Read-only. | **Done** |
 | P0.1 | Pinning (library + title), recency floor, projected-tier footer. | **Done** |
+| P0.4 | Added-date floor — promote recently-added movies and TV shows with fresh episodes to HOT. | **Done** |
 | P1 | Filesystem probing to detect current tier. Auto-detect array disks + Plex path translation. Majority-bytes rollup. | **Done** |
 | P0.2 | Collection-aware grouping (Harry Potter, Hunger Games, etc.). | Pending |
 | P2 | `--apply` with rsync moves + Plex rescan. | Pending |
@@ -306,9 +307,9 @@ at least one array disk is known (either listed explicitly in `paths.array_disks
 or found by auto-detect). If either is missing, outcomes degrade to
 `SHOULD_BE_*` / `NEUTRAL` so the script stays useful in a bare-P0 config.
 
-### Overrides: pinning + recency floor
+### Overrides: pinning + recency + added floors
 
-Three ways to force HOT regardless of raw score, evaluated in this order:
+Five-step precedence applied after scoring (highest wins):
 
 1. **`pinning.always_hot_libraries`** — list of library names (case-insensitive
    exact match). Every item in those libraries is `PIN_HOT`. Useful for things
@@ -317,16 +318,40 @@ Three ways to force HOT regardless of raw score, evaluated in this order:
    Any item whose title contains one of these is `PIN_HOT`. Great for long-tail
    favourites — pinning `"Stargate"` catches SG-1, Atlantis, Universe, Origins
    and the movie in a single entry.
-3. **`thresholds.hot_recency_days`** — recency floor. If a show or movie was
-   last played within this window, it's promoted to `SHOULD_BE_HOT` even if
-   the raw score lands in `NEUTRAL` or `SHOULD_BE_WARM`. This catches
-   infrequent-but-active shows (one episode every few weeks) that the play-
-   weighted score otherwise demotes. Default: `730` (≈2 years). Set to `0` or
-   comment out to disable.
+3. **Added-date floor** — promote-only, never demotes. See below.
+4. Raw score → HOT / WARM / NEUTRAL.
+5. **`thresholds.hot_recency_days`** — recency floor. If a show or movie was
+   last played within this window, it's promoted to HOT even if the raw score
+   lands in NEUTRAL or WARM. This catches infrequent-but-active shows (one
+   episode every few weeks) that the play-weighted score otherwise demotes.
+   Default: `730` (≈2 years). Set to `0` or comment out to disable.
 
-Pinned and recency-floor promotions tag the `score_breakdown` with an
-`override` key so `--explain` shows why the item was promoted past its raw
-score.
+Pinning and floor promotions tag the `score_breakdown` with an `override` key
+so `--explain` shows why the item was promoted past its raw score.
+
+#### Added-date floor
+
+Items added to Plex recently are likely to be watched regardless of their
+release year. The added-date floor promotes them to HOT without requiring any
+play history.
+
+- **Movies**: if `movie.addedAt` is within `thresholds.added_floor_days_movies`
+  days, the movie is promoted to HOT. Default: `45`.
+- **TV shows**: if any episode in the show was added within
+  `thresholds.added_floor_days_tv` days, the show is promoted to HOT. This
+  catches currently-airing series whose show-level `addedAt` is old but whose
+  episodes are fresh. Default: `30`.
+
+Set either threshold to `0` or `null` to disable it for that media type.
+
+```yaml
+thresholds:
+  added_floor_days_movies: 45   # movies added within 45 days -> HOT
+  added_floor_days_tv: 30       # TV show with episode added within 30 days -> HOT
+```
+
+The footer line `Added-floor promotions: N items` in the run log counts how
+many items were promoted by this rule.
 
 ## Tier detection (P1)
 
