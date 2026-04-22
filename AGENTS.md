@@ -40,6 +40,7 @@ CLAUDE.md and GEMINI.md are symlinks to this file.
 |---|---|---|
 | P0   | Plex catalog + history + scoring + table output, read-only | Done |
 | P0.1 | Pinning (library + title), recency floor, projected-tier footer | Done |
+| P0.4 | Added-date floor — promote recently-added movies and TV shows with fresh episodes to HOT | Done |
 | P1   | Filesystem tier detection, path translation, majority-bytes rollup | Done |
 | P0.2 | Collection-aware grouping (Harry Potter, etc.) | Pending |
 | P2   | `--apply`: rsync moves + Plex rescan | Pending |
@@ -113,13 +114,56 @@ the `year` field. Cosmetic only — doesn't affect scoring.
 
 1. Library pin (case-insensitive exact match on library name) → HOT + pinned
 2. Title pin (case-insensitive substring) → HOT + pinned
-3. Raw score → HOT / WARM / NEUTRAL
-4. Recency floor (only if raw rec was NEUTRAL or WARM, and last_played is
+3. Added-date floor (if `item.recently_added`) → HOT
+4. Raw score → HOT / WARM / NEUTRAL
+5. Recency floor (only if raw rec was NEUTRAL or WARM, and last_played is
    within `hot_recency_days`) → HOT
 
-Pinning wins over everything. Recency floor only *promotes*, never demotes
-— this is important for sanity: pinning never gets overridden by score
-decay, but recency can't drag a pinned item into WARM either.
+Pinning wins over everything. Both floors are promote-only, never demote.
+The added-date floor sits above raw score so NEUTRAL items get promoted
+before the score check. Recency floor sits below raw score and only fires
+when the score alone didn't reach HOT.
+
+### Two-floor promotion model
+
+There are two independent promote-only floors, both set in `thresholds:`.
+Neither can demote an item. Either can be disabled by setting its value to
+`0` or `null`.
+
+**Recency floor** (`hot_recency_days`): keyed off *playback*. If an item
+was last watched within the window, it is promoted to HOT. Designed for
+infrequent-but-active shows that the play-weighted score would otherwise
+demote (one episode every few weeks scores low, but the user is clearly
+watching it).
+
+**Added-date floor** (`added_floor_days_movies` / `added_floor_days_tv`):
+keyed off *Plex catalog additions*. If a movie was added recently, or if
+any episode in a TV show was added recently, the item is promoted to HOT
+without requiring any play history. Rationale: Plex surfaces recently-added
+media on the home screen for roughly this long, and users are likely to
+watch new additions regardless of their release year.
+
+The two floors are mutually independent — an item can qualify for both,
+either, or neither. The added-date floor takes precedence over raw score
+(step 3 before step 4) so it fires even on NEUTRAL-score items. The
+recency floor fires after raw score (step 5) so it only promotes items the
+score didn't already put in HOT.
+
+#### TV performance note
+
+The added-date floor for TV must NOT iterate `show.episodes()` per show —
+that is thousands of API calls on a large library. Instead, one call per
+TV library section:
+
+```python
+cutoff = datetime.now(timezone.utc) - timedelta(days=added_floor_days_tv)
+recent_eps = section.search(libtype="episode", addedAt__gte=cutoff)
+recently_active_shows = {int(ep.grandparentRatingKey) for ep in recent_eps}
+```
+
+`_build_recently_active_shows()` encapsulates this. The resulting set is
+passed into `collect_series()` as `recently_active_shows` and looked up
+O(1) per show via `show.ratingKey in recently_active_shows`.
 
 ### Tier rollup: majority of bytes
 

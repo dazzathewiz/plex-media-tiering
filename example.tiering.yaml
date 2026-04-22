@@ -35,6 +35,14 @@ thresholds:
   # show with one episode every few weeks) from being demoted just
   # because the play count is low. Set to 0 or comment out to disable.
   hot_recency_days: 730   # ~2 years
+  # Added-date floor — items added to Plex within this window are
+  # promoted to HOT even if never watched. Plex surfaces recently-added
+  # media on the home screen for roughly this long; tier them accordingly.
+  # TV floor fires when ANY episode in the show was added within the
+  # window (catches currently-airing shows whose show-level addedAt is
+  # old). Set to 0 or null to disable.
+  added_floor_days_movies: 45   # movies added within 45 days -> HOT
+  added_floor_days_tv: 30       # TV show with episode added within 30 days -> HOT
 
 # Pinning — overrides that force items to HOT regardless of score.
 # Both lists are case-insensitive. Library matching is exact; title
