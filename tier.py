@@ -12,6 +12,8 @@ Phase status:
   P0  (done)        Read-only analysis from Plex catalog + watch history.
   P0.1 (done)       Pinning (library + title), recency floor, projected-
                     tier footer.
+  P0.3 (done)       Collection pin — force every member of a named Plex
+                    collection to HOT via pinned_collections: config.
   P0.4 (done)       Added-date floor — promote recently-added movies and
                     TV shows with fresh episodes to HOT regardless of
                     play count.
@@ -107,6 +109,11 @@ DEFAULT_CONFIG = {
         # Universe, Origins, and the movie.
         "always_hot_titles": [],
     },
+    # Named Plex collections to force-promote to HOT. Each entry requires
+    # both library (exact Plex name) and name (exact collection title) to
+    # disambiguate — collection names are per-section in Plex, so the same
+    # name can exist in different libraries. Empty list = feature off.
+    "pinned_collections": [],
     "paths": {
         "user_share_prefix": "/mnt/user",
         # Mount point of the HOT pool as seen by THIS script (tier.py).
@@ -326,6 +333,9 @@ class Item:
     current_tier: str = "UNKNOWN"  # 'HOT' | 'WARM' | 'UNKNOWN'
     # --- decision ---
     outcome: str = "NEUTRAL"       # See decide_outcome() for P0 values
+    # --- collection-pin support ---
+    rating_key: Optional[int] = None  # Plex ratingKey; used by collect_all for collection lookup
+    collection_pinned: bool = False   # True if in a pinned_collections entry
     # --- added-date floor flag (set by collect_* if floor threshold met) ---
     recently_added: bool = False
     # --- for --explain ---
@@ -951,6 +961,81 @@ def _build_recently_active_shows(section, thresholds: dict) -> set:
         return set()
 
 
+def _build_collection_pinned_keys(
+    plex: PlexServer, pinned_collections: list,
+) -> tuple:
+    """Fetch members of named Plex collections and return their ratingKeys.
+
+    Returns (keys, matched_count, total_items) where:
+      keys          — set of int ratingKeys across all matched collections
+      matched_count — number of collections successfully fetched
+      total_items   — len(keys) (unique across collections)
+
+    Logs a WARNING for any entry whose library or collection doesn't exist
+    and continues — a bad config entry must not abort the run.
+
+    Both library and name are required per entry; collection names are
+    per-section in Plex (same name can appear in different libraries), so
+    name-only matching would be ambiguous.
+    """
+    if not pinned_collections:
+        return set(), 0, 0
+
+    keys: set = set()
+    matched = 0
+
+    for entry in pinned_collections:
+        lib_name = (entry.get("library") or "").strip()
+        col_name = (entry.get("name") or "").strip()
+        if not lib_name or not col_name:
+            log.warning(
+                "pinned_collections entry missing library or name: %r — skipping", entry
+            )
+            continue
+        try:
+            section = plex.library.section(lib_name)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Collection-pin: library %r not found: %s", lib_name, e)
+            continue
+        try:
+            all_cols = section.collections()
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "Collection-pin: could not list collections in %r: %s", lib_name, e
+            )
+            continue
+        col = next(
+            (c for c in (all_cols or []) if c.title.lower() == col_name.lower()),
+            None,
+        )
+        if col is None:
+            log.warning(
+                "Collection-pin: collection %r not found in library %r",
+                col_name, lib_name,
+            )
+            continue
+        try:
+            members = col.items()
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "Collection-pin: could not list members of %r/%r: %s",
+                col_name, lib_name, e,
+            )
+            continue
+        member_keys = {
+            int(m.ratingKey)
+            for m in (members or [])
+            if getattr(m, "ratingKey", None) is not None
+        }
+        matched += 1
+        keys.update(member_keys)
+        log.debug(
+            "Collection-pin: %r/%r — %d members", lib_name, col_name, len(member_keys)
+        )
+
+    return keys, matched, len(keys)
+
+
 def collect_movies(
     section, library_name: str, now, thresholds, history_index: dict,
     path_map, hot_mount: str, array_disks: List[str],
@@ -1027,6 +1112,11 @@ def collect_movies(
             if tier_split:
                 breakdown["tier_split"] = tier_split
 
+        try:
+            primary_rk: Optional[int] = int(primary.ratingKey)
+        except (TypeError, ValueError):
+            primary_rk = None
+
         yield Item(
             title=title,
             year=year,
@@ -1039,6 +1129,7 @@ def collect_movies(
             score=score,
             current_tier=current_tier,
             outcome="NEUTRAL",  # finalised in post-scoring override pass
+            rating_key=primary_rk,
             recently_added=recently_added,
             score_breakdown=breakdown,
         )
@@ -1139,6 +1230,7 @@ def collect_series(
             score=score,
             current_tier=current_tier,
             outcome="NEUTRAL",  # finalised in post-scoring override pass
+            rating_key=rk,
             recently_added=recently_added,
             score_breakdown=breakdown,
         )
@@ -1157,9 +1249,10 @@ def _compute_recommendation(
     Precedence (highest wins):
       1. Library pin       -> HOT, pinned=True
       2. Title pin         -> HOT, pinned=True
-      3. Added floor       -> HOT if item.recently_added is True
-      4. Raw score         -> HOT / WARM / NEUTRAL via score_recommendation.
-      5. Recency floor     -> HOT if last_played within hot_recency_days
+      3. Collection pin    -> HOT, pinned=True (if item.collection_pinned)
+      4. Added floor       -> HOT if item.recently_added is True
+      5. Raw score         -> HOT / WARM / NEUTRAL via score_recommendation.
+      6. Recency floor     -> HOT if last_played within hot_recency_days
                               AND raw recommendation is NEUTRAL or WARM.
     """
     pinning = cfg.get("pinning") or {}
@@ -1184,7 +1277,11 @@ def _compute_recommendation(
         if needle_hit:
             return "HOT", True, f"pinned title match: {needle_hit!r}"
 
-    # --- 3. Added-date floor (only promotes, never demotes) ---
+    # --- 3. Collection pin (promote-only, never demotes) ---
+    if item.collection_pinned:
+        return "HOT", True, "collection pin"
+
+    # --- 4. Added-date floor (only promotes, never demotes) ---
     if item.recently_added:
         if item.kind == "movie":
             days_since_added = (now - _as_utc(item.added)).days
@@ -1198,10 +1295,10 @@ def _compute_recommendation(
             reason = f"added-date floor: recent episode (<= added_floor_days_tv={threshold})"
         return "HOT", False, reason
 
-    # --- 4. Raw score ---
+    # --- 5. Raw score ---
     raw_rec = score_recommendation(item.score, thresholds)
 
-    # --- 5. Recency floor (only promotes, never demotes) ---
+    # --- 6. Recency floor (only promotes, never demotes) ---
     recency_days = thresholds.get("hot_recency_days")
     if (
         recency_days
@@ -1314,6 +1411,21 @@ def collect_all(plex: PlexServer, cfg: dict, filter_libraries) -> List[Item]:
         log.info(
             "Added-floor: %d movies + %d series with recent activity",
             floor_movie_count, floor_series_count,
+        )
+
+    # Collection-pin pass: fetch named collections once, mark matching items.
+    pinned_collections_cfg = cfg.get("pinned_collections") or []
+    if pinned_collections_cfg:
+        col_keys, col_matched, col_total = _build_collection_pinned_keys(
+            plex, pinned_collections_cfg
+        )
+        if col_keys:
+            for it in items:
+                if it.rating_key is not None and it.rating_key in col_keys:
+                    it.collection_pinned = True
+        log.info(
+            "Collection-pin: %d collections matched, %d items pinned",
+            col_matched, col_total,
         )
 
     # Post-scoring override pass. Done here (not per-collector) so both
@@ -1642,6 +1754,12 @@ def _run(args) -> int:
                 if "added-date floor" in it.score_breakdown.get("override", "")
             )
             log.info("  Added-floor promotions: %d items", floor_promotions)
+        if cfg.get("pinned_collections"):
+            col_promotions = sum(
+                1 for it in items
+                if it.score_breakdown.get("override") == "collection pin"
+            )
+            log.info("  Collection-pin promotions: %d items", col_promotions)
 
     return 0
 
@@ -1758,6 +1876,8 @@ def _make_item(**kwargs):
         added=now - timedelta(days=200),
         size_bytes=1_000_000_000,
         score=25.0,
+        rating_key=None,
+        collection_pinned=False,
         recently_added=False,
     )
     defaults.update(kwargs)
@@ -1890,6 +2010,92 @@ def _test_added_floor_tv_search_uses_int_timestamp():
     print("_test_added_floor_tv_search_uses_int_timestamp: OK")
 
 
+def _test_collection_pin_promotes_to_pin_hot():
+    """collection_pinned=True, any score/tier -> PIN_HOT via pinned=True"""
+    now = datetime.now(timezone.utc)
+    for current_tier in ("HOT", "WARM", "UNKNOWN"):
+        item = _make_item(
+            score=0.0, current_tier=current_tier,
+            rating_key=42, collection_pinned=True,
+        )
+        rec, pinned, reason = _compute_recommendation(item, _make_cfg(), now)
+        assert rec == "HOT", f"expected HOT, got {rec} (current_tier={current_tier})"
+        assert pinned, f"expected pinned=True (current_tier={current_tier})"
+        assert reason == "collection pin"
+        outcome = _combine_outcome(current_tier, rec, pinned)
+        assert outcome == "PIN_HOT", f"expected PIN_HOT, got {outcome}"
+    print("_test_collection_pin_promotes_to_pin_hot: OK")
+
+
+def _test_collection_pin_missing_collection():
+    """Missing collection -> WARNING emitted, empty set returned, no crash"""
+    warnings_seen = []
+    _orig_warning = log.warning
+
+    def _capture_warning(msg, *args):
+        warnings_seen.append(msg % args if args else msg)
+        _orig_warning(msg, *args)
+
+    log.warning = _capture_warning
+    try:
+        class _FakeSection:
+            title = "Movies"
+
+            def collections(self):
+                return []  # collection not present
+
+        class _FakePlex:
+            class _Lib:
+                def section(self, *_):
+                    return _FakeSection()
+            library = _Lib()
+
+        keys, matched, total = _build_collection_pinned_keys(
+            _FakePlex(), [{"library": "Movies", "name": "MCU"}]
+        )
+        assert keys == set(), f"expected empty set, got {keys}"
+        assert matched == 0
+        assert total == 0
+        assert any("MCU" in w for w in warnings_seen), "expected warning about missing collection"
+    finally:
+        log.warning = _orig_warning
+    print("_test_collection_pin_missing_collection: OK")
+
+
+def _test_collection_pin_empty_list():
+    """Empty pinned_collections -> returns immediately with no Plex calls"""
+    called = []
+
+    class _SentinelPlex:
+        class _Lib:
+            def section(self, name):
+                called.append(name)
+        library = _Lib()
+
+    keys, matched, total = _build_collection_pinned_keys(_SentinelPlex(), [])
+    assert keys == set()
+    assert matched == 0
+    assert total == 0
+    assert not called, "section() should not be called for empty list"
+    print("_test_collection_pin_empty_list: OK")
+
+
+def _test_collection_pin_idempotent_with_added_floor():
+    """collection_pinned=True AND recently_added=True -> collection pin wins (step 3 < step 4).
+    Only the collection-pin override is recorded; added-floor override is not set.
+    """
+    now = datetime.now(timezone.utc)
+    item = _make_item(
+        added=now - timedelta(days=5), score=25.0,
+        rating_key=7, collection_pinned=True, recently_added=True,
+    )
+    rec, pinned, reason = _compute_recommendation(item, _make_cfg(), now)
+    assert rec == "HOT", f"expected HOT, got {rec}"
+    assert pinned, "expected pinned=True from collection pin"
+    assert reason == "collection pin", f"expected collection pin reason, got {reason!r}"
+    print("_test_collection_pin_idempotent_with_added_floor: OK")
+
+
 if __name__ == "__main__":
     if "--_test" in sys.argv:
         _test_resolve_user_share()
@@ -1901,5 +2107,9 @@ if __name__ == "__main__":
         _test_added_floor_preserves_pin()
         _test_added_floor_never_demotes()
         _test_added_floor_tv_search_uses_int_timestamp()
+        _test_collection_pin_promotes_to_pin_hot()
+        _test_collection_pin_missing_collection()
+        _test_collection_pin_empty_list()
+        _test_collection_pin_idempotent_with_added_floor()
         sys.exit(0)
     sys.exit(main())
