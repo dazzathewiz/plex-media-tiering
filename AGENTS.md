@@ -157,13 +157,32 @@ TV library section:
 
 ```python
 cutoff = datetime.now(timezone.utc) - timedelta(days=added_floor_days_tv)
-recent_eps = section.search(libtype="episode", addedAt__gte=cutoff)
+recent_eps = section.search(libtype="episode", addedAt__gte=int(cutoff.timestamp()))
 recently_active_shows = {int(ep.grandparentRatingKey) for ep in recent_eps}
 ```
 
 `_build_recently_active_shows()` encapsulates this. The resulting set is
 passed into `collect_series()` as `recently_active_shows` and looked up
 O(1) per show via `show.ratingKey in recently_active_shows`.
+
+#### plexapi addedAt filter requires int Unix seconds
+
+`section.search(addedAt__gte=...)` and `addedAt__lte=...` expect an **int
+Unix timestamp** (seconds since epoch), not a Python `datetime`. Plexapi's
+filter evaluation compares the value against the stored string form of the
+Unix timestamp — passing a `datetime` raises:
+
+```text
+TypeError: '>=' not supported between instances of 'str' and 'datetime.datetime'
+```
+
+Always convert on the caller side: `int(cutoff.timestamp())`. This quirk
+does not affect the movies floor, which computes its check with plain
+`timedelta` arithmetic on `item.added` without ever calling `section.search`.
+
+The regression test `_test_added_floor_tv_search_uses_int_timestamp` in
+`--_test` guards against this being reintroduced: it stubs `section.search`,
+captures the kwargs, and asserts `addedAt__gte` is an `int`.
 
 ### Tier rollup: majority of bytes
 

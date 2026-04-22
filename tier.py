@@ -934,7 +934,10 @@ def _build_recently_active_shows(section, thresholds: dict) -> set:
         return set()
     cutoff = datetime.now(timezone.utc) - timedelta(days=int(days))
     try:
-        recent_eps = section.search(libtype="episode", addedAt__gte=cutoff)
+        # plexapi compares addedAt__gte against the stored string form of a
+        # Unix timestamp — passing a datetime causes a str >= datetime
+        # TypeError. int seconds is the only form that works.
+        recent_eps = section.search(libtype="episode", addedAt__gte=int(cutoff.timestamp()))
         return {
             int(ep.grandparentRatingKey)
             for ep in recent_eps
@@ -1857,6 +1860,36 @@ def _test_added_floor_never_demotes():
     print("_test_added_floor_never_demotes: OK")
 
 
+def _test_added_floor_tv_search_uses_int_timestamp():
+    """_build_recently_active_shows must pass int Unix timestamp to addedAt__gte.
+
+    plexapi's filter evaluation compares addedAt__gte against the stored string
+    form of a Unix timestamp. Passing a datetime object causes:
+      TypeError: '>=' not supported between instances of 'str' and 'datetime.datetime'
+    Only int seconds avoids this — the check here guards against regression.
+    """
+    captured = {}
+
+    class _FakeEp:
+        grandparentRatingKey = 99
+
+    class _FakeSection:
+        title = "TV Shows"
+
+        def search(self, **kwargs):
+            captured.update(kwargs)
+            return [_FakeEp()]
+
+    result = _build_recently_active_shows(_FakeSection(), {"added_floor_days_tv": 30})
+
+    assert "addedAt__gte" in captured, "addedAt__gte not passed to section.search"
+    assert isinstance(captured["addedAt__gte"], int), (
+        f"addedAt__gte must be int (Unix seconds), got {type(captured['addedAt__gte']).__name__}"
+    )
+    assert result == {99}
+    print("_test_added_floor_tv_search_uses_int_timestamp: OK")
+
+
 if __name__ == "__main__":
     if "--_test" in sys.argv:
         _test_resolve_user_share()
@@ -1867,5 +1900,6 @@ if __name__ == "__main__":
         _test_added_floor_disabled()
         _test_added_floor_preserves_pin()
         _test_added_floor_never_demotes()
+        _test_added_floor_tv_search_uses_int_timestamp()
         sys.exit(0)
     sys.exit(main())
