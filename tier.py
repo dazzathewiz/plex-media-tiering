@@ -12,6 +12,8 @@ Phase status:
   P0  (done)        Read-only analysis from Plex catalog + watch history.
   P0.1 (done)       Pinning (library + title), recency floor, projected-
                     tier footer.
+  P0.2 (done)       Auto-inherit — when ≥N members of a Plex collection
+                    naturally score HOT, promote the whole collection.
   P0.3 (done)       Collection pin — force every member of a named Plex
                     collection to HOT via pinned_collections: config.
   P0.4 (done)       Added-date floor — promote recently-added movies and
@@ -114,6 +116,16 @@ DEFAULT_CONFIG = {
     # disambiguate — collection names are per-section in Plex, so the same
     # name can exist in different libraries. Empty list = feature off.
     "pinned_collections": [],
+    # Auto-inherit collection pin — when enough members of a collection
+    # naturally score HOT (pre-floor, pre-pin), promote the whole collection.
+    # Use case: you've watched several Star Wars films; the rest auto-inherit
+    # HOT so they're ready when you reach for them. Default off — opt-in.
+    "auto_collection_inherit": {
+        "enabled": False,
+        "min_hot_members": 2,      # collections with fewer hot members are skipped
+        "skip_smart_collections": True,  # smart collections are curated rules; skip
+        "exclude_libraries": [],   # library names to exempt entirely
+    },
     "paths": {
         "user_share_prefix": "/mnt/user",
         # Mount point of the HOT pool as seen by THIS script (tier.py).
@@ -336,6 +348,7 @@ class Item:
     # --- collection-pin support ---
     rating_key: Optional[int] = None  # Plex ratingKey; used by collect_all for collection lookup
     collection_pinned: bool = False   # True if in a pinned_collections entry
+    auto_inherit_pinned: bool = False  # True if auto-inherit fired for this item's collection
     # --- added-date floor flag (set by collect_* if floor threshold met) ---
     recently_added: bool = False
     # --- for --explain ---
@@ -1036,6 +1049,103 @@ def _build_collection_pinned_keys(
     return keys, matched, len(keys)
 
 
+def _build_auto_inherit_keys(
+    plex: PlexServer,
+    auto_cfg: dict,
+    score_to_hot: float,
+    items: List[Item],
+    configured_library_names: List[str],
+) -> tuple:
+    """Return ratingKeys that should be auto-pinned via collection inheritance.
+
+    For each Plex collection in the configured libraries, counts members whose
+    natural score (pre-floor, pre-pin) is >= score_to_hot. When that count
+    meets min_hot_members, every member of the collection is added to the
+    result set so the caller can stamp them auto_inherit_pinned=True.
+
+    Returns (keys, triggered_count, total_inherited):
+      keys            — set of int ratingKeys across all triggered collections
+      triggered_count — how many collections met the threshold
+      total_inherited — total member slots across triggered collections
+
+    Is a no-op (returns empty set) when auto_cfg["enabled"] is falsy.
+    Logs WARNINGs for missing libraries / un-listable collections; never raises.
+    """
+    if not auto_cfg.get("enabled"):
+        return set(), 0, 0
+
+    min_hot = int(auto_cfg.get("min_hot_members") or 2)
+    skip_smart = bool(auto_cfg.get("skip_smart_collections", True))
+    exclude_libs = {
+        str(e).strip().lower()
+        for e in (auto_cfg.get("exclude_libraries") or [])
+    }
+
+    # Build rating_key -> item lookup for membership + score checks.
+    rk_lookup: dict = {
+        it.rating_key: it
+        for it in items
+        if it.rating_key is not None
+    }
+
+    keys: set = set()
+    triggered_count = 0
+    total_inherited = 0
+
+    for lib_name in configured_library_names:
+        if lib_name.strip().lower() in exclude_libs:
+            continue
+        try:
+            section = plex.library.section(lib_name)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Auto-inherit: library %r not found: %s", lib_name, e)
+            continue
+        try:
+            collections = section.collections()
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "Auto-inherit: could not list collections in %r: %s", lib_name, e
+            )
+            continue
+
+        for col in (collections or []):
+            if skip_smart and getattr(col, "smart", False):
+                continue
+            try:
+                members = col.items()
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    "Auto-inherit: could not get members of %r in %r: %s",
+                    col.title, lib_name, e,
+                )
+                continue
+
+            member_keys = {
+                int(m.ratingKey)
+                for m in (members or [])
+                if getattr(m, "ratingKey", None) is not None
+            }
+            if not member_keys:
+                continue
+
+            hot_count = sum(
+                1 for rk in member_keys
+                if rk in rk_lookup and rk_lookup[rk].score >= score_to_hot
+            )
+            if hot_count < min_hot:
+                continue
+
+            triggered_count += 1
+            total_inherited += len(member_keys)
+            keys.update(member_keys)
+            log.debug(
+                "Auto-inherit: %r/%r triggered (%d hot, %d total members)",
+                lib_name, col.title, hot_count, len(member_keys),
+            )
+
+    return keys, triggered_count, total_inherited
+
+
 def collect_movies(
     section, library_name: str, now, thresholds, history_index: dict,
     path_map, hot_mount: str, array_disks: List[str],
@@ -1247,13 +1357,14 @@ def _compute_recommendation(
       reason:         short human string for --explain (None if raw score)
 
     Precedence (highest wins):
-      1. Library pin       -> HOT, pinned=True
-      2. Title pin         -> HOT, pinned=True
-      3. Collection pin    -> HOT, pinned=True (if item.collection_pinned)
-      4. Added floor       -> HOT if item.recently_added is True
-      5. Raw score         -> HOT / WARM / NEUTRAL via score_recommendation.
-      6. Recency floor     -> HOT if last_played within hot_recency_days
-                              AND raw recommendation is NEUTRAL or WARM.
+      1. Library pin         -> HOT, pinned=True
+      2. Title pin           -> HOT, pinned=True
+      3. Collection pin      -> HOT, pinned=True (if item.collection_pinned)
+      4. Auto-inherit pin    -> HOT, pinned=True (if item.auto_inherit_pinned)
+      5. Added floor         -> HOT if item.recently_added is True
+      6. Raw score           -> HOT / WARM / NEUTRAL via score_recommendation.
+      7. Recency floor       -> HOT if last_played within hot_recency_days
+                                AND raw recommendation is NEUTRAL or WARM.
     """
     pinning = cfg.get("pinning") or {}
     thresholds = cfg.get("thresholds") or {}
@@ -1281,7 +1392,11 @@ def _compute_recommendation(
     if item.collection_pinned:
         return "HOT", True, "collection pin"
 
-    # --- 4. Added-date floor (only promotes, never demotes) ---
+    # --- 4. Auto-inherit collection pin (promote-only, never demotes) ---
+    if item.auto_inherit_pinned:
+        return "HOT", True, "auto-inherit collection"
+
+    # --- 5. Added-date floor (only promotes, never demotes) ---
     if item.recently_added:
         if item.kind == "movie":
             days_since_added = (now - _as_utc(item.added)).days
@@ -1295,10 +1410,10 @@ def _compute_recommendation(
             reason = f"added-date floor: recent episode (<= added_floor_days_tv={threshold})"
         return "HOT", False, reason
 
-    # --- 5. Raw score ---
+    # --- 6. Raw score ---
     raw_rec = score_recommendation(item.score, thresholds)
 
-    # --- 6. Recency floor (only promotes, never demotes) ---
+    # --- 7. Recency floor (only promotes, never demotes) ---
     recency_days = thresholds.get("hot_recency_days")
     if (
         recency_days
@@ -1411,6 +1526,27 @@ def collect_all(plex: PlexServer, cfg: dict, filter_libraries) -> List[Item]:
         log.info(
             "Added-floor: %d movies + %d series with recent activity",
             floor_movie_count, floor_series_count,
+        )
+
+    # Auto-inherit pass: scan all configured libraries for collections that
+    # have enough naturally-hot members to trigger the inherit rule.
+    auto_cfg = cfg.get("auto_collection_inherit") or {}
+    if auto_cfg.get("enabled"):
+        lib_names = [
+            (lib_cfg["name"] if isinstance(lib_cfg, dict) else lib_cfg)
+            for lib_cfg in cfg["libraries"]
+        ]
+        score_to_hot = float((cfg.get("thresholds") or {}).get("score_to_hot", 40.0))
+        ai_keys, ai_triggered, ai_inherited = _build_auto_inherit_keys(
+            plex, auto_cfg, score_to_hot, items, lib_names,
+        )
+        if ai_keys:
+            for it in items:
+                if it.rating_key is not None and it.rating_key in ai_keys:
+                    it.auto_inherit_pinned = True
+        log.info(
+            "Auto-inherit: %d collections triggered (≥%d hot members), %d items inherited",
+            ai_triggered, int(auto_cfg.get("min_hot_members") or 2), ai_inherited,
         )
 
     # Collection-pin pass: fetch named collections once, mark matching items.
@@ -1760,6 +1896,12 @@ def _run(args) -> int:
                 if it.score_breakdown.get("override") == "collection pin"
             )
             log.info("  Collection-pin promotions: %d items", col_promotions)
+        if (cfg.get("auto_collection_inherit") or {}).get("enabled"):
+            ai_promotions = sum(
+                1 for it in items
+                if it.score_breakdown.get("override") == "auto-inherit collection"
+            )
+            log.info("  Auto-inherit promotions: %d items", ai_promotions)
 
     return 0
 
@@ -1878,6 +2020,7 @@ def _make_item(**kwargs):
         score=25.0,
         rating_key=None,
         collection_pinned=False,
+        auto_inherit_pinned=False,
         recently_added=False,
     )
     defaults.update(kwargs)
@@ -2096,6 +2239,214 @@ def _test_collection_pin_idempotent_with_added_floor():
     print("_test_collection_pin_idempotent_with_added_floor: OK")
 
 
+def _test_auto_inherit_happy_path():
+    """Two collections: one triggers (2 hot members), one doesn't (only 1 hot member).
+    Only the triggered collection's members get auto_inherit_pinned=True.
+    """
+    now = datetime.now(timezone.utc)
+    items = [
+        _make_item(rating_key=1, score=50.0),   # hot — in Franchise A
+        _make_item(rating_key=2, score=50.0),   # hot — in Franchise A
+        _make_item(rating_key=3, score=25.0),   # cold — in Franchise A
+        _make_item(rating_key=4, score=50.0),   # hot — in Franchise B (only one)
+        _make_item(rating_key=5, score=10.0),   # cold — in Franchise B
+    ]
+
+    class _FakeMember:
+        def __init__(self, rk):
+            self.ratingKey = rk
+
+    class _FakeCol:
+        def __init__(self, title, rks, smart=False):
+            self.title = title
+            self.smart = smart
+            self._rks = rks
+        def items(self):
+            return [_FakeMember(rk) for rk in self._rks]
+
+    class _FakeSection:
+        def collections(self):
+            return [
+                _FakeCol("Franchise A", [1, 2, 3]),  # 2 hot members → triggers
+                _FakeCol("Franchise B", [4, 5]),     # 1 hot member  → skipped
+            ]
+
+    class _FakePlex:
+        class _Lib:
+            def section(self, *_):
+                return _FakeSection()
+        library = _Lib()
+
+    auto_cfg = {
+        "enabled": True, "min_hot_members": 2,
+        "skip_smart_collections": True, "exclude_libraries": [],
+    }
+    keys, triggered, inherited = _build_auto_inherit_keys(
+        _FakePlex(), auto_cfg, 40.0, items, ["Movies"]
+    )
+
+    assert triggered == 1, f"expected 1 triggered, got {triggered}"
+    assert inherited == 3, f"expected 3 inherited, got {inherited}"
+    assert keys == {1, 2, 3}, f"expected {{1,2,3}}, got {keys}"
+
+    # Verify that the cold member of the triggered collection still gets
+    # auto_inherit_pinned and resolves to PIN_HOT.
+    items[2].auto_inherit_pinned = True  # rk=3, score=25 (NEUTRAL without inherit)
+    rec, pinned, reason = _compute_recommendation(items[2], _make_cfg(), now)
+    assert rec == "HOT", f"expected HOT via auto-inherit, got {rec}"
+    assert pinned
+    assert reason == "auto-inherit collection"
+    print("_test_auto_inherit_happy_path: OK")
+
+
+def _test_auto_inherit_threshold_not_met():
+    """min_hot_members=3, only 2 hot members in the collection → no trigger."""
+
+    class _FakeMember:
+        def __init__(self, rk):
+            self.ratingKey = rk
+
+    class _FakeCol:
+        title = "Franchise"
+        smart = False
+        def items(self):
+            return [_FakeMember(rk) for rk in [1, 2, 3]]
+
+    class _FakeSection:
+        def collections(self):
+            return [_FakeCol()]
+
+    class _FakePlex:
+        class _Lib:
+            def section(self, *_):
+                return _FakeSection()
+        library = _Lib()
+
+    items = [
+        _make_item(rating_key=1, score=50.0),
+        _make_item(rating_key=2, score=50.0),
+        _make_item(rating_key=3, score=10.0),
+    ]
+    auto_cfg = {
+        "enabled": True, "min_hot_members": 3,
+        "skip_smart_collections": True, "exclude_libraries": [],
+    }
+    keys, triggered, inherited = _build_auto_inherit_keys(
+        _FakePlex(), auto_cfg, 40.0, items, ["Movies"]
+    )
+    assert triggered == 0, f"expected 0 triggered, got {triggered}"
+    assert inherited == 0
+    assert keys == set()
+    print("_test_auto_inherit_threshold_not_met: OK")
+
+
+def _test_auto_inherit_explicit_pin_takes_precedence():
+    """item.collection_pinned=True AND item.auto_inherit_pinned=True → explicit pin wins (step 3 < step 4).
+    Reason is 'collection pin', not 'auto-inherit collection'.
+    """
+    now = datetime.now(timezone.utc)
+    item = _make_item(
+        score=0.0, rating_key=42,
+        collection_pinned=True, auto_inherit_pinned=True,
+    )
+    rec, pinned, reason = _compute_recommendation(item, _make_cfg(), now)
+    assert rec == "HOT"
+    assert pinned
+    assert reason == "collection pin", (
+        f"explicit pin must fire before auto-inherit; got {reason!r}"
+    )
+    print("_test_auto_inherit_explicit_pin_takes_precedence: OK")
+
+
+def _test_auto_inherit_smart_collection_skip():
+    """Smart collections are skipped when skip_smart_collections=True, included when False."""
+
+    class _FakeMember:
+        def __init__(self, rk):
+            self.ratingKey = rk
+
+    class _FakeSmartCol:
+        title = "Smart"
+        smart = True
+        def items(self):
+            return [_FakeMember(1), _FakeMember(2)]
+
+    class _FakeSection:
+        def collections(self):
+            return [_FakeSmartCol()]
+
+    class _FakePlex:
+        class _Lib:
+            def section(self, *_):
+                return _FakeSection()
+        library = _Lib()
+
+    items = [
+        _make_item(rating_key=1, score=50.0),
+        _make_item(rating_key=2, score=50.0),
+    ]
+
+    auto_cfg_skip = {
+        "enabled": True, "min_hot_members": 2,
+        "skip_smart_collections": True, "exclude_libraries": [],
+    }
+    keys_skip, triggered_skip, _ = _build_auto_inherit_keys(
+        _FakePlex(), auto_cfg_skip, 40.0, items, ["Movies"]
+    )
+    assert triggered_skip == 0, "smart collection should be skipped"
+    assert keys_skip == set()
+
+    auto_cfg_include = {**auto_cfg_skip, "skip_smart_collections": False}
+    keys_inc, triggered_inc, _ = _build_auto_inherit_keys(
+        _FakePlex(), auto_cfg_include, 40.0, items, ["Movies"]
+    )
+    assert triggered_inc == 1, "smart collection should trigger when skip=False"
+    assert keys_inc == {1, 2}
+    print("_test_auto_inherit_smart_collection_skip: OK")
+
+
+def _test_auto_inherit_disabled():
+    """enabled=False → returns immediately with no Plex calls."""
+    called = []
+
+    class _SentinelPlex:
+        class _Lib:
+            def section(self, *_):
+                called.append("section")
+        library = _Lib()
+
+    auto_cfg = {"enabled": False, "min_hot_members": 2}
+    keys, triggered, inherited = _build_auto_inherit_keys(
+        _SentinelPlex(), auto_cfg, 40.0, [], ["Movies"]
+    )
+    assert keys == set()
+    assert triggered == 0
+    assert inherited == 0
+    assert not called, "section() should not be called when disabled"
+    print("_test_auto_inherit_disabled: OK")
+
+
+def _test_auto_inherit_exclude_library():
+    """Library listed in exclude_libraries is skipped; its collections never trigger."""
+    called = []
+
+    class _FakePlex:
+        class _Lib:
+            def section(self, name):
+                called.append(name)
+        library = _Lib()
+
+    auto_cfg = {
+        "enabled": True, "min_hot_members": 1,
+        "skip_smart_collections": False, "exclude_libraries": ["DVD Rips"],
+    }
+    _build_auto_inherit_keys(
+        _FakePlex(), auto_cfg, 40.0, [], ["Movies", "DVD Rips"]
+    )
+    assert "DVD Rips" not in called, "excluded library must not be fetched"
+    print("_test_auto_inherit_exclude_library: OK")
+
+
 if __name__ == "__main__":
     if "--_test" in sys.argv:
         _test_resolve_user_share()
@@ -2111,5 +2462,11 @@ if __name__ == "__main__":
         _test_collection_pin_missing_collection()
         _test_collection_pin_empty_list()
         _test_collection_pin_idempotent_with_added_floor()
+        _test_auto_inherit_happy_path()
+        _test_auto_inherit_threshold_not_met()
+        _test_auto_inherit_explicit_pin_takes_precedence()
+        _test_auto_inherit_smart_collection_skip()
+        _test_auto_inherit_disabled()
+        _test_auto_inherit_exclude_library()
         sys.exit(0)
     sys.exit(main())
