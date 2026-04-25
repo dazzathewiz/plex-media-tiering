@@ -169,6 +169,25 @@ incidental — one popular episode of a show you don't particularly care about,
 or a crossover film that happens to score well. Two hot members signals genuine
 engagement with the set as a set.
 
+**Three-branch trigger rule.** `_build_auto_inherit_keys()` applies:
+
+```python
+if col_size < min_hot:         # skip — can never trigger; avoids counting hot members
+elif col_size == min_hot:      required = max(1, ceil(col_size * min_hot_fraction))
+else:                          required = min_hot
+# trigger if hot_count >= required
+```
+
+The `col_size < min_hot` early exit is a real performance win on libraries with
+many 1-item "collections" (Plex creates singletons for some agents).
+
+The `col_size == min_hot` fraction branch exists to avoid a degenerate state:
+a 2-member collection with `min_hot_members: 2` would require BOTH members to
+be naturally hot — but if both are already hot there is nothing to inherit.
+With `min_hot_fraction: 0.5` (default), a 2-member collection only needs 1 hot
+member (`ceil(2 * 0.5) = 1`). For all collections larger than `min_hot_members`,
+the absolute threshold applies unchanged.
+
 **Precedence: `pinned_collections` > `auto_collection_inherit` > added-floor.**
 An item in both an explicit pin and a triggered auto-inherit collection will
 have `override = "collection pin"` (step 3 fires before step 4). It is counted

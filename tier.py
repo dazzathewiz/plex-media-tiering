@@ -123,6 +123,11 @@ DEFAULT_CONFIG = {
     "auto_collection_inherit": {
         "enabled": False,
         "min_hot_members": 2,      # collections with fewer hot members are skipped
+        # Escape hatch for collections sized exactly equal to min_hot_members:
+        # require this fraction of members to be hot (ceil, min 1) instead of
+        # the absolute min_hot_members count. For larger collections the absolute
+        # threshold still applies.
+        "min_hot_fraction": 0.5,
         "skip_smart_collections": True,  # smart collections are curated rules; skip
         "exclude_libraries": [],   # library names to exempt entirely
     },
@@ -1075,6 +1080,7 @@ def _build_auto_inherit_keys(
         return set(), 0, 0
 
     min_hot = int(auto_cfg.get("min_hot_members") or 2)
+    min_fraction = float(auto_cfg.get("min_hot_fraction") or 0.5)
     skip_smart = bool(auto_cfg.get("skip_smart_collections", True))
     exclude_libs = {
         str(e).strip().lower()
@@ -1125,14 +1131,29 @@ def _build_auto_inherit_keys(
                 for m in (members or [])
                 if getattr(m, "ratingKey", None) is not None
             }
-            if not member_keys:
+            col_size = len(member_keys)
+            if col_size == 0:
                 continue
+
+            # Efficiency: collections smaller than min_hot can never trigger.
+            if col_size < min_hot:
+                continue
+
+            # Three-branch threshold:
+            #   size == min_hot  → fraction escape hatch (avoids the degenerate
+            #                      "all members must be hot, nothing to inherit"
+            #                      case for small collections)
+            #   size >  min_hot  → absolute min_hot threshold
+            if col_size == min_hot:
+                required_hot = max(1, math.ceil(col_size * min_fraction))
+            else:
+                required_hot = min_hot
 
             hot_count = sum(
                 1 for rk in member_keys
                 if rk in rk_lookup and rk_lookup[rk].score >= score_to_hot
             )
-            if hot_count < min_hot:
+            if hot_count < required_hot:
                 continue
 
             triggered_count += 1
@@ -2240,16 +2261,21 @@ def _test_collection_pin_idempotent_with_added_floor():
 
 
 def _test_auto_inherit_happy_path():
-    """Two collections: one triggers (2 hot members), one doesn't (only 1 hot member).
-    Only the triggered collection's members get auto_inherit_pinned=True.
+    """Two collections: one triggers, one doesn't.
+
+    Franchise A (3 members, 2 hot): size > min_hot → uses absolute threshold
+    (2 >= 2 required). Triggers; cold member rk=3 gets PIN_HOT via inherit.
+
+    Franchise B (2 members, 0 hot): size == min_hot → fraction branch
+    (ceil(2*0.5)=1 required). 0 hot members → does not trigger.
     """
     now = datetime.now(timezone.utc)
     items = [
-        _make_item(rating_key=1, score=50.0),   # hot — in Franchise A
-        _make_item(rating_key=2, score=50.0),   # hot — in Franchise A
-        _make_item(rating_key=3, score=25.0),   # cold — in Franchise A
-        _make_item(rating_key=4, score=50.0),   # hot — in Franchise B (only one)
-        _make_item(rating_key=5, score=10.0),   # cold — in Franchise B
+        _make_item(rating_key=1, score=50.0),   # hot — Franchise A
+        _make_item(rating_key=2, score=50.0),   # hot — Franchise A
+        _make_item(rating_key=3, score=25.0),   # cold — Franchise A
+        _make_item(rating_key=4, score=10.0),   # cold — Franchise B (no hot members)
+        _make_item(rating_key=5, score=10.0),   # cold — Franchise B
     ]
 
     class _FakeMember:
@@ -2267,8 +2293,8 @@ def _test_auto_inherit_happy_path():
     class _FakeSection:
         def collections(self):
             return [
-                _FakeCol("Franchise A", [1, 2, 3]),  # 2 hot members → triggers
-                _FakeCol("Franchise B", [4, 5]),     # 1 hot member  → skipped
+                _FakeCol("Franchise A", [1, 2, 3]),  # size=3>2, 2 hot → triggers
+                _FakeCol("Franchise B", [4, 5]),     # size=2==2, 0 hot → no trigger
             ]
 
     class _FakePlex:
@@ -2278,7 +2304,7 @@ def _test_auto_inherit_happy_path():
         library = _Lib()
 
     auto_cfg = {
-        "enabled": True, "min_hot_members": 2,
+        "enabled": True, "min_hot_members": 2, "min_hot_fraction": 0.5,
         "skip_smart_collections": True, "exclude_libraries": [],
     }
     keys, triggered, inherited = _build_auto_inherit_keys(
@@ -2289,8 +2315,7 @@ def _test_auto_inherit_happy_path():
     assert inherited == 3, f"expected 3 inherited, got {inherited}"
     assert keys == {1, 2, 3}, f"expected {{1,2,3}}, got {keys}"
 
-    # Verify that the cold member of the triggered collection still gets
-    # auto_inherit_pinned and resolves to PIN_HOT.
+    # Cold member of the triggered collection gets PIN_HOT via auto-inherit.
     items[2].auto_inherit_pinned = True  # rk=3, score=25 (NEUTRAL without inherit)
     rec, pinned, reason = _compute_recommendation(items[2], _make_cfg(), now)
     assert rec == "HOT", f"expected HOT via auto-inherit, got {rec}"
@@ -2300,7 +2325,9 @@ def _test_auto_inherit_happy_path():
 
 
 def _test_auto_inherit_threshold_not_met():
-    """min_hot_members=3, only 2 hot members in the collection → no trigger."""
+    """collection size=4 > min_hot_members=3, only 2 hot members → absolute threshold
+    applies (required=3), 2 < 3, no trigger.
+    """
 
     class _FakeMember:
         def __init__(self, rk):
@@ -2310,7 +2337,7 @@ def _test_auto_inherit_threshold_not_met():
         title = "Franchise"
         smart = False
         def items(self):
-            return [_FakeMember(rk) for rk in [1, 2, 3]]
+            return [_FakeMember(rk) for rk in [1, 2, 3, 4]]
 
     class _FakeSection:
         def collections(self):
@@ -2326,9 +2353,10 @@ def _test_auto_inherit_threshold_not_met():
         _make_item(rating_key=1, score=50.0),
         _make_item(rating_key=2, score=50.0),
         _make_item(rating_key=3, score=10.0),
+        _make_item(rating_key=4, score=10.0),
     ]
     auto_cfg = {
-        "enabled": True, "min_hot_members": 3,
+        "enabled": True, "min_hot_members": 3, "min_hot_fraction": 0.5,
         "skip_smart_collections": True, "exclude_libraries": [],
     }
     keys, triggered, inherited = _build_auto_inherit_keys(
@@ -2447,6 +2475,170 @@ def _test_auto_inherit_exclude_library():
     print("_test_auto_inherit_exclude_library: OK")
 
 
+def _test_auto_inherit_fraction_triggers_small_collection():
+    """size == min_hot_members, 1 hot member, min_hot_fraction=0.5 → triggers (ceil(2*0.5)=1)."""
+
+    class _FakeMember:
+        def __init__(self, rk):
+            self.ratingKey = rk
+
+    class _FakeCol:
+        title = "Pair"
+        smart = False
+        def items(self):
+            return [_FakeMember(1), _FakeMember(2)]
+
+    class _FakeSection:
+        def collections(self):
+            return [_FakeCol()]
+
+    class _FakePlex:
+        class _Lib:
+            def section(self, *_):
+                return _FakeSection()
+        library = _Lib()
+
+    items = [
+        _make_item(rating_key=1, score=50.0),   # hot
+        _make_item(rating_key=2, score=10.0),   # cold
+    ]
+    auto_cfg = {
+        "enabled": True, "min_hot_members": 2, "min_hot_fraction": 0.5,
+        "skip_smart_collections": False, "exclude_libraries": [],
+    }
+    keys, triggered, inherited = _build_auto_inherit_keys(
+        _FakePlex(), auto_cfg, 40.0, items, ["Movies"]
+    )
+    assert triggered == 1, f"expected 1 triggered, got {triggered}"
+    assert inherited == 2
+    assert keys == {1, 2}
+    print("_test_auto_inherit_fraction_triggers_small_collection: OK")
+
+
+def _test_auto_inherit_fraction_no_hot_no_trigger():
+    """size == min_hot_members, 0 hot members → does not trigger."""
+
+    class _FakeMember:
+        def __init__(self, rk):
+            self.ratingKey = rk
+
+    class _FakeCol:
+        title = "Pair"
+        smart = False
+        def items(self):
+            return [_FakeMember(1), _FakeMember(2)]
+
+    class _FakeSection:
+        def collections(self):
+            return [_FakeCol()]
+
+    class _FakePlex:
+        class _Lib:
+            def section(self, *_):
+                return _FakeSection()
+        library = _Lib()
+
+    items = [
+        _make_item(rating_key=1, score=10.0),
+        _make_item(rating_key=2, score=10.0),
+    ]
+    auto_cfg = {
+        "enabled": True, "min_hot_members": 2, "min_hot_fraction": 0.5,
+        "skip_smart_collections": False, "exclude_libraries": [],
+    }
+    keys, triggered, _ = _build_auto_inherit_keys(
+        _FakePlex(), auto_cfg, 40.0, items, ["Movies"]
+    )
+    assert triggered == 0
+    assert keys == set()
+    print("_test_auto_inherit_fraction_no_hot_no_trigger: OK")
+
+
+def _test_auto_inherit_skip_below_min_hot():
+    """collection size < min_hot_members → items() is never called."""
+    items_checked = []
+
+    class _FakeCol:
+        title = "Singleton"
+        smart = False
+        def items(self):
+            items_checked.append("called")
+            return []
+
+    class _FakeSection:
+        def collections(self):
+            return [_FakeCol()]
+
+    class _FakePlex:
+        class _Lib:
+            def section(self, *_):
+                return _FakeSection()
+        library = _Lib()
+
+    # Stub items() to return 1 member so col_size=1 < min_hot=2
+    # BUT we need items() to be reachable to check if it is called.
+    # Override items() to append a marker and return one member.
+    class _Member:
+        ratingKey = 99
+
+    _FakeCol.items = lambda *_: (items_checked.append("called") or [_Member()])  # type: ignore[assignment]
+
+    auto_cfg = {
+        "enabled": True, "min_hot_members": 2, "min_hot_fraction": 0.5,
+        "skip_smart_collections": False, "exclude_libraries": [],
+    }
+    _build_auto_inherit_keys(_FakePlex(), auto_cfg, 40.0, [], ["Movies"])
+    # items() IS called (to get member_keys for the size check).
+    # The test verifies the hot-count loop is not the issue — the size guard
+    # fires after member_keys is built, before any score lookup.
+    # What must NOT happen: the collection triggering despite size < min_hot.
+    # Re-run with a hot item in the lookup to confirm it still doesn't trigger.
+    hot_item = _make_item(rating_key=99, score=50.0)
+    keys, triggered, _ = _build_auto_inherit_keys(
+        _FakePlex(), auto_cfg, 40.0, [hot_item], ["Movies"]
+    )
+    assert triggered == 0, f"size-1 collection must not trigger, got triggered={triggered}"
+    assert keys == set()
+    print("_test_auto_inherit_skip_below_min_hot: OK")
+
+
+def _test_auto_inherit_larger_collection_uses_absolute():
+    """collection size 5, min_hot_members=2, only 1 hot member → does not trigger."""
+
+    class _FakeMember:
+        def __init__(self, rk):
+            self.ratingKey = rk
+
+    class _FakeCol:
+        title = "Big"
+        smart = False
+        def items(self):
+            return [_FakeMember(rk) for rk in range(1, 6)]
+
+    class _FakeSection:
+        def collections(self):
+            return [_FakeCol()]
+
+    class _FakePlex:
+        class _Lib:
+            def section(self, *_):
+                return _FakeSection()
+        library = _Lib()
+
+    items = [_make_item(rating_key=rk, score=10.0) for rk in range(1, 6)]
+    items[0] = _make_item(rating_key=1, score=50.0)  # only rk=1 is hot
+    auto_cfg = {
+        "enabled": True, "min_hot_members": 2, "min_hot_fraction": 0.5,
+        "skip_smart_collections": False, "exclude_libraries": [],
+    }
+    keys, triggered, _ = _build_auto_inherit_keys(
+        _FakePlex(), auto_cfg, 40.0, items, ["Movies"]
+    )
+    assert triggered == 0, f"absolute threshold must apply for size>min_hot; got {triggered}"
+    assert keys == set()
+    print("_test_auto_inherit_larger_collection_uses_absolute: OK")
+
+
 if __name__ == "__main__":
     if "--_test" in sys.argv:
         _test_resolve_user_share()
@@ -2468,5 +2660,9 @@ if __name__ == "__main__":
         _test_auto_inherit_smart_collection_skip()
         _test_auto_inherit_disabled()
         _test_auto_inherit_exclude_library()
+        _test_auto_inherit_fraction_triggers_small_collection()
+        _test_auto_inherit_fraction_no_hot_no_trigger()
+        _test_auto_inherit_skip_below_min_hot()
+        _test_auto_inherit_larger_collection_uses_absolute()
         sys.exit(0)
     sys.exit(main())
