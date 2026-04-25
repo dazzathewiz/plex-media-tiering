@@ -15,6 +15,7 @@ prints the analysis table. It still doesn't move anything — that's P2.
 |-------|--------------|--------|
 | P0 | Plex connect + scoring + table output. Read-only. | **Done** |
 | P0.1 | Pinning (library + title), recency floor, projected-tier footer. | **Done** |
+| P0.3 | Collection pinning — force every member of a named Plex collection to HOT. | **Done** |
 | P0.4 | Added-date floor — promote recently-added movies and TV shows with fresh episodes to HOT. | **Done** |
 | P1 | Filesystem probing to detect current tier. Auto-detect array disks + Plex path translation. Majority-bytes rollup. | **Done** |
 | P0.2 | Collection-aware grouping (Harry Potter, Hunger Games, etc.). | Pending |
@@ -309,7 +310,7 @@ or found by auto-detect). If either is missing, outcomes degrade to
 
 ### Overrides: pinning + recency + added floors
 
-Five-step precedence applied after scoring (highest wins):
+Six-step precedence applied after scoring (highest wins):
 
 1. **`pinning.always_hot_libraries`** — list of library names (case-insensitive
    exact match). Every item in those libraries is `PIN_HOT`. Useful for things
@@ -318,9 +319,10 @@ Five-step precedence applied after scoring (highest wins):
    Any item whose title contains one of these is `PIN_HOT`. Great for long-tail
    favourites — pinning `"Stargate"` catches SG-1, Atlantis, Universe, Origins
    and the movie in a single entry.
-3. **Added-date floor** — promote-only, never demotes. See below.
-4. Raw score → HOT / WARM / NEUTRAL.
-5. **`thresholds.hot_recency_days`** — recency floor. If a show or movie was
+3. **`pinned_collections`** — collection pin. See below.
+4. **Added-date floor** — promote-only, never demotes. See below.
+5. Raw score → HOT / WARM / NEUTRAL.
+6. **`thresholds.hot_recency_days`** — recency floor. If a show or movie was
    last played within this window, it's promoted to HOT even if the raw score
    lands in NEUTRAL or WARM. This catches infrequent-but-active shows (one
    episode every few weeks) that the play-weighted score otherwise demotes.
@@ -328,6 +330,32 @@ Five-step precedence applied after scoring (highest wins):
 
 Pinning and floor promotions tag the `score_breakdown` with an `override` key
 so `--explain` shows why the item was promoted past its raw score.
+
+#### Collection pinning
+
+Force every member of a named Plex collection to HOT, regardless of score.
+Useful for hand-curated "always keep hot" groups — an MCU collection, a
+"Kids favourites" collection, a "Currently watching" collection managed from
+the Plex UI.
+
+```yaml
+pinned_collections:
+  - library: "Movies"
+    name: "Marvel Cinematic Universe"
+  - library: "TV Shows"
+    name: "Must Watch"
+```
+
+Both `library` and `name` are required per entry. `library` is case-sensitive
+(must match the Plex library name exactly). `name` is case-insensitive exact
+match against the collection title. Members show `outcome=PIN_HOT`. An empty
+list (the default) disables collection pinning entirely.
+
+If a collection or library isn't found, tier.py logs a WARNING and continues —
+a typo in config won't abort a scheduled run.
+
+The footer line `Collection-pin promotions: N items` counts how many items were
+pinned by this rule.
 
 #### Added-date floor
 

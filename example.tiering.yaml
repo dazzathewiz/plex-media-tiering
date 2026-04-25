@@ -57,6 +57,19 @@ pinning:
     # - "The Expanse"            # any title containing 'the expanse'
     # - "Stargate"               # catches SG-1, Atlantis, Universe, etc.
 
+# Collection pinning — force every member of a named Plex collection to HOT
+# regardless of score. Each entry needs both a library name (case-sensitive,
+# must match Plex exactly) and a collection name (case-insensitive exact match).
+# Members show outcome=PIN_HOT. Empty list disables this feature.
+pinned_collections: []
+  # Examples — uncomment to enable:
+  # - library: "Movies"
+  #   name: "Marvel Cinematic Universe"   # whole MCU collection -> HOT
+  # - library: "Movies"
+  #   name: "Star Wars"
+  # - library: "TV Shows"
+  #   name: "Must Watch"                  # a manual "keep hot" collection
+
 # Human-readable rotating log. In the container, /config is a bind-mount to
 # /mnt/user/appdata/plex-media-tiering, so the log is readable from the Unraid GUI's
 # file manager or any SMB mount.

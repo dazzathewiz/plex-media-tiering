@@ -40,6 +40,7 @@ CLAUDE.md and GEMINI.md are symlinks to this file.
 |---|---|---|
 | P0   | Plex catalog + history + scoring + table output, read-only | Done |
 | P0.1 | Pinning (library + title), recency floor, projected-tier footer | Done |
+| P0.3 | Collection pinning — force every member of a named Plex collection to HOT | Done |
 | P0.4 | Added-date floor — promote recently-added movies and TV shows with fresh episodes to HOT | Done |
 | P1   | Filesystem tier detection, path translation, majority-bytes rollup | Done |
 | P0.2 | Collection-aware grouping (Harry Potter, etc.) | Pending |
@@ -114,15 +115,37 @@ the `year` field. Cosmetic only — doesn't affect scoring.
 
 1. Library pin (case-insensitive exact match on library name) → HOT + pinned
 2. Title pin (case-insensitive substring) → HOT + pinned
-3. Added-date floor (if `item.recently_added`) → HOT
-4. Raw score → HOT / WARM / NEUTRAL
-5. Recency floor (only if raw rec was NEUTRAL or WARM, and last_played is
+3. Collection pin (if `item.collection_pinned`) → HOT + pinned
+4. Added-date floor (if `item.recently_added`) → HOT
+5. Raw score → HOT / WARM / NEUTRAL
+6. Recency floor (only if raw rec was NEUTRAL or WARM, and last_played is
    within `hot_recency_days`) → HOT
 
 Pinning wins over everything. Both floors are promote-only, never demote.
 The added-date floor sits above raw score so NEUTRAL items get promoted
 before the score check. Recency floor sits below raw score and only fires
 when the score alone didn't reach HOT.
+
+### Collection pin
+
+`pinned_collections` config is a list of `{library, name}` entries. At
+startup, `_build_collection_pinned_keys(plex, pinned_collections_cfg)`
+resolves each entry to the set of `ratingKey` ints belonging to that
+collection (via `section.collections()` → case-insensitive title match →
+`col.items()`). The resulting set is then used in `collect_all()` to stamp
+`item.collection_pinned = True` on matching items before scoring.
+
+Key invariants:
+
+- Missing library or collection name → WARNING + skip (not abort).
+- Empty `pinned_collections` list → no Plex calls at all (fast path).
+- `item.rating_key` is populated for both movies and TV shows from
+  `primary.ratingKey` / `show.ratingKey` during collection.
+- Collection pin always returns `pinned=True`, so `_combine_outcome()`
+  maps it to `PIN_HOT` for all current-tier states — consistent with
+  library and title pins.
+- Footer: `Collection-pin promotions: N items` (only logged when
+  `pinned_collections` is non-empty).
 
 ### Two-floor promotion model
 
