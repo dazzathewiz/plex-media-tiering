@@ -43,6 +43,7 @@ CLAUDE.md and GEMINI.md are symlinks to this file.
 | P0.2 | Auto-inherit — when ≥N members of a collection naturally score HOT, promote the whole collection | Done |
 | P0.3 | Collection pinning — force every member of a named Plex collection to HOT | Done |
 | P0.4 | Added-date floor — promote recently-added movies and TV shows with fresh episodes to HOT | Done |
+| P0.5 | Disk eviction mode — mark warm-tier array disks as evicting; items on them get RELOCATE_WARM. Data model + reporting only; actual moves are P2 | Done |
 | P1   | Filesystem tier detection, path translation, majority-bytes rollup | Done |
 | P2   | `--apply`: rsync moves + Plex rescan | Pending |
 | P3   | Hardening: lock file, currently-playing skip, free-space check, move cap | Pending |
@@ -293,6 +294,40 @@ See `_combine_outcome()` for the full logic. Key invariants:
 - The projected-tier bucket for each outcome is fixed in `_HOT_OUTCOMES`
   / `_WARM_OUTCOMES`. P2 reads this mapping too — if you add a new
   outcome, update the sets.
+
+### Disk eviction (P0.5)
+
+`array_disk_evict` marks specific warm-tier array disks as evicting. Items
+whose files majority-reside on an evicting disk and would otherwise `STAY_WARM`
+are changed to `RELOCATE_WARM`. Actual moves are P2.
+
+**Why RELOCATE_WARM exists rather than overloading STAY_WARM.** Eviction is
+orthogonal to the tier decision. An item on an evicting disk isn't on the wrong
+*tier* — it's on the wrong *disk within that tier*. Overloading STAY_WARM
+would lose the signal that P2's mover needs to choose a different destination
+disk rather than leaving the file alone. A distinct outcome keeps the
+semantics clean and lets P2 read the outcome alphabet unambiguously.
+
+**Why TO_HOT items on evict disks don't get a new outcome.** Moving an item
+from an evicting WARM disk to the HOT pool resolves the eviction implicitly —
+the item vacates the bad disk regardless of which path triggered the move.
+Introducing a parallel outcome (e.g. `EVICT_TO_HOT`) would add combinatorial
+complexity with no benefit: P2 would take the same action either way.
+
+**Hot-tier eviction is out of scope for v1.** ZFS pool drive eviction is a
+different problem — ZFS handles it via `zpool replace`, not via file-level
+moves. Adding hot-tier eviction would require destination-pool selection logic
+that belongs in a dedicated ZFS-aware subsystem, not in tier.py's simple
+prefix-based classifier.
+
+**Disk validation.** `_build_evict_disks()` validates each configured path
+against the effective `array_disks` list (post-auto-detect). A path not in
+the effective list gets a WARNING and is skipped — it's not a real warm disk
+tier.py knows about, so targeting it would be unsafe.
+
+**Footer accounting.** `RELOCATE_WARM` is in `_WARM_OUTCOMES` so the
+projected-WARM size total includes items that will relocate within the warm
+tier. They are NOT leaving the warm tier, just changing disks within it.
 
 ### Graceful degradation
 

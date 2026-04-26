@@ -19,6 +19,10 @@ Phase status:
   P0.4 (done)       Added-date floor — promote recently-added movies and
                     TV shows with fresh episodes to HOT regardless of
                     play count.
+  P0.5 (done)       Disk eviction mode — mark warm-tier array disks as
+                    evicting; items on them get RELOCATE_WARM so P2
+                    knows to move them regardless of tier score. Data
+                    model + reporting only; actual moves are P2.
   P1  (this file)   Filesystem probing to detect current tier. Auto-
                     detects array disks, translates Plex-side paths via
                     plex_path_map, rolls multi-part items up by bytes.
@@ -147,6 +151,15 @@ DEFAULT_CONFIG = {
         # longest matching plex prefix on each reported path is replaced
         # with the corresponding tier prefix. Empty list = no translation.
         "plex_path_map": [],
+    },
+    # Disk eviction — mark specific warm-tier array disks as evicting.
+    # Items whose files majority-reside on an evicting disk and would
+    # otherwise STAY_WARM are flagged RELOCATE_WARM so P2's mover will
+    # move them to a different warm disk (or hot, if the score says so).
+    # Actual moves are P2; this is data-model + reporting only.
+    "array_disk_evict": {
+        "enabled": False,
+        "disks": [],  # disk paths matching paths.array_disks format
     },
     "logging": {
         "path": "/config/tier.log",  # container-friendly default
@@ -348,6 +361,7 @@ class Item:
     score: float
     # --- filled in at P1+ ---
     current_tier: str = "UNKNOWN"  # 'HOT' | 'WARM' | 'UNKNOWN'
+    current_disk: Optional[str] = None  # dominant warm disk path; None if HOT/UNKNOWN/MIXED
     # --- decision ---
     outcome: str = "NEUTRAL"       # See decide_outcome() for P0 values
     # --- collection-pin support ---
@@ -527,6 +541,31 @@ def resolve_array_disks(cfg: dict) -> List[str]:
     return detected
 
 
+def _build_evict_disks(evict_cfg: dict, array_disks: List[str]) -> set:
+    """Return validated set of evicting disk paths from array_disk_evict config.
+
+    Logs a WARNING for any configured disk that isn't in the effective
+    array_disks list (typo, stale path, or disk removed from config).
+    Returns an empty set when disabled, when the disks list is empty, or when
+    all entries failed validation — in all cases no eviction lines are logged.
+    """
+    if not evict_cfg.get("enabled"):
+        return set()
+    raw = [str(d).rstrip("/") for d in (evict_cfg.get("disks") or [])]
+    if not raw:
+        return set()
+    valid_array = set(array_disks)
+    result = set()
+    for d in raw:
+        if d in valid_array:
+            result.add(d)
+        else:
+            log.warning(
+                "Eviction: disk %r not in effective array_disks list — skipping", d
+            )
+    return result
+
+
 def translate_plex_path(plex_path: str, path_map) -> str:
     """Translate a Plex-reported path to a tier-container path.
 
@@ -621,14 +660,15 @@ def resolve_item_current_tier(
     hot_mount: str,
     array_disks: List[str],
     user_share_prefix: str = "",
-) -> Tuple[str, dict]:
+) -> Tuple[str, dict, Optional[str]]:
     """Majority-bytes rollup of tier for a multi-part item.
 
     parts: iterable of (plex_file_path, size_bytes).
     Returns:
-      (tier_str, breakdown)
+      (tier_str, breakdown, dominant_warm_disk)
       tier_str: 'HOT' | 'WARM' | 'MIXED' | 'UNKNOWN'
       breakdown: dict of per-tier byte shares (0.0..1.0)
+      dominant_warm_disk: path of the WARM disk with most bytes, or None
 
     Decision rules:
       - Majority (>50%) bytes on HOT  -> HOT
@@ -637,6 +677,7 @@ def resolve_item_current_tier(
       - Otherwise (50/50 tie, or no clear majority) -> MIXED
     """
     totals = {"HOT": 0, "WARM": 0, "UNKNOWN": 0}
+    disk_bytes: dict = {}  # warm disk path -> bytes on that disk
     total = 0
     for plex_path, size in parts:
         if not size or size <= 0:
@@ -646,16 +687,23 @@ def resolve_item_current_tier(
         resolved = resolve_user_share(translated, user_share_prefix, hot_mount, array_disks)
         tier = classify_path(resolved, hot_mount, array_disks)
         totals[tier] += size
+        if tier == "WARM":
+            for disk in array_disks or []:
+                d = disk.rstrip("/")
+                if resolved == d or resolved.startswith(d + "/"):
+                    disk_bytes[disk] = disk_bytes.get(disk, 0) + size
+                    break
+    dominant = max(disk_bytes, key=disk_bytes.__getitem__) if disk_bytes else None
     if total == 0:
-        return "UNKNOWN", {"HOT": 0.0, "WARM": 0.0, "UNKNOWN": 0.0}
+        return "UNKNOWN", {"HOT": 0.0, "WARM": 0.0, "UNKNOWN": 0.0}, None
     split = {k: round(v / total, 4) for k, v in totals.items()}
     if split["HOT"] > 0.5:
-        return "HOT", split
+        return "HOT", split, None
     if split["WARM"] > 0.5:
-        return "WARM", split
+        return "WARM", split, dominant
     if split["UNKNOWN"] > 0.5:
-        return "UNKNOWN", split
-    return "MIXED", split
+        return "UNKNOWN", split, None
+    return "MIXED", split, dominant
 
 
 def _media_parts(media_list) -> Iterable[Tuple[str, int]]:
@@ -1232,12 +1280,13 @@ def collect_movies(
 
         # Current tier (P1). Probes only if tier detection is configured.
         current_tier = "UNKNOWN"
+        current_disk: Optional[str] = None
         tier_split: Optional[dict] = None
         if tier_probing:
             parts = []
             for m in group:
                 parts.extend(_media_parts(getattr(m, "media", None)))
-            current_tier, tier_split = resolve_item_current_tier(
+            current_tier, tier_split, current_disk = resolve_item_current_tier(
                 parts, path_map, hot_mount, array_disks, user_share_prefix,
             )
             if tier_split:
@@ -1259,6 +1308,7 @@ def collect_movies(
             size_bytes=size,
             score=score,
             current_tier=current_tier,
+            current_disk=current_disk,
             outcome="NEUTRAL",  # finalised in post-scoring override pass
             rating_key=primary_rk,
             recently_added=recently_added,
@@ -1338,12 +1388,13 @@ def collect_series(
 
         # Current tier (P1): majority-bytes rollup across every episode.
         current_tier = "UNKNOWN"
+        current_disk: Optional[str] = None
         tier_split: Optional[dict] = None
         if tier_probing:
             parts = []
             for ep in episodes:
                 parts.extend(_media_parts(getattr(ep, "media", None)))
-            current_tier, tier_split = resolve_item_current_tier(
+            current_tier, tier_split, current_disk = resolve_item_current_tier(
                 parts, path_map, hot_mount, array_disks, user_share_prefix,
             )
             if tier_split:
@@ -1360,6 +1411,7 @@ def collect_series(
             size_bytes=size,
             score=score,
             current_tier=current_tier,
+            current_disk=current_disk,
             outcome="NEUTRAL",  # finalised in post-scoring override pass
             rating_key=rk,
             recently_added=recently_added,
@@ -1591,6 +1643,33 @@ def collect_all(plex: PlexServer, cfg: dict, filter_libraries) -> List[Item]:
     for it in items:
         _apply_overrides(it, cfg, now)
 
+    # Eviction pass: items on eviction-marked warm disks that would STAY_WARM
+    # are flagged RELOCATE_WARM so P2's mover knows to relocate them.
+    evict_cfg = cfg.get("array_disk_evict") or {}
+    if evict_cfg.get("enabled"):
+        evict_disks = _build_evict_disks(evict_cfg, array_disks)
+        if evict_disks:
+            items_on_evict = [
+                it for it in items
+                if it.current_disk is not None and it.current_disk in evict_disks
+            ]
+            log.info(
+                "Eviction: %d disks marked (%s), %d items currently on evicting disks",
+                len(evict_disks), ", ".join(sorted(evict_disks)), len(items_on_evict),
+            )
+            relocate_count = 0
+            implicit_hot_count = 0
+            for it in items_on_evict:
+                if it.outcome == "STAY_WARM":
+                    it.outcome = "RELOCATE_WARM"
+                    relocate_count += 1
+                elif it.outcome in _HOT_OUTCOMES:
+                    implicit_hot_count += 1
+            log.info(
+                "Eviction: %d items flagged RELOCATE_WARM (TO_HOT path: %d)",
+                relocate_count, implicit_hot_count,
+            )
+
     return items
 
 
@@ -1611,7 +1690,7 @@ def _fmt_size(gb: float) -> str:
 # executed. The bucket reflects where the item will END UP, not where it
 # currently sits — so TO_HOT + STAY_HOT + PIN_HOT all go into HOT.
 _HOT_OUTCOMES = {"SHOULD_BE_HOT", "PIN_HOT", "STAY_HOT", "TO_HOT"}
-_WARM_OUTCOMES = {"SHOULD_BE_WARM", "STAY_WARM", "TO_WARM"}
+_WARM_OUTCOMES = {"SHOULD_BE_WARM", "STAY_WARM", "TO_WARM", "RELOCATE_WARM"}
 # MIXED_NEUTRAL = item is split 50/50 with no direction to resolve it.
 # Leave under NEUTRAL; P2 takes no action.
 
@@ -2639,6 +2718,62 @@ def _test_auto_inherit_larger_collection_uses_absolute():
     print("_test_auto_inherit_larger_collection_uses_absolute: OK")
 
 
+def _test_eviction_stay_warm_becomes_relocate():
+    """Item on evict-marked disk with natural STAY_WARM -> outcome RELOCATE_WARM."""
+    item = _make_item(score=25.0, current_tier="WARM", current_disk="/mnt/disk7")
+    item.outcome = "STAY_WARM"
+    evict_cfg = {"enabled": True, "disks": ["/mnt/disk7"]}
+    evict_disks = _build_evict_disks(evict_cfg, ["/mnt/disk7", "/mnt/disk1"])
+    assert evict_disks == {"/mnt/disk7"}
+    items_on_evict = [it for it in [item] if it.current_disk in evict_disks]
+    for it in items_on_evict:
+        if it.outcome == "STAY_WARM":
+            it.outcome = "RELOCATE_WARM"
+    assert item.outcome == "RELOCATE_WARM", f"expected RELOCATE_WARM, got {item.outcome}"
+    assert "RELOCATE_WARM" in _WARM_OUTCOMES, "RELOCATE_WARM must be in _WARM_OUTCOMES"
+    print("_test_eviction_stay_warm_becomes_relocate: OK")
+
+
+def _test_eviction_to_hot_stays_to_hot():
+    """Item on evict-marked disk with natural TO_HOT -> outcome stays TO_HOT."""
+    item = _make_item(score=55.0, current_tier="WARM", current_disk="/mnt/disk7")
+    item.outcome = "TO_HOT"
+    evict_cfg = {"enabled": True, "disks": ["/mnt/disk7"]}
+    evict_disks = _build_evict_disks(evict_cfg, ["/mnt/disk7", "/mnt/disk1"])
+    items_on_evict = [it for it in [item] if it.current_disk in evict_disks]
+    for it in items_on_evict:
+        if it.outcome == "STAY_WARM":
+            it.outcome = "RELOCATE_WARM"
+    assert item.outcome == "TO_HOT", f"expected TO_HOT unchanged, got {item.outcome}"
+    print("_test_eviction_to_hot_stays_to_hot: OK")
+
+
+def _test_eviction_non_evict_disk_unaffected():
+    """Item on non-evict disk -> outcome unaffected even if other disks are in evict set."""
+    item = _make_item(score=25.0, current_tier="WARM", current_disk="/mnt/disk1")
+    item.outcome = "STAY_WARM"
+    evict_cfg = {"enabled": True, "disks": ["/mnt/disk7"]}
+    evict_disks = _build_evict_disks(evict_cfg, ["/mnt/disk7", "/mnt/disk1"])
+    items_on_evict = [it for it in [item] if it.current_disk in evict_disks]
+    for it in items_on_evict:
+        if it.outcome == "STAY_WARM":
+            it.outcome = "RELOCATE_WARM"
+    assert item.outcome == "STAY_WARM", f"expected STAY_WARM unchanged, got {item.outcome}"
+    print("_test_eviction_non_evict_disk_unaffected: OK")
+
+
+def _test_eviction_disabled_no_items_flagged():
+    """enabled=False -> no items flagged, _build_evict_disks returns empty set."""
+    item = _make_item(score=25.0, current_tier="WARM", current_disk="/mnt/disk7")
+    item.outcome = "STAY_WARM"
+    evict_cfg = {"enabled": False, "disks": ["/mnt/disk7"]}
+    evict_disks = _build_evict_disks(evict_cfg, ["/mnt/disk7"])
+    assert evict_disks == set(), f"expected empty set when disabled, got {evict_disks}"
+    # No eviction pass runs when evict_disks is empty
+    assert item.outcome == "STAY_WARM", "outcome must be unchanged when disabled"
+    print("_test_eviction_disabled_no_items_flagged: OK")
+
+
 if __name__ == "__main__":
     if "--_test" in sys.argv:
         _test_resolve_user_share()
@@ -2664,5 +2799,9 @@ if __name__ == "__main__":
         _test_auto_inherit_fraction_no_hot_no_trigger()
         _test_auto_inherit_skip_below_min_hot()
         _test_auto_inherit_larger_collection_uses_absolute()
+        _test_eviction_stay_warm_becomes_relocate()
+        _test_eviction_to_hot_stays_to_hot()
+        _test_eviction_non_evict_disk_unaffected()
+        _test_eviction_disabled_no_items_flagged()
         sys.exit(0)
     sys.exit(main())
