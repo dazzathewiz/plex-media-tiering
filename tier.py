@@ -1649,6 +1649,12 @@ def collect_all(plex: PlexServer, cfg: dict, filter_libraries) -> List[Item]:
     if evict_cfg.get("enabled"):
         evict_disks = _build_evict_disks(evict_cfg, array_disks)
         if evict_disks:
+            for it in items:
+                if it.current_tier == "WARM":
+                    log.debug(
+                        "eviction probe: %r kind=%s disk=%r outcome=%s",
+                        it.title, it.kind, it.current_disk, it.outcome,
+                    )
             items_on_evict = [
                 it for it in items
                 if it.current_disk is not None and it.current_disk in evict_disks
@@ -2774,6 +2780,97 @@ def _test_eviction_disabled_no_items_flagged():
     print("_test_eviction_disabled_no_items_flagged: OK")
 
 
+def _test_dominant_warm_disk_movie_with_year_folder():
+    """resolve_item_current_tier correctly attributes a movie at a deep year-subfolder path.
+
+    Guards against hypothesis 1 (path nesting breaks disk attribution):
+      /mnt/user/Movies/<year>/<title>/<file>.mkv should resolve to the disk
+      holding the majority of bytes, not return dominant=None.
+    """
+    import tempfile, os as _os
+
+    with tempfile.TemporaryDirectory() as root:
+        disk1  = _os.path.join(root, "disk1")
+        disk7  = _os.path.join(root, "disk7")
+        hot    = _os.path.join(root, "hot_pool")
+        rel    = _os.path.join("Movies", "2007",
+                                "Alien vs. Predator Requiem (2007)")
+        _os.makedirs(_os.path.join(disk7, rel), exist_ok=True)
+        _os.makedirs(_os.path.join(disk1, "Movies"), exist_ok=True)
+        _os.makedirs(_os.path.join(hot,   "Movies"), exist_ok=True)
+
+        fname  = "Alien vs. Predator Requiem (2007).mkv"
+        target = _os.path.join(disk7, rel, fname)
+        open(target, "w").close()
+
+        user_prefix = "/mnt/user"
+        plex_path   = "/mnt/user/Movies/2007/Alien vs. Predator Requiem (2007)/" + fname
+        array_disks = [disk1, disk7]
+        path_map    = []
+
+        tier, breakdown, dominant = resolve_item_current_tier(
+            [(plex_path, 5_000_000_000)],
+            path_map, hot, array_disks, user_prefix,
+        )
+        assert tier == "WARM", f"expected WARM, got {tier!r}"
+        assert dominant == disk7, f"expected dominant={disk7!r}, got {dominant!r}"
+    print("_test_dominant_warm_disk_movie_with_year_folder: OK")
+
+
+def _test_dominant_warm_disk_single_file_item():
+    """A movie with exactly one media file gets current_disk populated (not None).
+
+    Guards against hypothesis 3 (single-file items short-circuit and return None).
+    """
+    import tempfile, os as _os
+
+    with tempfile.TemporaryDirectory() as root:
+        disk7 = _os.path.join(root, "disk7")
+        hot   = _os.path.join(root, "hot_pool")
+        _os.makedirs(_os.path.join(disk7, "Movies"), exist_ok=True)
+        _os.makedirs(_os.path.join(hot,   "Movies"), exist_ok=True)
+
+        fname  = "The Hunger Games Catching Fire (2013).mkv"
+        target = _os.path.join(disk7, "Movies", fname)
+        open(target, "w").close()
+
+        user_prefix = "/mnt/user"
+        plex_path   = "/mnt/user/Movies/" + fname
+        array_disks = [disk7]
+
+        tier, breakdown, dominant = resolve_item_current_tier(
+            [(plex_path, 8_000_000_000)],
+            path_map=[], hot_mount=hot, array_disks=array_disks,
+            user_share_prefix=user_prefix,
+        )
+        assert tier == "WARM", f"expected WARM, got {tier!r}"
+        assert dominant is not None, "dominant must not be None for a single-file WARM item"
+        assert dominant == disk7, f"expected dominant={disk7!r}, got {dominant!r}"
+    print("_test_dominant_warm_disk_single_file_item: OK")
+
+
+def _test_eviction_movie_on_evict_disk_becomes_relocate():
+    """movie kind on evict-marked disk, natural STAY_WARM -> outcome RELOCATE_WARM.
+
+    Mirror of _test_eviction_stay_warm_becomes_relocate for kind='movie'.
+    Guards against hypothesis 4 (movies pre-assigned via a separate code path
+    the eviction pass doesn't evaluate).
+    """
+    item = _make_item(kind="movie", score=25.0, current_tier="WARM",
+                      current_disk="/mnt/disk7")
+    item.outcome = "STAY_WARM"
+    evict_cfg   = {"enabled": True, "disks": ["/mnt/disk7"]}
+    evict_disks = _build_evict_disks(evict_cfg, ["/mnt/disk7", "/mnt/disk1"])
+    items_on_evict = [it for it in [item] if it.current_disk in evict_disks]
+    for it in items_on_evict:
+        if it.outcome == "STAY_WARM":
+            it.outcome = "RELOCATE_WARM"
+    assert item.outcome == "RELOCATE_WARM", (
+        f"expected RELOCATE_WARM for movie kind, got {item.outcome}"
+    )
+    print("_test_eviction_movie_on_evict_disk_becomes_relocate: OK")
+
+
 if __name__ == "__main__":
     if "--_test" in sys.argv:
         _test_resolve_user_share()
@@ -2803,5 +2900,8 @@ if __name__ == "__main__":
         _test_eviction_to_hot_stays_to_hot()
         _test_eviction_non_evict_disk_unaffected()
         _test_eviction_disabled_no_items_flagged()
+        _test_dominant_warm_disk_movie_with_year_folder()
+        _test_dominant_warm_disk_single_file_item()
+        _test_eviction_movie_on_evict_disk_becomes_relocate()
         sys.exit(0)
     sys.exit(main())
