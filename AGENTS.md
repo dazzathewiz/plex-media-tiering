@@ -7,9 +7,9 @@ re-litigate (and get wrong) from reading the diff alone.
 
 A single-file Python script (`tier.py`) that asks Plex which media is
 hot/cold, probes the local filesystem to see where each item currently
-lives, and recommends where it *should* live — on a fast pool (HOT) or a
-parity array (WARM). Phased design; it refuses to actually move anything
-until P2 ships.
+lives, and recommends — and now executes — moves between a fast pool (HOT)
+and a parity array (WARM). Move execution is opt-in (`moves.enabled: true`
++ `--apply`); dry-run is the default.
 
 Runs as a one-shot Docker container scheduled by Unraid's User Scripts
 plugin. Image is built by GitHub Actions on every push to `main`, multi-
@@ -45,7 +45,9 @@ CLAUDE.md and GEMINI.md are symlinks to this file.
 | P0.4 | Added-date floor — promote recently-added movies and TV shows with fresh episodes to HOT | Done |
 | P0.5 | Disk eviction mode — mark warm-tier array disks as evicting; items on them get RELOCATE_WARM. Data model + reporting only; actual moves are P2 | Done |
 | P1   | Filesystem tier detection, path translation, majority-bytes rollup | Done |
-| P2   | `--apply`: rsync moves + Plex rescan | Pending |
+| P2.1 | Move executor — TO_HOT direction; rsync + size-verify + source delete; parity guard; dry-run by default | Done |
+| P2.2 | TO_WARM + RELOCATE_WARM moves | Pending |
+| P2.3 | Plex rescan automation post-move | Pending |
 | P3   | Hardening: lock file, currently-playing skip, free-space check, move cap | Pending |
 | P4   | Scheduled cron + size-triggered wrapper | Pending |
 
@@ -386,6 +388,54 @@ unaffected. If a file doesn't exist on any probed mount the original
 (unresolved) path is returned and `classify_path()` marks it UNKNOWN,
 preserving graceful degradation.
 
+### Move executor (P2.1)
+
+**Why TO_HOT is shipped first (lowest-risk direction).**
+The source is the parity-protected Unraid array; the destination is a separate
+ZFS pool with no redundancy contract with the source. A failed move doesn't
+reduce redundancy — the source is parity-protected until we explicitly delete
+it post-verification. There is also no destination-disk selection problem (the
+ZFS pool is a single target). This makes TO_HOT the cleanest first cut without
+importing P3's free-space-budget complexity.
+
+**Why source deletion is gated on size-verify.**
+Silent data loss is the worst possible failure mode for a file mover. rsync
+exiting 0 doesn't guarantee a complete transfer — disk-full conditions, network
+interruptions, or corruption can leave a truncated destination. The size-verify
+step (`du -sb` on source and destination, tolerance ≤ 1 KB) is the only safety
+gate between a failed rsync and a deleted source. Never bypass it to save time.
+
+**Why moves are serial, not parallel.**
+Parallel rsyncs against a parity-protected Unraid array thrash the parity disk
+and can cause I/O contention that degrades both array performance and parity
+integrity. The throughput gain from parallelism is marginal compared to the risk.
+P2.2 will revisit if operators request it, with explicit caveats.
+
+**Why parity check is a blocker, not a warning.**
+Unraid's parity recalculation reads every data block and recomputes expected
+parity. A concurrent write (which rsync produces) changes a block after parity
+has been sampled, leaving the array with a parity mismatch for that stripe.
+This is silent unless the next parity check reveals it. Aborting the move pass
+before any rsync call is the only safe behaviour. The `parity_check_blocking:
+false` escape hatch exists for operators who understand the risk and have a
+specific reason to proceed.
+
+**Why `[SKIPPED]` for already-HOT items is an idempotency net.**
+If the script is re-run after a partial apply, some TO_HOT items may have
+already arrived on the hot pool (because rsync succeeded but the run was
+interrupted before the summary logged). Detecting `current_tier == HOT` on a
+TO_HOT item and logging SKIPPED instead of re-rsyncing is a cheap idempotency
+guard that prevents double-rsyncing. It does not indicate a scoring error.
+
+**`Item.source_dir` — common-ancestor directory of files on dominant disk.**
+`resolve_item_current_tier()` now returns a fourth value: the common ancestor
+directory of all resolved file paths on the dominant WARM disk. For a single
+movie file at `/mnt/disk4/Movies/Foo/foo.mkv` it is the parent directory
+`/mnt/disk4/Movies/Foo`. For a TV series spanning multiple season subdirectories
+it is the common prefix, e.g. `/mnt/disk4/TV Shows/Show (2001)`. This is what
+P2's rsync uses as the source. Do not refactor to "title-derived path" — the
+actual filesystem layout is the ground truth, not the Plex title string.
+
 ## Config shape
 
 `example.tiering.yaml` is the canonical source. It auto-seeds `/config/
@@ -406,18 +456,21 @@ merges over the user config via `_deep_merge()`. Keep the two in sync.
 
 ## Development rules
 
-### Read-only at runtime (until P2)
+### Write only to `/config` at runtime
 
 The container bind-mounts media read-only. `tier.py` must NOT write
 outside `/config`. If you need to spill state, put it in `/config/
-state.json` — the volume is persistent and already mounted.
+state.json` — the volume is persistent and already mounted. The one
+exception is the move executor, which writes to the hot pool destination;
+that path is a separate read-write mount.
 
-### No `--apply` without phase-gate
+### `--apply` is now live in P2.1 (TO_HOT only)
 
-`--apply` exists in the argparser and immediately exits with code 3 in
-P0/P1. Do not wire it to actual rsync calls without a corresponding phase
-bump. P2 opens this up with safety guards (currently-playing skip,
-free-space check, move-size cap, lock file).
+`--apply` executes TO_HOT moves when `moves.enabled: true`. Adding
+support for new move directions (TO_WARM, RELOCATE_WARM) requires a
+corresponding phase bump to P2.2. The full P3 safety guards (currently-
+playing skip, free-space check, move-size cap, lock file) are still
+pending — don't add them piecemeal without the full P3 spec.
 
 ### Notifiers must not raise
 

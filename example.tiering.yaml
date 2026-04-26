@@ -171,6 +171,38 @@ array_disk_evict:
   # - "/mnt/disk7"   # disk developing bad sectors — drain before retirement
   # - "/mnt/disk2"   # cabling issues — drain before debug
 
+# Move executor (P2.1) — controls rsync moves from WARM array to HOT pool.
+#
+# Default: enabled=false — the move pass is skipped entirely (no log lines).
+# Set enabled=true to activate dry-run reporting. Add --apply on the CLI to
+# actually execute moves. Scope: TO_HOT only in P2.1.
+#
+# Recommended first-run sequence:
+#   1. Set enabled=true, leave --apply off. Confirm the dry-run list looks sane.
+#   2. Set delete_source_after_verify=false. Run with --apply on one test item.
+#      Confirm the destination has the file and source is untouched.
+#   3. Set delete_source_after_verify=true when you trust the verify step.
+moves:
+  enabled: false
+  # rsync flags applied to every move. -aH preserves permissions, timestamps,
+  # and hardlinks. --partial keeps partial transfers so a restart doesn't start
+  # from zero. --inplace writes directly to the destination file.
+  rsync_options: ["-aH", "--partial", "--inplace"]
+  # Delete the source directory after rsync exits 0 AND size-verify passes.
+  # Set false for the first few apply runs to keep the source as a safety net.
+  delete_source_after_verify: true
+  # Verify destination byte count matches source within 1 KB before deleting.
+  # Strongly recommended — disabling skips the only safety gate before delete.
+  size_verify: true
+  # Abort the move pass if an Unraid parity check or resync is in progress.
+  # Parity recalculation is sensitive to concurrent writes; blocking is safest.
+  # Set false if you need an escape hatch and understand the risk.
+  parity_check_blocking: true
+  # Throttle rsync to this many MB/s. null = unthrottled. Useful if you want
+  # moves to run in the background without saturating the array.
+  bandwidth_limit_mbps: null
+  # - 50    # example: cap at 50 MB/s
+
 # Capacity — not used in P0, wired up in P3.
 # Budget-aware promotion/demotion keeps the hot ZFS pool under the ceiling.
 capacity:

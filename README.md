@@ -5,9 +5,10 @@ watch history and age, and recommends whether each item should sit on the HOT
 tier (HDD ZFS pool) or the WARM tier (Unraid parity array). Scheduled to run
 monthly or when the ZFS pool fills past a threshold.
 
-**Current status: Phase P1 (read-only).** The script connects to Plex, computes
-scores, detects the current tier of each item by probing the filesystem, and
-prints the analysis table. It still doesn't move anything — that's P2.
+**Current status: Phase P2.1 — TO_HOT moves.** The script connects to Plex,
+computes scores, detects the current tier of each item, and (when
+`moves.enabled: true`) dry-runs or executes rsync moves from the Unraid parity
+array to the hot ZFS pool. Pass `--apply` to execute; default is dry-run.
 
 ## Phase roadmap
 
@@ -20,7 +21,9 @@ prints the analysis table. It still doesn't move anything — that's P2.
 | P0.4 | Added-date floor — promote recently-added movies and TV shows with fresh episodes to HOT. | **Done** |
 | P0.5 | Disk eviction — mark warm-tier array disks as evicting; items on them get `RELOCATE_WARM`. Data model + reporting only; actual moves are P2. | **Done** |
 | P1 | Filesystem probing to detect current tier. Auto-detect array disks + Plex path translation. Majority-bytes rollup. | **Done** |
-| P2 | `--apply` with rsync moves + Plex rescan. | Pending |
+| P2.1 | Move executor — TO_HOT direction. rsync from warm array to hot pool. Dry-run by default; `--apply` executes. | **Done** |
+| P2.2 | TO_WARM + RELOCATE_WARM moves. | Pending |
+| P2.3 | Plex rescan automation post-move. | Pending |
 | P3 | Hardened safeguards (lock file, currently-playing skip, free-space check, move-size cap). | Pending |
 | P4 | Scheduled cron + size-triggered wrapper. | Pending |
 
@@ -569,6 +572,90 @@ stays `current_tier = UNKNOWN` and its outcome degrades to `SHOULD_BE_*`
 rather than `STAY_*`/`TO_*`. Look for `current_tier: UNKNOWN` in
 `--explain` output — that's the tell.
 
+## Moves (P2)
+
+The move executor (P2.1) turns `TO_HOT` recommendations into actual rsync
+operations. It is opt-in and safe by default.
+
+### Enabling
+
+```yaml
+moves:
+  enabled: true
+```
+
+With `enabled: false` (the default), the move pass is skipped entirely — the
+dry-run analysis table still prints as usual.
+
+### Dry-run vs apply
+
+**Default (no `--apply`)** — dry-run. A `[DRY-RUN]` block logs every
+projected move with source path, destination path, size, and an ETA estimate
+at 200 MB/s throughput. No filesystem changes are made.
+
+```
+[DRY-RUN] Moves: TO_HOT=3 — 12.3 GB total — estimated 1m02s at 200 MB/s
+[DRY-RUN]   Foo (2010) — 4.2 GB — /mnt/disk4/Movies/Foo (2010) → /mnt/hot_pool/Movies/Foo (2010)
+...
+```
+
+**With `--apply`** — executes moves serially. Each item is rsynced, size-verified,
+and (if configured) source-deleted. A per-item `[SUCCESS]` / `[SKIPPED]` /
+`[FAILED]` line is logged with the elapsed time.
+
+### Scope (P2.1)
+
+Only `TO_HOT` items are moved in P2.1. Items with outcome `TO_WARM`,
+`RELOCATE_WARM`, `SHOULD_BE_HOT`, or `SHOULD_BE_WARM` are tallied in a single
+skip line and left for P2.2/P2.3.
+
+### Source deletion
+
+```yaml
+moves:
+  delete_source_after_verify: true   # default
+  size_verify: true                  # default
+```
+
+The source directory is only deleted if:
+
+1. rsync exits 0, **and**
+2. `size_verify: true` and the destination byte count matches source within 1 KB.
+
+Set `delete_source_after_verify: false` for the first few apply runs to keep
+the source as a safety net. The item will exist in both locations until you
+remove the source manually.
+
+### Parity-check guard
+
+```yaml
+moves:
+  parity_check_blocking: true   # default
+```
+
+Before starting any moves, tier.py reads `/proc/mdstat` to detect whether an
+Unraid parity check or resync is running. With `parity_check_blocking: true`
+(the default), the move pass aborts before any rsync call. Set `false` for an
+escape hatch if you know what you're doing.
+
+### Bandwidth throttle
+
+```yaml
+moves:
+  bandwidth_limit_mbps: 50   # limit rsync to 50 MB/s
+```
+
+Passes `--bwlimit` to rsync. `null` (default) = unthrottled.
+
+### Recommended first-run sequence
+
+1. Set `moves.enabled: true`, leave `--apply` off. Run and check the
+   `[DRY-RUN]` block looks correct.
+2. Set `delete_source_after_verify: false`. Run with `--apply` on a small test
+   item. Confirm the destination has the file and the source still exists.
+3. After watching a few successful apply runs, set
+   `delete_source_after_verify: true`.
+
 ## Tuning
 
 All thresholds live in `tiering.yaml`. After the first few runs, look for:
@@ -590,7 +677,6 @@ recency-floor promotions appear under the `override` key in the breakdown.
 | 0 | Success |
 | 1 | Config error (file missing, token placeholder, empty libraries) |
 | 2 | Plex unreachable or auth failed |
-| 3 | `--apply` used in P0 (not yet implemented) |
 | 4 | Unhandled runtime error (notification fired if configured) |
 | 130 | Interrupted (SIGINT) |
 
