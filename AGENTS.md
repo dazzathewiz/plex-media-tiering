@@ -329,6 +329,20 @@ tier.py knows about, so targeting it would be unsafe.
 projected-WARM size total includes items that will relocate within the warm
 tier. They are NOT leaving the warm tier, just changing disks within it.
 
+**Dominant warm disk rollup (`Item.current_disk`).** TV series commonly
+span multiple array disks (older seasons on one, newer on another).
+The eviction pass needs to attribute a series to exactly one disk. The
+chosen rule is **majority bytes**: whichever array disk holds the most
+bytes of the item wins and is stored as `Item.current_disk`. Consequences:
+
+- An item with only a small minority of bytes on an evicting disk does
+  **not** trigger `RELOCATE_WARM` — if 90% of a series is on disk1 and
+  10% on disk7, evicting disk7 does not justify moving the whole series.
+- `Item.current_disk` is only populated when `current_tier == "WARM"`.
+  HOT items don't get one — there is no per-disk concept on the ZFS pool.
+- Do not refactor to "first disk found" or a list of all disks containing
+  the item. The majority-bytes winner is intentional.
+
 ### Graceful degradation
 
 Tier detection activates only when BOTH `paths.hot_pool_mount` is set AND
