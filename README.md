@@ -18,6 +18,7 @@ prints the analysis table. It still doesn't move anything — that's P2.
 | P0.2 | Auto-inherit — when ≥N members of a collection naturally score HOT, promote the whole collection. | **Done** |
 | P0.3 | Collection pinning — force every member of a named Plex collection to HOT. | **Done** |
 | P0.4 | Added-date floor — promote recently-added movies and TV shows with fresh episodes to HOT. | **Done** |
+| P0.5 | Disk eviction — mark warm-tier array disks as evicting; items on them get `RELOCATE_WARM`. Data model + reporting only; actual moves are P2. | **Done** |
 | P1 | Filesystem probing to detect current tier. Auto-detect array disks + Plex path translation. Majority-bytes rollup. | **Done** |
 | P2 | `--apply` with rsync moves + Plex rescan. | Pending |
 | P3 | Hardened safeguards (lock file, currently-playing skip, free-space check, move-size cap). | Pending |
@@ -302,6 +303,7 @@ Outcomes:
 | `SHOULD_BE_WARM` | Score says WARM but current tier is UNKNOWN. |
 | `NEUTRAL` | In the score dead zone AND tier detection disabled. |
 | `MIXED_NEUTRAL` | Files are split exactly 50/50 across tiers with no score-based direction to resolve it. P2 leaves it alone. Very rare. |
+| `RELOCATE_WARM` | On a WARM disk marked for eviction. Score says keep warm, but P2 must move to a different warm disk. See [Disk eviction](#disk-eviction) below. |
 
 Tier detection activates automatically when `paths.hot_pool_mount` is set AND
 at least one array disk is known (either listed explicitly in `paths.array_disks`
@@ -454,6 +456,63 @@ thresholds:
 
 The footer line `Added-floor promotions: N items` in the run log counts how
 many items were promoted by this rule.
+
+## Disk eviction
+
+Mark one or more warm-tier array disks as "evicting" so items on them appear in
+the report as needing relocation — regardless of their tier score.
+
+**Use cases:**
+
+- A disk developing reallocated sectors that needs to retire before failure.
+- A disk with cabling or firmware issues you want to drain before debugging.
+- Rebalancing media across array disks to reclaim space or even wear.
+
+Eviction is orthogonal to the hot/warm tier decision. An item flagged
+`RELOCATE_WARM` isn't on the wrong *tier* — it's on the wrong *disk within
+that tier*. Its score still says WARM; only its current physical location is
+unacceptable.
+
+**Eviction does not move data — it flags items so the dry-run report shows
+what would move when P2's mover lands.**
+
+```yaml
+array_disk_evict:
+  enabled: true
+  disks:
+    - "/mnt/disk7"   # disk developing bad sectors — drain before retirement
+    - "/mnt/disk2"   # cabling issues — drain before debug
+```
+
+Disk paths must match the format used in `paths.array_disks` exactly
+(case-sensitive). A typo logs a `WARNING` per bad entry and is skipped; the
+run continues with the valid entries.
+
+### How outcomes change under eviction
+
+| Natural outcome on the evicting disk | Eviction outcome | Why |
+|---|---|---|
+| `STAY_WARM` | `RELOCATE_WARM` | Score says warm but P2 must pick a different warm disk. |
+| `TO_HOT` | `TO_HOT` (unchanged) | Move to hot resolves the eviction implicitly — no new outcome needed. |
+| `PIN_HOT` / `SHOULD_BE_HOT` | unchanged | Already going to HOT; eviction is resolved. |
+| Anything with `current_tier = HOT` | unchanged | Hot-tier eviction is out of scope for v1 (ZFS handles drive replacement). |
+
+### Log lines
+
+When enabled with at least one valid disk, two log lines appear per run:
+
+```text
+Eviction: 2 disks marked (/mnt/disk2, /mnt/disk7), 47 items currently on evicting disks
+Eviction: 31 items flagged RELOCATE_WARM (TO_HOT path: 16)
+```
+
+The first line shows scope. The second shows how items split: 31 need explicit
+relocation by P2's mover, 16 are already going to HOT and resolve the eviction
+implicitly. If `enabled: false` or the disk list is empty, no `Eviction:` lines
+appear.
+
+`RELOCATE_WARM` counts in the projected **WARM** size total in the run
+summary — these items are staying warm, just moving disks within that tier.
 
 ## Tier detection (P1)
 

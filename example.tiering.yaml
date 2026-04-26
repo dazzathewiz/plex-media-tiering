@@ -149,6 +149,28 @@ paths:
   #   - plex: "/data/tv"
   #     tier: "/mnt/user/TV Shows"
 
+# Disk eviction — mark specific warm-tier array disks as evicting so items
+# on them are flagged for relocation regardless of their tier score. Typical
+# use cases: a disk developing reallocated sectors that needs to retire, a
+# disk with cabling issues you want to drain before debugging, or a
+# rebalance across the array. Eviction is orthogonal to the hot/warm tier
+# decision: an item being evicted isn't necessarily wrong-tiered, its
+# current *disk* is just unacceptable. Items that would STAY_WARM on an
+# evicting disk instead show RELOCATE_WARM in the report, signalling that
+# P2's mover should move them to a different warm disk. Items already
+# heading to HOT (TO_HOT) resolve the eviction implicitly — no new outcome.
+#
+# IMPORTANT: Eviction does not move data — it flags items so the dry-run
+# report shows what would move when P2's mover lands.
+#
+# Disk paths must match the format used in paths.array_disks exactly
+# (case-sensitive). A typo logs a WARNING and is skipped; the run continues.
+array_disk_evict:
+  enabled: false
+  disks: []
+  # - "/mnt/disk7"   # disk developing bad sectors — drain before retirement
+  # - "/mnt/disk2"   # cabling issues — drain before debug
+
 # Capacity — not used in P0, wired up in P3.
 # Budget-aware promotion/demotion keeps the hot ZFS pool under the ceiling.
 capacity:
