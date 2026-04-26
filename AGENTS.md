@@ -40,16 +40,13 @@ CLAUDE.md and GEMINI.md are symlinks to this file.
 |---|---|---|
 | P0   | Plex catalog + history + scoring + table output, read-only | Done |
 | P0.1 | Pinning (library + title), recency floor, projected-tier footer | Done |
+| P0.2 | Auto-inherit — when ≥N members of a collection naturally score HOT, promote the whole collection | Done |
 | P0.3 | Collection pinning — force every member of a named Plex collection to HOT | Done |
 | P0.4 | Added-date floor — promote recently-added movies and TV shows with fresh episodes to HOT | Done |
 | P1   | Filesystem tier detection, path translation, majority-bytes rollup | Done |
-| P0.2 | Collection-aware grouping (Harry Potter, etc.) | Pending |
 | P2   | `--apply`: rsync moves + Plex rescan | Pending |
 | P3   | Hardening: lock file, currently-playing skip, free-space check, move cap | Pending |
 | P4   | Scheduled cron + size-triggered wrapper | Pending |
-
-P0.2 slots before P2 in priority because it's a scoring-layer concern, not
-a moves-layer concern.
 
 ## Non-obvious design decisions
 
@@ -116,9 +113,10 @@ the `year` field. Cosmetic only — doesn't affect scoring.
 1. Library pin (case-insensitive exact match on library name) → HOT + pinned
 2. Title pin (case-insensitive substring) → HOT + pinned
 3. Collection pin (if `item.collection_pinned`) → HOT + pinned
-4. Added-date floor (if `item.recently_added`) → HOT
-5. Raw score → HOT / WARM / NEUTRAL
-6. Recency floor (only if raw rec was NEUTRAL or WARM, and last_played is
+4. Auto-inherit collection pin (if `item.auto_inherit_pinned`) → HOT + pinned
+5. Added-date floor (if `item.recently_added`) → HOT
+6. Raw score → HOT / WARM / NEUTRAL
+7. Recency floor (only if raw rec was NEUTRAL or WARM, and last_played is
    within `hot_recency_days`) → HOT
 
 Pinning wins over everything. Both floors are promote-only, never demote.
@@ -146,6 +144,65 @@ Key invariants:
   library and title pins.
 - Footer: `Collection-pin promotions: N items` (only logged when
   `pinned_collections` is non-empty).
+
+### Auto-inherit collection pin
+
+`auto_collection_inherit` is the automatic counterpart to `pinned_collections`.
+After natural scoring (pre-floor, pre-pin), `_build_auto_inherit_keys()` scans
+all configured Plex libraries for collections, counting how many members have
+`score >= score_to_hot`. If that count meets `min_hot_members`, every member is
+added to the inherit set and `item.auto_inherit_pinned = True` is stamped on
+matching items in `collect_all()`. `_compute_recommendation()` step 4 then
+returns PIN_HOT for those items.
+
+Key design decisions:
+
+**Why natural score, not `current_tier`, as the trigger.** `current_tier` is
+a tracking artifact — where the file physically sits on disk. Using it as the
+trigger would cause feedback loops: a file promoted to HOT by auto-inherit
+would then trigger further inheritance in other collections it belongs to, and
+demoting it would immediately re-trigger the rule. Natural score reflects the
+user's engagement pattern, which is stable.
+
+**Why `min_hot_members: 2` default, not 1.** A single hot member could be
+incidental — one popular episode of a show you don't particularly care about,
+or a crossover film that happens to score well. Two hot members signals genuine
+engagement with the set as a set.
+
+**Three-branch trigger rule.** `_build_auto_inherit_keys()` applies:
+
+```python
+if col_size < min_hot:         # skip — can never trigger; avoids counting hot members
+elif col_size == min_hot:      required = max(1, ceil(col_size * min_hot_fraction))
+else:                          required = min_hot
+# trigger if hot_count >= required
+```
+
+The `col_size < min_hot` early exit is a real performance win on libraries with
+many 1-item "collections" (Plex creates singletons for some agents).
+
+The `col_size == min_hot` fraction branch exists to avoid a degenerate state:
+a 2-member collection with `min_hot_members: 2` would require BOTH members to
+be naturally hot — but if both are already hot there is nothing to inherit.
+With `min_hot_fraction: 0.5` (default), a 2-member collection only needs 1 hot
+member (`ceil(2 * 0.5) = 1`). For all collections larger than `min_hot_members`,
+the absolute threshold applies unchanged.
+
+**Precedence: `pinned_collections` > `auto_collection_inherit` > added-floor.**
+An item in both an explicit pin and a triggered auto-inherit collection will
+have `override = "collection pin"` (step 3 fires before step 4). It is counted
+in the `Collection-pin promotions` counter, not `Auto-inherit promotions`. This
+preserves the semantic that explicit user intent takes precedence over inferred.
+
+**`skip_smart_collections: true` default.** Smart collections are rules-based
+(Plex manages them: "Recently Added", "Top Rated", etc.). Auto-triggering on
+them would promote everything that happens to be new or popular — defeating
+the specificity of the feature. Manual collections are curated by the user and
+are the correct signal.
+
+**No Plex calls when disabled.** `enabled: false` causes `_build_auto_inherit_keys`
+to return `(set(), 0, 0)` immediately. No `section.collections()` calls are made,
+no log lines are emitted.
 
 ### Two-floor promotion model
 

@@ -70,6 +70,25 @@ pinned_collections: []
   # - library: "TV Shows"
   #   name: "Must Watch"                  # a manual "keep hot" collection
 
+# Auto-inherit collection pin — automatically promote every member of a Plex
+# collection to HOT when at least min_hot_members of its members naturally score
+# at or above score_to_hot (pre-floor, pre-pin). Use case: you've watched
+# enough Star Wars films that they score hot; the rest of the collection
+# auto-inherits HOT so they're ready when you reach for them.
+# Default: disabled — opt-in once you've confirmed your scoring looks sane.
+auto_collection_inherit:
+  enabled: false
+  min_hot_members: 2          # collections with fewer members than this are skipped entirely
+  # Escape hatch for collections sized exactly equal to min_hot_members. When
+  # collection_size == min_hot_members, require this fraction of members to be
+  # hot (ceil, floored at 1) instead of the absolute count. For larger
+  # collections the absolute min_hot_members threshold still applies.
+  # Default 0.5 means a 2-member collection needs 1 hot member to trigger.
+  min_hot_fraction: 0.5
+  skip_smart_collections: true  # smart (rules-based) collections are already curated — skip
+  exclude_libraries: []       # library names to exempt from auto-inherit entirely
+  # - "DVD Rips"              # example: low-quality library you never want auto-pinned
+
 # Human-readable rotating log. In the container, /config is a bind-mount to
 # /mnt/user/appdata/plex-media-tiering, so the log is readable from the Unraid GUI's
 # file manager or any SMB mount.

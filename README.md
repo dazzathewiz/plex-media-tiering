@@ -15,10 +15,10 @@ prints the analysis table. It still doesn't move anything — that's P2.
 |-------|--------------|--------|
 | P0 | Plex connect + scoring + table output. Read-only. | **Done** |
 | P0.1 | Pinning (library + title), recency floor, projected-tier footer. | **Done** |
+| P0.2 | Auto-inherit — when ≥N members of a collection naturally score HOT, promote the whole collection. | **Done** |
 | P0.3 | Collection pinning — force every member of a named Plex collection to HOT. | **Done** |
 | P0.4 | Added-date floor — promote recently-added movies and TV shows with fresh episodes to HOT. | **Done** |
 | P1 | Filesystem probing to detect current tier. Auto-detect array disks + Plex path translation. Majority-bytes rollup. | **Done** |
-| P0.2 | Collection-aware grouping (Harry Potter, Hunger Games, etc.). | Pending |
 | P2 | `--apply` with rsync moves + Plex rescan. | Pending |
 | P3 | Hardened safeguards (lock file, currently-playing skip, free-space check, move-size cap). | Pending |
 | P4 | Scheduled cron + size-triggered wrapper. | Pending |
@@ -310,7 +310,7 @@ or found by auto-detect). If either is missing, outcomes degrade to
 
 ### Overrides: pinning + recency + added floors
 
-Six-step precedence applied after scoring (highest wins):
+Seven-step precedence applied after scoring (highest wins):
 
 1. **`pinning.always_hot_libraries`** — list of library names (case-insensitive
    exact match). Every item in those libraries is `PIN_HOT`. Useful for things
@@ -319,14 +319,36 @@ Six-step precedence applied after scoring (highest wins):
    Any item whose title contains one of these is `PIN_HOT`. Great for long-tail
    favourites — pinning `"Stargate"` catches SG-1, Atlantis, Universe, Origins
    and the movie in a single entry.
-3. **`pinned_collections`** — collection pin. See below.
-4. **Added-date floor** — promote-only, never demotes. See below.
-5. Raw score → HOT / WARM / NEUTRAL.
-6. **`thresholds.hot_recency_days`** — recency floor. If a show or movie was
+3. **`pinned_collections`** — explicit collection pin. See below.
+4. **`auto_collection_inherit`** — automatic collection pin. See below.
+5. **Added-date floor** — promote-only, never demotes. See below.
+6. Raw score → HOT / WARM / NEUTRAL.
+7. **`thresholds.hot_recency_days`** — recency floor. If a show or movie was
    last played within this window, it's promoted to HOT even if the raw score
    lands in NEUTRAL or WARM. This catches infrequent-but-active shows (one
    episode every few weeks) that the play-weighted score otherwise demotes.
    Default: `730` (≈2 years). Set to `0` or comment out to disable.
+
+#### Choosing between override layers
+
+Three mechanisms can promote items to HOT beyond their raw score. Pick the
+right tool for each use case:
+
+- **`pinning.always_hot_titles`** — you know a specific title or franchise by
+  name and you always want it on the fast tier, regardless of how much you've
+  watched it. Zero setup overhead; works across libraries.
+
+- **`pinned_collections`** — you maintain a Plex collection (e.g. "Must
+  Watch", "Kids favourites") and want every member kept HOT. Explicit: you
+  curate the collection, tier.py pins it unconditionally.
+
+- **`auto_collection_inherit`** — you don't want to curate a list, but you
+  notice you've been actively watching part of a franchise and want the rest
+  ready. Auto-inherit detects that ≥N members scored HOT naturally and
+  promotes the whole collection. No YAML required beyond enabling the feature.
+  Default off — enable once you've validated your scoring thresholds.
+
+All three produce `outcome=PIN_HOT` and appear in `--explain` output.
 
 Pinning and floor promotions tag the `score_breakdown` with an `override` key
 so `--explain` shows why the item was promoted past its raw score.
@@ -356,6 +378,58 @@ a typo in config won't abort a scheduled run.
 
 The footer line `Collection-pin promotions: N items` counts how many items were
 pinned by this rule.
+
+#### Auto-inherit collection pin
+
+Automatically promotes all members of a Plex collection to HOT when enough of
+its members already score HOT naturally (pre-floor, pre-pin). Designed for the
+case where you've been watching part of a franchise and want the rest pre-warmed
+without manually curating a config entry.
+
+```yaml
+auto_collection_inherit:
+  enabled: true
+  min_hot_members: 2          # 2+ naturally-hot members triggers the whole collection
+  skip_smart_collections: true  # skip rules-based smart collections
+  exclude_libraries: []       # libraries to exempt (e.g. ["DVD Rips"])
+```
+
+How it works:
+
+1. After scoring, tier.py scans all configured Plex libraries (minus
+   `exclude_libraries`) for collections.
+2. For each collection, it counts members whose `score >= score_to_hot`
+   (natural score, before any floor or pin override).
+3. If that count reaches `min_hot_members`, every member of the collection is
+   promoted to HOT — including cold members that scored WARM or NEUTRAL on
+   their own.
+
+`min_hot_members: 2` (default) means one popular entry in a franchise won't
+drag the rest along — it takes at least two to infer genuine engagement with
+the set. `min_hot_members: 1` removes that guard if you prefer more aggressive
+promotion.
+
+**Smart collections** are rules-based playlists Plex manages automatically
+(e.g. "Recently Added", "Top Rated"). Skipping them (`skip_smart_collections:
+true`, the default) avoids false positives from automated curation. Set to
+`false` if you have smart collections you've intentionally set up for tiering.
+
+Log lines added when enabled:
+
+```text
+Auto-inherit: 4 collections triggered (≥2 hot members), 38 items inherited
+  Auto-inherit promotions: 22 items
+```
+
+The first line appears during collection (how many collections triggered and
+how many total member slots were inherited). The second is in the run summary
+(how many items actually changed outcome — the diff from the first number is
+items that were already going to be HOT).
+
+**Precedence with explicit collection pin**: if an item belongs to both a
+`pinned_collections` entry and a triggered auto-inherit collection, the
+explicit pin takes precedence and the item is counted in the
+`Collection-pin promotions` counter, not `Auto-inherit promotions`.
 
 #### Added-date floor
 
