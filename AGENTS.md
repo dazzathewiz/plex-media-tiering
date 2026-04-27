@@ -546,9 +546,7 @@ git checkout -b feat/p2.2-to-warm-moves
 git add tier.py example.tiering.yaml README.md AGENTS.md
 git commit -m "feat(P2.2): TO_WARM + RELOCATE_WARM move directions
 
-Brief body: what changed and why. One paragraph max.
-
-Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>"
+Brief body: what changed and why. One paragraph max."
 
 # 5. Push
 git push -u origin feat/p2.2-to-warm-moves
@@ -583,8 +581,6 @@ What was updated in README, AGENTS.md, example.tiering.yaml.
 Checkboxes for manual on-Unraid verification steps (only when the
 change touches Plex API semantics or real filesystem behaviour —
 see "When to trust CI vs require Unraid testing" above).
-
-🤖 Generated with [Claude Code](https://claude.com/claude-code)
 ```
 
 Check for an existing issue with `gh issue list` before opening the PR; if
