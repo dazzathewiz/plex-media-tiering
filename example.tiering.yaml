@@ -184,6 +184,10 @@ array_disk_evict:
 #   3. Set delete_source_after_verify=true when you trust the verify step.
 moves:
   enabled: false
+  # Set apply: true to execute moves without passing --apply on the CLI.
+  # Useful for scheduled runs (e.g. Unraid User Scripts) where you can't
+  # append CLI flags. Equivalent to --apply; both flags are additive.
+  apply: false
   # rsync flags applied to every move. -aH preserves permissions, timestamps,
   # and hardlinks. --partial keeps partial transfers so a restart doesn't start
   # from zero. --inplace writes directly to the destination file.

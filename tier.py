@@ -169,6 +169,7 @@ DEFAULT_CONFIG = {
     # enabled: false means the move pass is skipped entirely — no log lines.
     "moves": {
         "enabled": False,
+        "apply": False,
         "rsync_options": ["-aH", "--partial", "--inplace"],
         "delete_source_after_verify": True,
         "size_verify": True,
@@ -376,7 +377,10 @@ class Item:
     # --- filled in at P1+ ---
     current_tier: str = "UNKNOWN"  # 'HOT' | 'WARM' | 'UNKNOWN'
     current_disk: Optional[str] = None  # dominant warm disk path; None if HOT/UNKNOWN/MIXED
-    source_dir: Optional[str] = None    # resolved local dir containing item's files on current_disk
+    # All warm disk source dirs for this item (dominant disk first). A series
+    # split across multiple array disks will have one entry per disk so the
+    # move executor can rsync every disk's content to the hot pool in one pass.
+    source_dirs: List[str] = field(default_factory=list)
     # --- decision ---
     outcome: str = "NEUTRAL"       # See decide_outcome() for P0 values
     # --- collection-pin support ---
@@ -675,7 +679,7 @@ def resolve_item_current_tier(
     hot_mount: str,
     array_disks: List[str],
     user_share_prefix: str = "",
-) -> Tuple[str, dict, Optional[str], Optional[str]]:
+) -> Tuple[str, dict, Optional[str], List[str]]:
     """Majority-bytes rollup of tier for a multi-part item.
 
     parts: iterable of (plex_file_path, size_bytes).
@@ -712,24 +716,31 @@ def resolve_item_current_tier(
                     disk_files.setdefault(disk, []).append(resolved)
                     break
     dominant = max(disk_bytes, key=disk_bytes.__getitem__) if disk_bytes else None
-    # Compute source_dir: common ancestor of all files on the dominant disk.
-    # For a single file /disk/Movies/Foo/foo.mkv → dirname → /disk/Movies/Foo.
-    # For multi-file: os.path.commonpath gives the shared directory already.
-    source_dir: Optional[str] = None
-    if dominant and disk_files.get(dominant):
-        files = disk_files[dominant]
+    # Build source dirs for every warm disk (dominant first). A series split
+    # across multiple array disks gets one entry per disk so the move executor
+    # can rsync all of them to the hot pool in one pass.
+    # For a single file /disk/Lib/Title/foo.mkv → dirname → /disk/Lib/Title.
+    # For multi-file commonpath already returns the shared directory.
+    warm_source_dirs: List[str] = []
+    for disk, files in disk_files.items():
+        if not files:
+            continue
         cp = os.path.commonpath(files)
-        source_dir = os.path.dirname(cp) if cp in files else cp
+        src = os.path.dirname(cp) if cp in files else cp
+        if disk == dominant:
+            warm_source_dirs.insert(0, src)
+        else:
+            warm_source_dirs.append(src)
     if total == 0:
-        return "UNKNOWN", {"HOT": 0.0, "WARM": 0.0, "UNKNOWN": 0.0}, None, None
+        return "UNKNOWN", {"HOT": 0.0, "WARM": 0.0, "UNKNOWN": 0.0}, None, []
     split = {k: round(v / total, 4) for k, v in totals.items()}
     if split["HOT"] > 0.5:
-        return "HOT", split, None, None
+        return "HOT", split, None, []
     if split["WARM"] > 0.5:
-        return "WARM", split, dominant, source_dir
+        return "WARM", split, dominant, warm_source_dirs
     if split["UNKNOWN"] > 0.5:
-        return "UNKNOWN", split, None, None
-    return "MIXED", split, dominant, source_dir
+        return "UNKNOWN", split, None, []
+    return "MIXED", split, dominant, warm_source_dirs
 
 
 def _media_parts(media_list) -> Iterable[Tuple[str, int]]:
@@ -1307,13 +1318,13 @@ def collect_movies(
         # Current tier (P1). Probes only if tier detection is configured.
         current_tier = "UNKNOWN"
         current_disk: Optional[str] = None
-        source_dir: Optional[str] = None
+        source_dirs: List[str] = []
         tier_split: Optional[dict] = None
         if tier_probing:
             parts = []
             for m in group:
                 parts.extend(_media_parts(getattr(m, "media", None)))
-            current_tier, tier_split, current_disk, source_dir = resolve_item_current_tier(
+            current_tier, tier_split, current_disk, source_dirs = resolve_item_current_tier(
                 parts, path_map, hot_mount, array_disks, user_share_prefix,
             )
             if tier_split:
@@ -1336,7 +1347,7 @@ def collect_movies(
             score=score,
             current_tier=current_tier,
             current_disk=current_disk,
-            source_dir=source_dir,
+            source_dirs=source_dirs,
             outcome="NEUTRAL",  # finalised in post-scoring override pass
             rating_key=primary_rk,
             recently_added=recently_added,
@@ -1417,13 +1428,13 @@ def collect_series(
         # Current tier (P1): majority-bytes rollup across every episode.
         current_tier = "UNKNOWN"
         current_disk: Optional[str] = None
-        source_dir: Optional[str] = None
+        source_dirs: List[str] = []
         tier_split: Optional[dict] = None
         if tier_probing:
             parts = []
             for ep in episodes:
                 parts.extend(_media_parts(getattr(ep, "media", None)))
-            current_tier, tier_split, current_disk, source_dir = resolve_item_current_tier(
+            current_tier, tier_split, current_disk, source_dirs = resolve_item_current_tier(
                 parts, path_map, hot_mount, array_disks, user_share_prefix,
             )
             if tier_split:
@@ -1441,7 +1452,7 @@ def collect_series(
             score=score,
             current_tier=current_tier,
             current_disk=current_disk,
-            source_dir=source_dir,
+            source_dirs=source_dirs,
             outcome="NEUTRAL",  # finalised in post-scoring override pass
             rating_key=rk,
             recently_added=recently_added,
@@ -1742,16 +1753,19 @@ _ASSUMED_THROUGHPUT_BPS = 200 * 1024 * 1024  # 200 MB/s
 def _compute_destination_path(item: "Item", hot_pool_mount: str) -> Optional[str]:
     """Return the hot-pool path for a TO_HOT move.
 
-    Strips item.current_disk prefix from item.source_dir and prepends
-    hot_pool_mount. Returns None if source_dir or current_disk is unset
-    or inconsistent (logged by caller).
+    Uses the dominant (first) source dir to derive the relative path, then
+    prepends hot_pool_mount. All source dirs share the same relative path
+    (e.g. /TV Shows/Show (2001)) so the destination is the same regardless
+    of which disk each source dir lives on.
+    Returns None if source_dirs is empty or current_disk is unset.
     """
-    if not item.source_dir or not item.current_disk:
+    if not item.source_dirs or not item.current_disk:
         return None
+    src = item.source_dirs[0]
     disk = item.current_disk.rstrip("/")
-    if not item.source_dir.startswith(disk + "/") and item.source_dir != disk:
+    if not src.startswith(disk + "/") and src != disk:
         return None
-    rel = item.source_dir[len(disk):]
+    rel = src[len(disk):]
     return hot_pool_mount.rstrip("/") + rel
 
 
@@ -1809,45 +1823,46 @@ def _run_move_pass(items: List["Item"], cfg: dict, apply: bool) -> None:
 
     to_hot = [it for it in items if it.outcome == "TO_HOT"]
 
-    # Resolve source/destination for each candidate.
-    moves: List[tuple] = []  # (item, src, dst)
+    # Resolve destination for each candidate. Items already on HOT are kept
+    # in the list so the per-item loop can emit [SKIPPED] with their index.
+    moves: List[tuple] = []  # (item, dst_or_None)
     for it in to_hot:
         if it.current_tier == "HOT":
-            # Already on hot pool — handled as [SKIPPED] in the loop below.
-            moves.append((it, it.source_dir, None))
+            moves.append((it, None))
             continue
         dst = _compute_destination_path(it, hot_mount)
         if dst is None:
             log.warning(
                 "Moves: [SKIP] %s — cannot compute destination "
-                "(source_dir=%r current_disk=%r)",
-                it.title_year, it.source_dir, it.current_disk,
+                "(source_dirs=%r current_disk=%r)",
+                it.title_year, it.source_dirs, it.current_disk,
             )
             continue
-        moves.append((it, it.source_dir, dst))
+        moves.append((it, dst))
 
     if not moves:
         log.info("Moves: no actionable TO_HOT items")
         return
 
-    total_bytes = sum(it.size_bytes for it, _, dst in moves if dst is not None)
+    total_bytes = sum(it.size_bytes for it, dst in moves if dst is not None)
 
     if not apply:
         eta = _fmt_eta(total_bytes / _ASSUMED_THROUGHPUT_BPS)
         log.info(
             "[DRY-RUN] Moves: TO_HOT=%d — %s total — estimated %s at 200 MB/s",
-            len([m for m in moves if m[2] is not None]),
+            len([m for m in moves if m[1] is not None]),
             _fmt_size(total_bytes / (1024 ** 3)),
             eta,
         )
-        for it, src, dst in moves:
+        for it, dst in moves:
             if dst is None:
                 log.info("[DRY-RUN]   %s — already on hot pool (SKIPPED)", it.title_year)
             else:
-                log.info(
-                    "[DRY-RUN]   %s — %s — %s → %s",
-                    it.title_year, _fmt_size(it.size_bytes / (1024 ** 3)), src, dst,
-                )
+                for src in it.source_dirs:
+                    log.info(
+                        "[DRY-RUN]   %s — %s — %s → %s",
+                        it.title_year, _fmt_size(it.size_bytes / (1024 ** 3)), src, dst,
+                    )
         return
 
     # --apply mode.
@@ -1876,54 +1891,65 @@ def _run_move_pass(items: List["Item"], cfg: dict, apply: bool) -> None:
     affected_libraries: set = set()
     run_start = datetime.now(timezone.utc)
 
-    for idx, (it, src, dst) in enumerate(moves, 1):
+    for idx, (it, dst) in enumerate(moves, 1):
         prefix = f"  [{idx}/{len(moves)}]"
         item_start = datetime.now(timezone.utc)
+        size_str = _fmt_size(it.size_bytes / (1024 ** 3))
 
         if dst is None or it.current_tier == "HOT":
             log.info("%s [SKIPPED] %s — already on hot pool (no-op)", prefix, it.title_year)
             n_skipped += 1
             continue
 
+        # Log before starting — long rsyncs are otherwise silent.
+        log.info("%s Moving %s — %s", prefix, it.title_year, size_str)
+        for src in it.source_dirs:
+            log.info("%s   %s → %s", prefix, src, dst)
+
         # Ensure destination parent directory exists.
         dst_parent = str(Path(dst).parent)
         try:
             Path(dst_parent).mkdir(parents=True, exist_ok=True)
         except OSError as exc:
-            log.error(
-                "%s [FAILED] %s — cannot create %s: %s",
-                prefix, it.title_year, dst_parent, exc,
-            )
+            log.error("%s [FAILED] %s — cannot create %s: %s", prefix, it.title_year, dst_parent, exc)
             n_failed += 1
             continue
 
-        # rsync source directory into destination.
-        cmd = ["rsync"] + rsync_opts + [src.rstrip("/") + "/", dst.rstrip("/") + "/"]
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True)
-        except OSError as exc:
-            log.error("%s [FAILED] %s — rsync failed to start: %s", prefix, it.title_year, exc)
+        # rsync each source directory (one per warm disk) into the destination.
+        rsync_failed = False
+        for src in it.source_dirs:
+            cmd = ["rsync"] + rsync_opts + [src.rstrip("/") + "/", dst.rstrip("/") + "/"]
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True)
+            except OSError as exc:
+                log.error("%s [FAILED] %s — rsync failed to start: %s", prefix, it.title_year, exc)
+                rsync_failed = True
+                break
+            if result.returncode != 0:
+                log.error(
+                    "%s [FAILED] %s — rsync exit %d (%s) — source unchanged",
+                    prefix, it.title_year, result.returncode, src,
+                )
+                rsync_failed = True
+                break
+        if rsync_failed:
             n_failed += 1
             continue
 
-        if result.returncode != 0:
-            log.error(
-                "%s [FAILED] %s — rsync exit %d — source unchanged",
-                prefix, it.title_year, result.returncode,
-            )
-            n_failed += 1
-            continue
-
-        # Size verification.
+        # Size verification: sum all source dirs, compare to destination total.
         if size_verify:
             try:
-                src_du = subprocess.run(["du", "-sb", src], capture_output=True, text=True)
+                src_sz = 0
+                for src in it.source_dirs:
+                    du = subprocess.run(["du", "-sb", src], capture_output=True, text=True)
+                    if du.returncode != 0:
+                        raise OSError(f"du failed for {src}")
+                    src_sz += int(du.stdout.split()[0])
                 dst_du = subprocess.run(["du", "-sb", dst], capture_output=True, text=True)
-                src_sz = int(src_du.stdout.split()[0]) if src_du.returncode == 0 else None
                 dst_sz = int(dst_du.stdout.split()[0]) if dst_du.returncode == 0 else None
-                if src_sz is None or dst_sz is None or abs(src_sz - dst_sz) > 1024:
+                if dst_sz is None or abs(src_sz - dst_sz) > 1024:
                     log.error(
-                        "%s [FAILED] %s — size verify failed (src=%s dst=%s) — source unchanged",
+                        "%s [FAILED] %s — size verify failed (src_total=%s dst=%s) — source unchanged",
                         prefix, it.title_year, src_sz, dst_sz,
                     )
                     n_failed += 1
@@ -1936,17 +1962,19 @@ def _run_move_pass(items: List["Item"], cfg: dict, apply: bool) -> None:
                 n_failed += 1
                 continue
 
-        # Delete source if configured.
+        # Delete all source directories if configured.
         if delete_after:
-            try:
-                subprocess.run(["rm", "-rf", src], check=True, capture_output=True)
-            except subprocess.CalledProcessError as exc:
-                elapsed = (datetime.now(timezone.utc) - item_start).total_seconds()
-                log.warning(
-                    "%s [SUCCESS*] %s — %s in %s — moved OK but source removal failed: %s",
-                    prefix, it.title_year,
-                    _fmt_size(it.size_bytes / (1024 ** 3)), _fmt_eta(elapsed), exc,
-                )
+            delete_failed = False
+            for src in it.source_dirs:
+                try:
+                    subprocess.run(["rm", "-rf", src], check=True, capture_output=True)
+                except subprocess.CalledProcessError as exc:
+                    log.warning(
+                        "%s [SUCCESS*] %s — moved OK but source removal failed (%s): %s",
+                        prefix, it.title_year, src, exc,
+                    )
+                    delete_failed = True
+            if delete_failed:
                 n_success += 1
                 affected_libraries.add(it.library)
                 continue
@@ -1954,8 +1982,7 @@ def _run_move_pass(items: List["Item"], cfg: dict, apply: bool) -> None:
         elapsed = (datetime.now(timezone.utc) - item_start).total_seconds()
         log.info(
             "%s [SUCCESS] %s — %s in %s — %s → %s",
-            prefix, it.title_year,
-            _fmt_size(it.size_bytes / (1024 ** 3)), _fmt_eta(elapsed),
+            prefix, it.title_year, size_str, _fmt_eta(elapsed),
             it.current_disk, hot_mount,
         )
         n_success += 1
@@ -2225,7 +2252,8 @@ def _run(args) -> int:
 
     # Move pass runs on the full scored list before --top truncation so every
     # TO_HOT item is considered regardless of display limit.
-    _run_move_pass(items, cfg, apply=args.apply)
+    moves_apply = args.apply or bool((cfg.get("moves") or {}).get("apply", False))
+    _run_move_pass(items, cfg, apply=moves_apply)
 
     if args.top:
         items = items[: args.top]
@@ -3155,7 +3183,7 @@ def _test_destination_path_movie_tohot():
     item = _make_item(
         kind="movie", library="Movies", title="Foo", year=2010,
         current_disk="/mnt/disk4",
-        source_dir="/mnt/disk4/Movies/Foo (2010)",
+        source_dirs=["/mnt/disk4/Movies/Foo (2010)"],
     )
     dst = _compute_destination_path(item, "/mnt/zfs_media")
     assert dst == "/mnt/zfs_media/Movies/Foo (2010)", f"got {dst!r}"
@@ -3167,7 +3195,7 @@ def _test_destination_path_series_tohot():
     item = _make_item(
         kind="series", library="TV Shows", title="Show", year=2001,
         current_disk="/mnt/disk2",
-        source_dir="/mnt/disk2/TV Shows/Show (2001)",
+        source_dirs=["/mnt/disk2/TV Shows/Show (2001)"],
     )
     dst = _compute_destination_path(item, "/mnt/zfs_media")
     assert dst == "/mnt/zfs_media/TV Shows/Show (2001)", f"got {dst!r}"
@@ -3188,7 +3216,7 @@ def _test_move_skipped_when_already_hot():
     item = _make_item(
         kind="movie", library="Movies",
         current_tier="HOT", current_disk="/mnt/disk4",
-        source_dir="/mnt/disk4/Movies/Foo (2010)",
+        source_dirs=["/mnt/disk4/Movies/Foo (2010)"],
     )
     item.outcome = "TO_HOT"
 
@@ -3227,7 +3255,7 @@ def _test_dry_run_emits_no_apply_call():
     item = _make_item(
         kind="movie", library="Movies",
         current_tier="WARM", current_disk="/mnt/disk4",
-        source_dir="/mnt/disk4/Movies/Foo (2010)",
+        source_dirs=["/mnt/disk4/Movies/Foo (2010)"],
     )
     item.outcome = "TO_HOT"
 
@@ -3268,7 +3296,7 @@ def _test_parity_check_aborts_pass():
     item = _make_item(
         kind="movie", library="Movies",
         current_tier="WARM", current_disk="/mnt/disk4",
-        source_dir="/mnt/disk4/Movies/Foo (2010)",
+        source_dirs=["/mnt/disk4/Movies/Foo (2010)"],
     )
     item.outcome = "TO_HOT"
 
@@ -3371,7 +3399,7 @@ def _test_size_verify_failure_skips_delete():
         item = _make_item(
             kind="movie", library="Movies",
             current_tier="WARM", current_disk=_os.path.join(root, "disk4"),
-            source_dir=src,
+            source_dirs=[src],
         )
         item.outcome = "TO_HOT"
 
@@ -3393,6 +3421,57 @@ def _test_size_verify_failure_skips_delete():
 
     assert not rm_calls, f"rm -rf must NOT be called on size mismatch, got {rm_calls}"
     print("_test_size_verify_failure_skips_delete: OK")
+
+
+def _test_multidisk_series_all_source_dirs_rsynced():
+    """Series split across two warm disks: rsync is called once per source dir."""
+    import tempfile, os as _os
+
+    rsync_srcs = []
+
+    def _fake_run(cmd, **_):
+        class R:
+            returncode = 0
+            stdout = "1000000\t/path"
+        if cmd and cmd[0] == "rsync":
+            rsync_srcs.append(cmd[-2])
+        return R()
+
+    with tempfile.TemporaryDirectory() as root:
+        disk6_src = _os.path.join(root, "disk6", "TV Shows", "Reba (2001)")
+        disk3_src = _os.path.join(root, "disk3", "TV Shows", "Reba (2001)")
+        hot_mount = _os.path.join(root, "zfs_media")
+        _os.makedirs(disk6_src, exist_ok=True)
+        _os.makedirs(disk3_src, exist_ok=True)
+        _os.makedirs(hot_mount, exist_ok=True)
+
+        item = _make_item(
+            kind="series", library="TV Shows", title="Reba", year=2001,
+            current_tier="WARM", current_disk=_os.path.join(root, "disk6"),
+            source_dirs=[disk6_src, disk3_src],
+        )
+        item.outcome = "TO_HOT"
+
+        cfg = {
+            "moves": {
+                "enabled": True, "rsync_options": ["-aH"],
+                "delete_source_after_verify": False, "size_verify": False,
+                "parity_check_blocking": False, "bandwidth_limit_mbps": None,
+            },
+            "paths": {"hot_pool_mount": hot_mount},
+        }
+
+        orig = subprocess.run
+        try:
+            subprocess.run = _fake_run
+            _run_move_pass([item], cfg, apply=True)
+        finally:
+            subprocess.run = orig
+
+    assert len(rsync_srcs) == 2, f"expected 2 rsync calls, got {len(rsync_srcs)}: {rsync_srcs}"
+    assert any("disk6" in s for s in rsync_srcs), "disk6 source missing from rsync calls"
+    assert any("disk3" in s for s in rsync_srcs), "disk3 source missing from rsync calls"
+    print("_test_multidisk_series_all_source_dirs_rsynced: OK")
 
 
 if __name__ == "__main__":
@@ -3435,5 +3514,6 @@ if __name__ == "__main__":
         _test_parity_check_unraid_idle_not_falsely_detected()
         _test_parity_check_unraid_active_detected()
         _test_size_verify_failure_skips_delete()
+        _test_multidisk_series_all_source_dirs_rsynced()
         sys.exit(0)
     sys.exit(main())
