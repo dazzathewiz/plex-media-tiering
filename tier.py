@@ -1756,10 +1756,23 @@ def _compute_destination_path(item: "Item", hot_pool_mount: str) -> Optional[str
 
 
 def _check_parity_in_progress() -> bool:
-    """Return True if an Unraid parity check or resync is running."""
+    """Return True if an Unraid parity check or resync is running.
+
+    Unraid uses a custom key=value /proc/mdstat format where mdResync= holds
+    the current sync position: 0 = idle, non-zero = in progress.
+    mdResyncAction= records the *last* action type regardless of run state,
+    so matching on the word "check" there gives a false positive when idle.
+
+    Standard Linux md RAID shows active progress inline as "check=22.3%".
+    """
     try:
         content = Path("/proc/mdstat").read_text()
-        return bool(re.search(r"\b(check|resync)\b", content))
+        # Unraid format: mdResync=<position>  (0 = idle)
+        m = re.search(r"^mdResync=(\d+)", content, re.MULTILINE)
+        if m:
+            return int(m.group(1)) > 0
+        # Standard Linux md format: active sync shows percentage inline.
+        return bool(re.search(r"\b(check|resync)\s*=\s*\d+\.\d+%", content))
     except OSError:
         return False
 
@@ -3286,6 +3299,49 @@ def _test_parity_check_aborts_pass():
     print("_test_parity_check_aborts_pass: OK")
 
 
+def _test_parity_check_unraid_idle_not_falsely_detected():
+    """Unraid idle mdstat (mdResync=0 + mdResyncAction=check) -> NOT detected as running.
+
+    Unraid stores the last action type in mdResyncAction regardless of whether
+    a check is actually running. mdResync=0 means idle; matching on the word
+    'check' in that field was a false positive.
+    """
+    import unittest.mock as _mock
+
+    idle_content = (
+        "mdResyncAction=check P\n"
+        "mdResyncSize=15625879500\n"
+        "mdResyncCorr=0\n"
+        "mdResync=0\n"
+        "mdResyncPos=0\n"
+        "mdResyncDt=0\n"
+        "mdResyncDb=0\n"
+    )
+    with _mock.patch.object(Path, "read_text", return_value=idle_content):
+        result = _check_parity_in_progress()
+    assert result is False, "idle Unraid mdstat must not be detected as parity check in progress"
+    print("_test_parity_check_unraid_idle_not_falsely_detected: OK")
+
+
+def _test_parity_check_unraid_active_detected():
+    """Unraid active check (mdResync=<non-zero>) -> correctly detected as running."""
+    import unittest.mock as _mock
+
+    active_content = (
+        "mdResyncAction=check P\n"
+        "mdResyncSize=15625879500\n"
+        "mdResyncCorr=0\n"
+        "mdResync=1234567890\n"
+        "mdResyncPos=1234567890\n"
+        "mdResyncDt=100\n"
+        "mdResyncDb=50\n"
+    )
+    with _mock.patch.object(Path, "read_text", return_value=active_content):
+        result = _check_parity_in_progress()
+    assert result is True, "active Unraid mdstat must be detected as parity check in progress"
+    print("_test_parity_check_unraid_active_detected: OK")
+
+
 def _test_size_verify_failure_skips_delete():
     """Size mismatch after rsync -> item marked FAILED, rm -rf NOT called."""
     rm_calls = []
@@ -3376,6 +3432,8 @@ if __name__ == "__main__":
         _test_move_skipped_when_already_hot()
         _test_dry_run_emits_no_apply_call()
         _test_parity_check_aborts_pass()
+        _test_parity_check_unraid_idle_not_falsely_detected()
+        _test_parity_check_unraid_active_detected()
         _test_size_verify_failure_skips_delete()
         sys.exit(0)
     sys.exit(main())
