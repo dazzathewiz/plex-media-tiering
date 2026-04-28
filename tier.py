@@ -1915,6 +1915,17 @@ def _run_move_pass(items: List["Item"], cfg: dict, apply: bool) -> None:
             n_failed += 1
             continue
 
+        # Snapshot destination size before rsync. Items that were MIXED-tier may
+        # already have some files on the hot pool; we compare the delta (bytes
+        # added) against the source size, not the absolute destination total.
+        dst_before_sz = 0
+        if size_verify and Path(dst).exists():
+            try:
+                pre_du = subprocess.run(["du", "-sb", dst], capture_output=True, text=True)
+                dst_before_sz = int(pre_du.stdout.split()[0]) if pre_du.returncode == 0 else 0
+            except Exception:  # noqa: BLE001
+                dst_before_sz = 0
+
         # rsync each source directory (one per warm disk) into the destination.
         rsync_failed = False
         for src in it.source_dirs:
@@ -1926,9 +1937,12 @@ def _run_move_pass(items: List["Item"], cfg: dict, apply: bool) -> None:
                 rsync_failed = True
                 break
             if result.returncode != 0:
+                stderr_lines = (result.stderr or "").strip().splitlines()[:5]
+                stderr_str = "; ".join(stderr_lines) if stderr_lines else ""
                 log.error(
-                    "%s [FAILED] %s — rsync exit %d (%s) — source unchanged",
+                    "%s [FAILED] %s — rsync exit %d (%s)%s — source unchanged",
                     prefix, it.title_year, result.returncode, src,
+                    f": {stderr_str}" if stderr_str else "",
                 )
                 rsync_failed = True
                 break
@@ -1936,7 +1950,9 @@ def _run_move_pass(items: List["Item"], cfg: dict, apply: bool) -> None:
             n_failed += 1
             continue
 
-        # Size verification: sum all source dirs, compare to destination total.
+        # Size verification: compare bytes transferred (dst delta) against source.
+        # Using the delta rather than absolute dst size handles items that were
+        # MIXED-tier (some files already on hot pool before this run).
         if size_verify:
             try:
                 src_sz = 0
@@ -1946,11 +1962,14 @@ def _run_move_pass(items: List["Item"], cfg: dict, apply: bool) -> None:
                         raise OSError(f"du failed for {src}")
                     src_sz += int(du.stdout.split()[0])
                 dst_du = subprocess.run(["du", "-sb", dst], capture_output=True, text=True)
-                dst_sz = int(dst_du.stdout.split()[0]) if dst_du.returncode == 0 else None
-                if dst_sz is None or abs(src_sz - dst_sz) > 1024:
+                dst_after_sz = int(dst_du.stdout.split()[0]) if dst_du.returncode == 0 else None
+                transferred = (dst_after_sz - dst_before_sz) if dst_after_sz is not None else None
+                if transferred is None or abs(transferred - src_sz) > 1024:
                     log.error(
-                        "%s [FAILED] %s — size verify failed (src_total=%s dst=%s) — source unchanged",
-                        prefix, it.title_year, src_sz, dst_sz,
+                        "%s [FAILED] %s — size verify failed "
+                        "(src=%s dst_delta=%s dst_before=%s dst_after=%s) — source unchanged",
+                        prefix, it.title_year, src_sz, transferred,
+                        dst_before_sz, dst_after_sz,
                     )
                     n_failed += 1
                     continue
@@ -3474,6 +3493,78 @@ def _test_multidisk_series_all_source_dirs_rsynced():
     print("_test_multidisk_series_all_source_dirs_rsynced: OK")
 
 
+def _test_size_verify_mixed_tier_preexisting_dst_passes():
+    """MIXED-tier item: destination already has pre-existing files before rsync.
+
+    Old logic compared src_sz vs dst_total and always failed (dst > src).
+    New logic compares src_sz vs (dst_after - dst_before) so pre-existing
+    content doesn't count as a mismatch.
+
+    Fake du returns: src=500B, dst_before=1000B (pre-existing), dst_after=1500B.
+    delta = 1500-1000 = 500 == src → verify passes → rm is called.
+    """
+    rm_calls = []
+    # Track dst du calls so we can return different values before/after rsync.
+    dst_du_calls = [0]
+
+    def _fake_run(cmd, **_):
+        class R:
+            returncode = 0
+            stderr = ""
+            stdout = ""
+        r = R()
+        if cmd and cmd[0] == "rsync":
+            pass  # success, no-op
+        elif cmd and cmd[0] == "du":
+            path = cmd[-1]
+            if "disk5" in path:
+                r.stdout = f"500\t{path}\n"       # source bytes
+            else:
+                dst_du_calls[0] += 1
+                if dst_du_calls[0] == 1:
+                    r.stdout = f"1000\t{path}\n"  # dst_before: pre-existing
+                else:
+                    r.stdout = f"1500\t{path}\n"  # dst_after: pre-existing + transferred
+        elif cmd and cmd[0] == "rm":
+            rm_calls.append(cmd)
+        return r
+
+    import tempfile, os as _os
+    with tempfile.TemporaryDirectory() as root:
+        src_dir = _os.path.join(root, "disk5", "TV Shows", "Fire Country (2022)")
+        hot_mount = _os.path.join(root, "zfs_media")
+        dst_dir = _os.path.join(hot_mount, "TV Shows", "Fire Country (2022)")
+        _os.makedirs(src_dir, exist_ok=True)
+        _os.makedirs(dst_dir, exist_ok=True)  # destination exists (pre-existing files)
+
+        item = _make_item(
+            kind="series", library="TV Shows",
+            current_tier="WARM", current_disk=_os.path.join(root, "disk5"),
+            source_dirs=[src_dir],
+        )
+        item.outcome = "TO_HOT"
+
+        cfg = {
+            "moves": {
+                "enabled": True, "rsync_options": ["-aH"],
+                "delete_source_after_verify": True, "size_verify": True,
+                "parity_check_blocking": False, "bandwidth_limit_mbps": None,
+            },
+            "paths": {"hot_pool_mount": hot_mount},
+        }
+
+        orig = subprocess.run
+        try:
+            subprocess.run = _fake_run
+            _run_move_pass([item], cfg, apply=True)
+        finally:
+            subprocess.run = orig
+
+    assert rm_calls, "rm -rf MUST be called — size verify should pass with delta logic"
+    assert dst_du_calls[0] == 2, f"expected 2 dst du calls (before + after), got {dst_du_calls[0]}"
+    print("_test_size_verify_mixed_tier_preexisting_dst_passes: OK")
+
+
 if __name__ == "__main__":
     if "--_test" in sys.argv:
         _test_resolve_user_share()
@@ -3515,5 +3606,6 @@ if __name__ == "__main__":
         _test_parity_check_unraid_active_detected()
         _test_size_verify_failure_skips_delete()
         _test_multidisk_series_all_source_dirs_rsynced()
+        _test_size_verify_mixed_tier_preexisting_dst_passes()
         sys.exit(0)
     sys.exit(main())
