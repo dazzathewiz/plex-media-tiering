@@ -498,15 +498,21 @@ before waiting for CI.
 
 #### Run locally before pushing
 
+macOS system `python3` lacks pyyaml and plexapi. **Always use the venv**
+for checks 2 and 3; check 1 (compile) is fine with bare python3.
+
 ```bash
-# 1. Compile check
+# Bootstrap venv once (skip if /tmp/pmt-venv already exists)
+python3 -m venv /tmp/pmt-venv && /tmp/pmt-venv/bin/pip install pyyaml plexapi -q
+
+# 1. Compile check (bare python3 is fine — no third-party imports)
 python3 -m py_compile tier.py
 
-# 2. YAML validity
-python3 -c "import yaml; yaml.safe_load(open('example.tiering.yaml'))"
+# 2. YAML validity (needs pyyaml — use venv)
+/tmp/pmt-venv/bin/python3 -c "import yaml; yaml.safe_load(open('example.tiering.yaml'))"
 
-# 3. Inline test harness
-python3 tier.py --_test
+# 3. Inline test harness (needs pyyaml + plexapi — use venv)
+/tmp/pmt-venv/bin/python3 tier.py --_test
 ```
 
 When adding non-trivial logic (scoring tweak, new outcome, path handling),
