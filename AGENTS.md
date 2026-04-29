@@ -491,27 +491,43 @@ revocation event, not a quick fix.
 #### Automated in CI
 
 Every push and pull request targeting `main` runs `.github/workflows/test.yml`,
-which executes the three checks below automatically. A failing check blocks
-PR merge (once branch protection is enabled). You do not need to run these
+which executes `py_compile`, the YAML validity check, and `--_test`
+automatically. A failing check blocks PR merge. You do not need to run these
 as a manual ritual, but running them locally first gives a fast-fail loop
 before waiting for CI.
 
+#### When to trust CI vs require Unraid testing
+
+CI is sufficient to merge when the change is **purely scoring or data-model
+logic** — new outcomes, scoring tweaks, override rules, config parsing,
+collection/pin logic, floor changes. All such logic is covered by the inline
+test harness and never touches Plex or the filesystem at runtime.
+
+Manual testing on Unraid is required when the change involves **Plex API
+semantics or real filesystem behaviour** that the inline stubs cannot
+faithfully replicate — path translation, `plex.history()` calls, rsync
+execution, file existence probes, parity detection, or any new plexapi
+call. For those, a representative test run against real data is the only
+meaningful gate.
+
 #### Run locally before pushing
 
-macOS system `python3` lacks pyyaml and plexapi. **Always use the venv**
-for checks 2 and 3; check 1 (compile) is fine with bare python3.
+The host Python on macOS (and Unraid) does not have `pyyaml` or `plexapi`
+installed at system level. Running with bare `python3` fails with
+`Missing dependency`. Use a venv — the one-time setup is cheap:
 
 ```bash
-# Bootstrap venv once (skip if /tmp/pmt-venv already exists)
-python3 -m venv /tmp/pmt-venv && /tmp/pmt-venv/bin/pip install pyyaml plexapi -q
+# One-time setup (reuse the venv across sessions)
+python3 -m venv /tmp/pmt-venv
+/tmp/pmt-venv/bin/pip install pyyaml plexapi -q
 
-# 1. Compile check (bare python3 is fine — no third-party imports)
+# 1. Compile check (no deps needed — bare python3 is fine here)
 python3 -m py_compile tier.py
 
-# 2. YAML validity (needs pyyaml — use venv)
+# 2. YAML validity
 /tmp/pmt-venv/bin/python3 -c "import yaml; yaml.safe_load(open('example.tiering.yaml'))"
 
-# 3. Inline test harness (needs pyyaml + plexapi — use venv)
+# 3. Inline test harness
 /tmp/pmt-venv/bin/python3 tier.py --_test
 ```
 
@@ -561,3 +577,66 @@ Renaming or removing an outcome breaks P2 when it lands. Don't.
    the README if user-facing behaviour or an outcome changed.
 6. Update the phase table in this file and in `tier.py`'s module
    docstring if the change closes out a phase.
+7. Follow the Standard PR flow below.
+
+## Standard PR flow
+
+Every code change ships as a PR off `main`. Follow these steps exactly —
+they are not boilerplate to be re-stated in each prompt.
+
+```bash
+# 1. Start from an up-to-date main
+git checkout main && git pull origin main
+
+# 2. Create the feature branch
+#    Convention: feat/<phase>-<slug>  |  fix/<slug>  |  docs/<slug>
+git checkout -b feat/p2.2-to-warm-moves
+
+# 3. Implement, then run the pre-commit check (see above)
+
+# 4. Stage and commit
+#    Single logical commit is fine for small PRs. Use imperative subject.
+git add tier.py example.tiering.yaml README.md AGENTS.md
+git commit -m "feat(P2.2): TO_WARM + RELOCATE_WARM move directions
+
+Brief body: what changed and why. One paragraph max."
+
+# 5. Push
+git push -u origin feat/p2.2-to-warm-moves
+
+# 6. Open the PR
+gh pr create \
+  --title "feat(P2.2): TO_WARM + RELOCATE_WARM move directions" \
+  --body "..."
+```
+
+### PR body structure
+
+Mirror the structure used in PRs #11, #13, #15, #16, #18:
+
+```markdown
+## Summary
+2-4 line elevator pitch.
+
+## Config schema (if applicable)
+YAML snippet of any new keys.
+
+## Behaviour
+Bullet list of what the feature does, edge cases, defaults.
+
+## Tests
+List of test names added; confirm all pass.
+
+## Docs
+What was updated in README, AGENTS.md, example.tiering.yaml.
+
+## Test plan
+Checkboxes for manual on-Unraid verification steps (only when the
+change touches Plex API semantics or real filesystem behaviour —
+see "When to trust CI vs require Unraid testing" above).
+```
+
+Check for an existing issue with `gh issue list` before opening the PR; if
+one exists add `Closes #N` to the body so it auto-closes on merge.
+
+**Do not merge.** Leave the PR open for human review.
