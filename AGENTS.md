@@ -402,8 +402,14 @@ importing P3's free-space-budget complexity.
 Silent data loss is the worst possible failure mode for a file mover. rsync
 exiting 0 doesn't guarantee a complete transfer — disk-full conditions, network
 interruptions, or corruption can leave a truncated destination. The size-verify
-step (`du -sb` on source and destination, tolerance ≤ 1 KB) is the only safety
-gate between a failed rsync and a deleted source. Never bypass it to save time.
+step (`os.path.getsize` per file in `warm_disk_files`, tolerance ≤ 1 KB total)
+is the only safety gate between a failed rsync and a deleted source. Never
+bypass it to save time.
+
+Per-file measurement (not `du -sb` on the whole directory tree) is deliberate:
+it measures only the files we moved, ignoring pre-existing files already on the
+hot pool for MIXED-tier items, and is immune to concurrent downloads landing at
+the destination between rsync finishing and the verify running.
 
 **Why moves are serial, not parallel.**
 Parallel rsyncs against a parity-protected Unraid array thrash the parity disk
@@ -427,14 +433,50 @@ interrupted before the summary logged). Detecting `current_tier == HOT` on a
 TO_HOT item and logging SKIPPED instead of re-rsyncing is a cheap idempotency
 guard that prevents double-rsyncing. It does not indicate a scoring error.
 
-**`Item.source_dir` — common-ancestor directory of files on dominant disk.**
-`resolve_item_current_tier()` now returns a fourth value: the common ancestor
-directory of all resolved file paths on the dominant WARM disk. For a single
-movie file at `/mnt/disk4/Movies/Foo/foo.mkv` it is the parent directory
-`/mnt/disk4/Movies/Foo`. For a TV series spanning multiple season subdirectories
-it is the common prefix, e.g. `/mnt/disk4/TV Shows/Show (2001)`. This is what
-P2's rsync uses as the source. Do not refactor to "title-derived path" — the
-actual filesystem layout is the ground truth, not the Plex title string.
+**`Item.warm_disk_files` — the ground truth for what gets moved.**
+`resolve_item_current_tier()` returns a 5-tuple; the fifth value is
+`warm_disk_files: Dict[str, List[str]]` — a mapping of warm disk mount →
+list of resolved absolute file paths on that disk belonging to this item.
+This is what P2's rsync operates on directly via `--files-from`. Do not
+refactor to title-derived or directory-derived paths — the actual filesystem
+paths are the ground truth, not the Plex title or the common-ancestor dir.
+
+The fourth value, `source_dirs: List[str]`, is derived from `warm_disk_files`
+for display in log lines only — it is the common-ancestor directory per warm
+disk, dominant disk first. P2 does not use it for rsync.
+
+**Why rsync uses `--files-from`, not a source directory.**
+Early versions rsynced the common-ancestor directory of each item's files.
+For year-organised movie libraries (`Movies/2000/Foo.mkv`) the common ancestor
+was the year folder, causing the whole `Movies/2000/` tree to transfer instead
+of just the item's files. Switching to `--files-from` with the per-file list
+from `warm_disk_files` means only the exact files belonging to this item are
+transferred, regardless of how they are organised on disk.
+
+**Why companion files (subtitles, NFOs, etc.) are included in `warm_disk_files`.**
+`media.parts` from the Plex API only lists container files (`.mkv`, `.mp4`,
+etc.). Sidecar files (`.srt`, `.nfo`, `.sub`, language-tagged variants like
+`Movie.en.srt`) are invisible to the API but Plex discovers them at play time
+by scanning the media file's directory for files whose stem matches. If they
+are left on the warm disk after the media file moves, Plex cannot find them.
+
+`_find_companion_files(media_path)` scans the media file's parent directory
+for any file whose stem equals the media stem or starts with `stem + "."`.
+Results are appended to `warm_disk_files[disk]` so rsync picks them up.
+Do not replace this with an API-based approach — the API does not expose
+sidecar files.
+
+**Why empty ancestor directories are pruned after source delete.**
+After `os.unlink` on each source file, `_run_move_pass` walks every ancestor
+directory from the file's parent up to (but not including) the disk root and
+attempts `os.rmdir` on each, sorted deepest-first. `os.rmdir` silently fails
+on non-empty directories so the walk is safe and idempotent. Without this,
+season directories and show directories are left as empty shells on the warm
+disk after a complete series move.
+
+Each disk in `warm_disk_files` is walked against its own root, not just
+`Item.current_disk` (the dominant disk), so multi-disk series are pruned
+correctly on every contributing disk.
 
 ## Config shape
 

@@ -278,7 +278,7 @@ Community Apps template includes that mount as an "advanced" option.
 ./tier.py --quiet           # no console output, file log only
 ```
 
-`--apply` exists but errors out in P0 (read-only phase).
+`--apply` activates move execution when `moves.enabled: true`. Without it the move pass runs in dry-run mode.
 
 ## Scoring
 
@@ -603,6 +603,16 @@ at 200 MB/s throughput. No filesystem changes are made.
 and (if configured) source-deleted. A per-item `[SUCCESS]` / `[SKIPPED]` /
 `[FAILED]` line is logged with the elapsed time.
 
+**Scheduled runs (no CLI access)** — set `moves.apply: true` in `tiering.yaml`
+instead of passing `--apply` on the command line. The two flags are additive;
+either alone is sufficient to trigger apply mode.
+
+```yaml
+moves:
+  enabled: true
+  apply: true   # execute moves without --apply on the CLI
+```
+
 ### Scope (P2.1)
 
 Only `TO_HOT` items are moved in P2.1. Items with outcome `TO_WARM`,
@@ -617,14 +627,27 @@ moves:
   size_verify: true                  # default
 ```
 
-The source directory is only deleted if:
+Source files are only deleted if:
 
 1. rsync exits 0, **and**
 2. `size_verify: true` and the destination byte count matches source within 1 KB.
 
+Verification is done per-file using `os.path.getsize`, measuring only the
+files that were moved. Pre-existing files already on the hot pool (for
+partially-migrated MIXED-tier items) are not counted, avoiding false failures.
+
+After deletion, empty ancestor directories (season folders, show folders, year
+folders, etc.) are automatically pruned up to but not including the disk root.
+Non-empty directories are left untouched.
+
 Set `delete_source_after_verify: false` for the first few apply runs to keep
 the source as a safety net. The item will exist in both locations until you
 remove the source manually.
+
+Sidecar files (`.nfo`, `.srt`, `.sub`, language-tagged subtitles like
+`Movie.en.srt`) are moved alongside the media file automatically — Plex
+discovers them by directory scan at play time, so they must live on the same
+tier as the media.
 
 ### Parity-check guard
 
