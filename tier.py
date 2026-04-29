@@ -2036,25 +2036,35 @@ def _run_move_pass(items: List["Item"], cfg: dict, apply: bool) -> None:
         # items sharing the same parent directory (e.g. a year folder) are safe.
         if delete_after:
             delete_failed = False
-            dirs_to_prune: set = set()
+            # Per-disk set of leaf dirs that need ancestor pruning.
+            disk_leaf_dirs: Dict[str, set] = {}
             for disk, files in it.warm_disk_files.items():
+                disk_leaf_dirs[disk] = set()
                 for f in files:
                     try:
                         os.unlink(f)
-                        dirs_to_prune.add(os.path.dirname(f))
+                        disk_leaf_dirs[disk].add(os.path.dirname(f))
                     except OSError as exc:
                         log.warning(
                             "%s [SUCCESS*] %s — moved OK but source removal failed (%s): %s",
                             prefix, it.title_year, f, exc,
                         )
                         delete_failed = True
-            # Prune empty ancestor directories up to (but not including) disk root.
-            for d in sorted(dirs_to_prune, reverse=True):
-                disk_root = (it.current_disk or "").rstrip("/")
-                if d == disk_root or not d.startswith(disk_root):
-                    continue
+            # Prune empty ancestor directories up to (but not including) each
+            # disk root. Walk every ancestor so season dirs, show dirs, etc.
+            # are removed when they empty out. Each disk is handled with its
+            # own root so multi-disk series prune correctly on every disk.
+            all_dirs: set = set()
+            for disk, leaf_dirs in disk_leaf_dirs.items():
+                disk_root = disk.rstrip("/")
+                for d in leaf_dirs:
+                    current = d
+                    while current and current != disk_root and current.startswith(disk_root + "/"):
+                        all_dirs.add(current)
+                        current = os.path.dirname(current)
+            for d in sorted(all_dirs, reverse=True):
                 try:
-                    os.rmdir(d)  # no-op if directory still has files
+                    os.rmdir(d)  # no-op if directory still has content
                 except OSError:
                     pass
             if delete_failed:
@@ -3625,6 +3635,77 @@ def _test_size_verify_mixed_tier_preexisting_dst_passes():
     print("_test_size_verify_mixed_tier_preexisting_dst_passes: OK")
 
 
+def _test_empty_ancestor_dirs_pruned_after_delete():
+    """Season dir, show dir, and intermediate dirs are removed when emptied by a move.
+
+    Simulates a TV series where Season 1 lives on disk1 (non-dominant) and Season 2
+    on disk5 (dominant). After all files are deleted, both season dirs and both show
+    dirs must be pruned, not just the immediate parent of each file.
+    """
+    import tempfile, os as _os
+
+    with tempfile.TemporaryDirectory() as root:
+        disk1 = _os.path.join(root, "disk1")
+        disk5 = _os.path.join(root, "disk5")
+        hot_mount = _os.path.join(root, "zfs_media")
+
+        s1_ep = _os.path.join(disk1, "TV Shows", "Sullivan's Crossing (2023)", "Season 1", "S01E01.mkv")
+        s2_ep = _os.path.join(disk5, "TV Shows", "Sullivan's Crossing (2023)", "Season 2", "S02E01.mkv")
+        dst_s1 = _os.path.join(hot_mount, "TV Shows", "Sullivan's Crossing (2023)", "Season 1", "S01E01.mkv")
+        dst_s2 = _os.path.join(hot_mount, "TV Shows", "Sullivan's Crossing (2023)", "Season 2", "S02E01.mkv")
+
+        for f in (s1_ep, s2_ep, dst_s1, dst_s2):
+            _os.makedirs(_os.path.dirname(f), exist_ok=True)
+            with open(f, "wb") as fh:
+                fh.write(b"x" * 100)
+
+        def _fake_run(*_a, **_kw):
+            class R:
+                returncode = 0
+                stderr = ""
+            return R()
+
+        item = _make_item(
+            kind="series", library="TV Shows",
+            current_tier="WARM", current_disk=disk5,
+            warm_disk_files={disk1: [s1_ep], disk5: [s2_ep]},
+        )
+        item.outcome = "TO_HOT"
+
+        cfg = {
+            "moves": {
+                "enabled": True, "rsync_options": ["-aH"],
+                "delete_source_after_verify": True, "size_verify": True,
+                "parity_check_blocking": False, "bandwidth_limit_mbps": None,
+            },
+            "paths": {"hot_pool_mount": hot_mount},
+        }
+
+        orig = subprocess.run
+        try:
+            subprocess.run = _fake_run
+            _run_move_pass([item], cfg, apply=True)
+        finally:
+            subprocess.run = orig
+
+        # Files must be gone
+        assert not _os.path.exists(s1_ep), "S01E01.mkv source must be deleted"
+        assert not _os.path.exists(s2_ep), "S02E01.mkv source must be deleted"
+        # Season dirs must be pruned (were empty after file deletion)
+        assert not _os.path.exists(_os.path.dirname(s1_ep)), "Season 1 dir on disk1 must be pruned"
+        assert not _os.path.exists(_os.path.dirname(s2_ep)), "Season 2 dir on disk5 must be pruned"
+        # Show dirs must be pruned (became empty after season dirs removed)
+        show_disk1 = _os.path.join(disk1, "TV Shows", "Sullivan's Crossing (2023)")
+        show_disk5 = _os.path.join(disk5, "TV Shows", "Sullivan's Crossing (2023)")
+        assert not _os.path.exists(show_disk1), "show dir on disk1 must be pruned"
+        assert not _os.path.exists(show_disk5), "show dir on disk5 must be pruned"
+        # Disk roots themselves must never be touched
+        assert _os.path.exists(disk1), "disk1 root must survive"
+        assert _os.path.exists(disk5), "disk5 root must survive"
+
+    print("_test_empty_ancestor_dirs_pruned_after_delete: OK")
+
+
 def _test_companion_files_included_in_warm_disk_files():
     """Companion files (nfo, srt, sub) are included in warm_disk_files alongside media."""
     import tempfile, os as _os
@@ -3706,5 +3787,6 @@ if __name__ == "__main__":
         _test_multidisk_series_all_source_dirs_rsynced()
         _test_size_verify_mixed_tier_preexisting_dst_passes()
         _test_companion_files_included_in_warm_disk_files()
+        _test_empty_ancestor_dirs_pruned_after_delete()
         sys.exit(0)
     sys.exit(main())
