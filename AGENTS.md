@@ -7,9 +7,9 @@ re-litigate (and get wrong) from reading the diff alone.
 
 A single-file Python script (`tier.py`) that asks Plex which media is
 hot/cold, probes the local filesystem to see where each item currently
-lives, and recommends where it *should* live — on a fast pool (HOT) or a
-parity array (WARM). Phased design; it refuses to actually move anything
-until P2 ships.
+lives, and recommends — and now executes — moves between a fast pool (HOT)
+and a parity array (WARM). Move execution is opt-in (`moves.enabled: true`
++ `--apply`); dry-run is the default.
 
 Runs as a one-shot Docker container scheduled by Unraid's User Scripts
 plugin. Image is built by GitHub Actions on every push to `main`, multi-
@@ -45,7 +45,9 @@ CLAUDE.md and GEMINI.md are symlinks to this file.
 | P0.4 | Added-date floor — promote recently-added movies and TV shows with fresh episodes to HOT | Done |
 | P0.5 | Disk eviction mode — mark warm-tier array disks as evicting; items on them get RELOCATE_WARM. Data model + reporting only; actual moves are P2 | Done |
 | P1   | Filesystem tier detection, path translation, majority-bytes rollup | Done |
-| P2   | `--apply`: rsync moves + Plex rescan | Pending |
+| P2.1 | Move executor — TO_HOT direction; rsync + size-verify + source delete; parity guard; dry-run by default | Done |
+| P2.2 | TO_WARM + RELOCATE_WARM moves | Pending |
+| P2.3 | Plex rescan automation post-move | Pending |
 | P3   | Hardening: lock file, currently-playing skip, free-space check, move cap | Pending |
 | P4   | Scheduled cron + size-triggered wrapper | Pending |
 
@@ -386,6 +388,96 @@ unaffected. If a file doesn't exist on any probed mount the original
 (unresolved) path is returned and `classify_path()` marks it UNKNOWN,
 preserving graceful degradation.
 
+### Move executor (P2.1)
+
+**Why TO_HOT is shipped first (lowest-risk direction).**
+The source is the parity-protected Unraid array; the destination is a separate
+ZFS pool with no redundancy contract with the source. A failed move doesn't
+reduce redundancy — the source is parity-protected until we explicitly delete
+it post-verification. There is also no destination-disk selection problem (the
+ZFS pool is a single target). This makes TO_HOT the cleanest first cut without
+importing P3's free-space-budget complexity.
+
+**Why source deletion is gated on size-verify.**
+Silent data loss is the worst possible failure mode for a file mover. rsync
+exiting 0 doesn't guarantee a complete transfer — disk-full conditions, network
+interruptions, or corruption can leave a truncated destination. The size-verify
+step (`os.path.getsize` per file in `warm_disk_files`, tolerance ≤ 1 KB total)
+is the only safety gate between a failed rsync and a deleted source. Never
+bypass it to save time.
+
+Per-file measurement (not `du -sb` on the whole directory tree) is deliberate:
+it measures only the files we moved, ignoring pre-existing files already on the
+hot pool for MIXED-tier items, and is immune to concurrent downloads landing at
+the destination between rsync finishing and the verify running.
+
+**Why moves are serial, not parallel.**
+Parallel rsyncs against a parity-protected Unraid array thrash the parity disk
+and can cause I/O contention that degrades both array performance and parity
+integrity. The throughput gain from parallelism is marginal compared to the risk.
+P2.2 will revisit if operators request it, with explicit caveats.
+
+**Why parity check is a blocker, not a warning.**
+Unraid's parity recalculation reads every data block and recomputes expected
+parity. A concurrent write (which rsync produces) changes a block after parity
+has been sampled, leaving the array with a parity mismatch for that stripe.
+This is silent unless the next parity check reveals it. Aborting the move pass
+before any rsync call is the only safe behaviour. The `parity_check_blocking:
+false` escape hatch exists for operators who understand the risk and have a
+specific reason to proceed.
+
+**Why `[SKIPPED]` for already-HOT items is an idempotency net.**
+If the script is re-run after a partial apply, some TO_HOT items may have
+already arrived on the hot pool (because rsync succeeded but the run was
+interrupted before the summary logged). Detecting `current_tier == HOT` on a
+TO_HOT item and logging SKIPPED instead of re-rsyncing is a cheap idempotency
+guard that prevents double-rsyncing. It does not indicate a scoring error.
+
+**`Item.warm_disk_files` — the ground truth for what gets moved.**
+`resolve_item_current_tier()` returns a 5-tuple; the fifth value is
+`warm_disk_files: Dict[str, List[str]]` — a mapping of warm disk mount →
+list of resolved absolute file paths on that disk belonging to this item.
+This is what P2's rsync operates on directly via `--files-from`. Do not
+refactor to title-derived or directory-derived paths — the actual filesystem
+paths are the ground truth, not the Plex title or the common-ancestor dir.
+
+The fourth value, `source_dirs: List[str]`, is derived from `warm_disk_files`
+for display in log lines only — it is the common-ancestor directory per warm
+disk, dominant disk first. P2 does not use it for rsync.
+
+**Why rsync uses `--files-from`, not a source directory.**
+Early versions rsynced the common-ancestor directory of each item's files.
+For year-organised movie libraries (`Movies/2000/Foo.mkv`) the common ancestor
+was the year folder, causing the whole `Movies/2000/` tree to transfer instead
+of just the item's files. Switching to `--files-from` with the per-file list
+from `warm_disk_files` means only the exact files belonging to this item are
+transferred, regardless of how they are organised on disk.
+
+**Why companion files (subtitles, NFOs, etc.) are included in `warm_disk_files`.**
+`media.parts` from the Plex API only lists container files (`.mkv`, `.mp4`,
+etc.). Sidecar files (`.srt`, `.nfo`, `.sub`, language-tagged variants like
+`Movie.en.srt`) are invisible to the API but Plex discovers them at play time
+by scanning the media file's directory for files whose stem matches. If they
+are left on the warm disk after the media file moves, Plex cannot find them.
+
+`_find_companion_files(media_path)` scans the media file's parent directory
+for any file whose stem equals the media stem or starts with `stem + "."`.
+Results are appended to `warm_disk_files[disk]` so rsync picks them up.
+Do not replace this with an API-based approach — the API does not expose
+sidecar files.
+
+**Why empty ancestor directories are pruned after source delete.**
+After `os.unlink` on each source file, `_run_move_pass` walks every ancestor
+directory from the file's parent up to (but not including) the disk root and
+attempts `os.rmdir` on each, sorted deepest-first. `os.rmdir` silently fails
+on non-empty directories so the walk is safe and idempotent. Without this,
+season directories and show directories are left as empty shells on the warm
+disk after a complete series move.
+
+Each disk in `warm_disk_files` is walked against its own root, not just
+`Item.current_disk` (the dominant disk), so multi-disk series are pruned
+correctly on every contributing disk.
+
 ## Config shape
 
 `example.tiering.yaml` is the canonical source. It auto-seeds `/config/
@@ -406,18 +498,21 @@ merges over the user config via `_deep_merge()`. Keep the two in sync.
 
 ## Development rules
 
-### Read-only at runtime (until P2)
+### Write only to `/config` at runtime
 
 The container bind-mounts media read-only. `tier.py` must NOT write
 outside `/config`. If you need to spill state, put it in `/config/
-state.json` — the volume is persistent and already mounted.
+state.json` — the volume is persistent and already mounted. The one
+exception is the move executor, which writes to the hot pool destination;
+that path is a separate read-write mount.
 
-### No `--apply` without phase-gate
+### `--apply` is now live in P2.1 (TO_HOT only)
 
-`--apply` exists in the argparser and immediately exits with code 3 in
-P0/P1. Do not wire it to actual rsync calls without a corresponding phase
-bump. P2 opens this up with safety guards (currently-playing skip,
-free-space check, move-size cap, lock file).
+`--apply` executes TO_HOT moves when `moves.enabled: true`. Adding
+support for new move directions (TO_WARM, RELOCATE_WARM) requires a
+corresponding phase bump to P2.2. The full P3 safety guards (currently-
+playing skip, free-space check, move-size cap, lock file) are still
+pending — don't add them piecemeal without the full P3 spec.
 
 ### Notifiers must not raise
 
