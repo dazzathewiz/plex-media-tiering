@@ -677,6 +677,36 @@ def classify_path(
     return "UNKNOWN"
 
 
+def _find_companion_files(media_path: str) -> List[str]:
+    """Return sidecar files in the same directory that share the media file's stem.
+
+    Plex discovers external subtitles at play time by scanning the media
+    file's directory for files whose stem matches (or starts with the stem
+    followed by '.', to catch language tags like Movie.en.srt).  This
+    function replicates that logic so rsync moves companions alongside the
+    media file.
+
+    Example: /disk/Movies/Moana (2016).mkv  →  finds:
+      Moana (2016).nfo, Moana (2016).en.srt, Moana (2016).sub, …
+    """
+    parent = os.path.dirname(media_path)
+    stem = os.path.splitext(os.path.basename(media_path))[0]
+    companions: List[str] = []
+    try:
+        with os.scandir(parent) as it:
+            for entry in it:
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                if entry.path == media_path:
+                    continue
+                entry_stem = os.path.splitext(entry.name)[0]
+                if entry_stem == stem or entry_stem.startswith(stem + "."):
+                    companions.append(entry.path)
+    except OSError:
+        pass
+    return companions
+
+
 def resolve_item_current_tier(
     parts: Iterable[Tuple[str, int]],
     path_map,
@@ -720,6 +750,20 @@ def resolve_item_current_tier(
                     disk_bytes[disk] = disk_bytes.get(disk, 0) + size
                     disk_files.setdefault(disk, []).append(resolved)
                     break
+    # Augment each disk's file list with companion files (subtitles, NFO, etc.)
+    # that share the media file's stem. Plex discovers external subtitles this
+    # way at play time, so they must live alongside the media on the same tier.
+    seen: set = set()
+    for disk in list(disk_files.keys()):
+        extras: List[str] = []
+        for mf in disk_files[disk]:
+            seen.add(mf)
+            for companion in _find_companion_files(mf):
+                if companion not in seen:
+                    seen.add(companion)
+                    extras.append(companion)
+        disk_files[disk].extend(extras)
+
     dominant = max(disk_bytes, key=disk_bytes.__getitem__) if disk_bytes else None
     # Build display-only source dirs (common ancestor per disk, dominant first).
     warm_source_dirs: List[str] = []
@@ -3581,6 +3625,44 @@ def _test_size_verify_mixed_tier_preexisting_dst_passes():
     print("_test_size_verify_mixed_tier_preexisting_dst_passes: OK")
 
 
+def _test_companion_files_included_in_warm_disk_files():
+    """Companion files (nfo, srt, sub) are included in warm_disk_files alongside media."""
+    import tempfile, os as _os
+
+    with tempfile.TemporaryDirectory() as root:
+        disk = _os.path.join(root, "disk4")
+        hot_mount = _os.path.join(root, "zfs_media")
+        movie_dir = _os.path.join(disk, "Movies", "Moana (2016)")
+        _os.makedirs(movie_dir, exist_ok=True)
+        _os.makedirs(hot_mount, exist_ok=True)
+
+        mkv = _os.path.join(movie_dir, "Moana (2016).mkv")
+        nfo = _os.path.join(movie_dir, "Moana (2016).nfo")
+        srt = _os.path.join(movie_dir, "Moana (2016).en.srt")
+        unrelated = _os.path.join(movie_dir, "other_movie.mkv")
+
+        for f in (mkv, nfo, srt, unrelated):
+            with open(f, "wb") as fh:
+                fh.write(b"x" * 100)
+
+        parts = [(mkv, 100)]
+        tier, _, _, _, wdf = resolve_item_current_tier(
+            parts=parts,
+            path_map=[],
+            hot_mount=hot_mount,
+            array_disks=[disk],
+        )
+
+        assert tier == "WARM", f"expected WARM, got {tier}"
+        files = wdf.get(disk, [])
+        assert mkv in files, f"mkv missing from warm_disk_files: {files}"
+        assert nfo in files, f"nfo missing from warm_disk_files: {files}"
+        assert srt in files, f"srt missing from warm_disk_files: {files}"
+        assert unrelated not in files, f"unrelated file must not be included: {files}"
+
+    print("_test_companion_files_included_in_warm_disk_files: OK")
+
+
 if __name__ == "__main__":
     if "--_test" in sys.argv:
         _test_resolve_user_share()
@@ -3623,5 +3705,6 @@ if __name__ == "__main__":
         _test_size_verify_failure_skips_delete()
         _test_multidisk_series_all_source_dirs_rsynced()
         _test_size_verify_mixed_tier_preexisting_dst_passes()
+        _test_companion_files_included_in_warm_disk_files()
         sys.exit(0)
     sys.exit(main())
