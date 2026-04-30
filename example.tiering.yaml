@@ -206,6 +206,19 @@ moves:
   # moves to run in the background without saturating the array.
   bandwidth_limit_mbps: null
   # - 50    # example: cap at 50 MB/s
+  # Destination warm-disk selection for TO_WARM and RELOCATE_WARM moves.
+  warm_disk_selection:
+    # Only strategy in v1. For each item needing a warm destination:
+    #   1. Filter disks by free space >= item size + safety_margin_gb.
+    #   2. For series: prefer the disk that already holds the most bytes
+    #      of that series (co-location keeps a show on one spindle).
+    #   3. Fallback: most free space wins.
+    # Items with no qualifying disk are skipped with [FAILED] in the log.
+    strategy: "co_locate_then_most_free"
+    # Minimum free space to leave on the target disk after the move (GB).
+    # Conservative: a fully accurate check would subtract existing series
+    # bytes already on the target, but the simple upper-bound is safer.
+    safety_margin_gb: 50
 
 # Capacity — not used in P0, wired up in P3.
 # Budget-aware promotion/demotion keeps the hot ZFS pool under the ceiling.

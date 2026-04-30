@@ -46,8 +46,9 @@ CLAUDE.md and GEMINI.md are symlinks to this file.
 | P0.5 | Disk eviction mode — mark warm-tier array disks as evicting; items on them get RELOCATE_WARM. Data model + reporting only; actual moves are P2 | Done |
 | P1   | Filesystem tier detection, path translation, majority-bytes rollup | Done |
 | P2.1 | Move executor — TO_HOT direction; rsync + size-verify + source delete; parity guard; dry-run by default | Done |
-| P2.2 | TO_WARM + RELOCATE_WARM moves | Pending |
-| P2.3 | Plex rescan automation post-move | Pending |
+| P2.2 | TO_WARM moves — demote from hot pool to chosen warm disk; co_locate_then_most_free destination selection | Done |
+| P2.3 | RELOCATE_WARM moves — drain evicting warm disks to healthy warm disks; source disk excluded from candidates | Done |
+| P2.4 | Plex rescan automation — dropped (Unraid user-share union makes it unnecessary for in-union moves) | N/A |
 | P3   | Hardening: lock file, currently-playing skip, free-space check, move cap | Pending |
 | P4   | Scheduled cron + size-triggered wrapper | Pending |
 
@@ -433,13 +434,21 @@ interrupted before the summary logged). Detecting `current_tier == HOT` on a
 TO_HOT item and logging SKIPPED instead of re-rsyncing is a cheap idempotency
 guard that prevents double-rsyncing. It does not indicate a scoring error.
 
-**`Item.warm_disk_files` — the ground truth for what gets moved.**
-`resolve_item_current_tier()` returns a 5-tuple; the fifth value is
+**`Item.warm_disk_files` and `Item.hot_pool_files` — the ground truth for what gets moved.**
+`resolve_item_current_tier()` returns a 6-tuple. The fifth value is
 `warm_disk_files: Dict[str, List[str]]` — a mapping of warm disk mount →
 list of resolved absolute file paths on that disk belonging to this item.
-This is what P2's rsync operates on directly via `--files-from`. Do not
-refactor to title-derived or directory-derived paths — the actual filesystem
-paths are the ground truth, not the Plex title or the common-ancestor dir.
+The sixth value is `hot_pool_files: List[str]` — the resolved absolute paths
+on the hot pool (populated whenever the item has HOT bytes). `_exec_single_move`
+operates on these via `--files-from` in all three move directions:
+
+- TO_HOT: source = `warm_disk_files`, dst = hot pool.
+- TO_WARM: source = `{hot_pool_mount: hot_pool_files}`, dst = chosen warm disk.
+- RELOCATE_WARM: source = `warm_disk_files` (all disks), dst = chosen warm disk.
+
+Do not refactor to title-derived or directory-derived paths — the actual
+filesystem paths are the ground truth, not the Plex title or the common-
+ancestor dir.
 
 The fourth value, `source_dirs: List[str]`, is derived from `warm_disk_files`
 for display in log lines only — it is the common-ancestor directory per warm
@@ -477,6 +486,46 @@ disk after a complete series move.
 Each disk in `warm_disk_files` is walked against its own root, not just
 `Item.current_disk` (the dominant disk), so multi-disk series are pruned
 correctly on every contributing disk.
+
+**Why warm destination selection co-locates series on one spindle.**
+`_select_warm_destination()` scores candidate disks by how many bytes of
+the item already live there. For a series move, the disk that already holds
+the most series bytes wins over the most-free disk. This is a correctness
+and UX property, not just a space optimisation: when a user binges a show,
+Unraid's parity-protected array wakes one spindle, not several scattered
+ones. A co-located series also simplifies future RELOCATE_WARM: one disk
+holds the whole item, so eviction is a single-source move. The annotation
+`(co-locate, +X GB existing)` in the log lets operators verify the
+heuristic is firing correctly.
+
+The series-vs-movie distinction matters: movies have no affinity — they
+always go to the most-free qualifying disk. Only series items (those where
+`item.media_type == "show"`) trigger the co-location path.
+
+**Why `current_disk` is excluded from RELOCATE_WARM candidates.**
+RELOCATE_WARM's purpose is to vacate an evicting disk. Selecting the same
+disk as the destination would either be a no-op (the file path doesn't
+change) or trigger an rsync from a disk to itself, which is undefined
+behaviour and almost certainly an error. `_select_warm_destination()` takes
+an optional `exclude_disk` parameter; `_run_move_pass` passes
+`item.current_disk` for RELOCATE_WARM items. The warm disk with the most
+existing series bytes is still preferred among the *remaining* candidates —
+the co-location logic is otherwise unchanged.
+
+**Why P2.4 (post-move Plex rescan) was scoped to TO_HOT only.**
+Unraid's user-share union filesystem presents `/mnt/user/<share>/` as a
+merged view that spans all array disks. TO_WARM and RELOCATE_WARM both
+move files between array disks, so the file's `/mnt/user/…` path is
+unchanged from Plex's perspective — no rescan is needed. TO_HOT moves a
+file from the array to a separate ZFS pool mount (e.g. `/mnt/hot_pool/`)
+that is outside the user-share union. Plex never sees a `/mnt/hot_pool/`
+path; instead, the mover relies on the user-share path remaining valid
+(it resolves through Unraid's union). If the hot pool is NOT mounted
+via user-share (i.e. `hot_pool_mount` is not under `user_share_prefix`),
+a rescan may be needed — the log line after a TO_HOT apply run recommends
+it. We do not automate the rescan because plexapi's `Library.update()` is
+a fire-and-forget with no completion signal, and the move executor must not
+block on Plex's indexing speed.
 
 ## Config shape
 

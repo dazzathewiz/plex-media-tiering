@@ -5,10 +5,12 @@ watch history and age, and recommends whether each item should sit on the HOT
 tier (HDD ZFS pool) or the WARM tier (Unraid parity array). Scheduled to run
 monthly or when the ZFS pool fills past a threshold.
 
-**Current status: Phase P2.1 — TO_HOT moves.** The script connects to Plex,
-computes scores, detects the current tier of each item, and (when
-`moves.enabled: true`) dry-runs or executes rsync moves from the Unraid parity
-array to the hot ZFS pool. Pass `--apply` to execute; default is dry-run.
+**Current status: Phase P2.2 + P2.3 — all three move directions.** The script
+connects to Plex, computes scores, detects the current tier of each item, and
+(when `moves.enabled: true`) dry-runs or executes rsync moves in all three
+directions: TO_HOT (warm array → hot pool), TO_WARM (hot pool → warm array),
+and RELOCATE_WARM (evicting warm disk → healthy warm disk). Pass `--apply` to
+execute; default is dry-run.
 
 ## Phase roadmap
 
@@ -22,8 +24,9 @@ array to the hot ZFS pool. Pass `--apply` to execute; default is dry-run.
 | P0.5 | Disk eviction — mark warm-tier array disks as evicting; items on them get `RELOCATE_WARM`. Data model + reporting only; actual moves are P2. | **Done** |
 | P1 | Filesystem probing to detect current tier. Auto-detect array disks + Plex path translation. Majority-bytes rollup. | **Done** |
 | P2.1 | Move executor — TO_HOT direction. rsync from warm array to hot pool. Dry-run by default; `--apply` executes. | **Done** |
-| P2.2 | TO_WARM + RELOCATE_WARM moves. | Pending |
-| P2.3 | Plex rescan automation post-move. | Pending |
+| P2.2 | TO_WARM moves — demote items from hot pool to chosen warm disk (co-location + most-free selection). | **Done** |
+| P2.3 | RELOCATE_WARM moves — drain evicting warm disks to healthy warm disks. Evicting disk excluded from candidates. | **Done** |
+| P2.4 | Plex rescan automation — **intentionally not implemented**. Unraid's user-share union means Plex always reads through `/mnt/user/` regardless of which physical disk backs a file; TO_WARM and RELOCATE_WARM moves are invisible to Plex at the path level. Only TO_HOT (which moves files off the union to a separate ZFS mount) recommends a rescan. | N/A |
 | P3 | Hardened safeguards (lock file, currently-playing skip, free-space check, move-size cap). | Pending |
 | P4 | Scheduled cron + size-triggered wrapper. | Pending |
 
