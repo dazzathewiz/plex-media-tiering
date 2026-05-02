@@ -1829,6 +1829,27 @@ def collect_all(plex: PlexServer, cfg: dict, filter_libraries) -> List[Item]:
                 relocate_count, implicit_hot_count,
             )
 
+    # Straggler cleanup: items whose MAJORITY tier matches their recommendation
+    # (STAY) but whose MINORITY bytes are on the wrong tier.  Typical cause:
+    # a partial previous move where the main title file moved but extras did
+    # not, or a movie-per-folder library where extras were added while the main
+    # file was already on a different tier.
+    straggler_to_warm = 0
+    straggler_to_hot = 0
+    for it in items:
+        if it.outcome == "STAY_WARM" and it.hot_pool_files:
+            it.outcome = "TO_WARM"
+            straggler_to_warm += 1
+        elif it.outcome == "STAY_HOT" and it.warm_disk_files:
+            it.outcome = "TO_HOT"
+            straggler_to_hot += 1
+    if straggler_to_warm or straggler_to_hot:
+        log.info(
+            "Stragglers: %d STAY_WARM→TO_WARM, %d STAY_HOT→TO_HOT "
+            "(files on wrong tier despite correct majority-bytes tier)",
+            straggler_to_warm, straggler_to_hot,
+        )
+
     return items
 
 
@@ -1885,9 +1906,10 @@ def _select_warm_destination(
     Selection rules:
       1. Exclude exclude_disk (used for RELOCATE_WARM to avoid the source disk).
       2. Filter by capacity: free >= item.size_bytes + safety_margin_bytes.
-      3. Co-location: for series, prefer the candidate disk that already holds
-         the most bytes of this item (from warm_disk_files). Keeps a series on
-         one spindle so a binge only wakes one drive.
+      3. Co-location: when warm_disk_files is non-empty (item already has files
+         on at least one warm disk), prefer the candidate disk that holds the most
+         bytes of this item. Applies to series AND to movies with straggler files
+         so extras always land on the same spindle as the main title.
       4. Fallback: most free space.
     """
     candidates = [d for d in array_disks if d != exclude_disk]
@@ -1900,9 +1922,10 @@ def _select_warm_destination(
         return None, f"no disk with ≥ {_fmt_size(needed / (1024 ** 3))} free (safety_margin included)"
 
     # Co-location: prefer the qualified disk that already holds the most bytes
-    # of this series. Only applicable to series with warm_disk_files populated
-    # (i.e. the item has some bytes already on at least one warm disk).
-    if item.kind == "series" and item.warm_disk_files:
+    # of this item. Applies whenever warm_disk_files is populated — covers
+    # both series (always partial on warm) and movie stragglers (main file
+    # already on a specific warm disk, extras need to join it).
+    if item.warm_disk_files:
         best_disk: Optional[str] = None
         best_sz = 0
         for disk in qualified:
@@ -2128,16 +2151,15 @@ def _run_move_pass(items: List["Item"], cfg: dict, apply: bool) -> None:
 
     # --- Build per-direction queues ---
 
-    # TO_HOT: already-HOT items are idempotency skips; others need warm_disk_files.
-    to_hot_skip = [it for it in items if it.outcome == "TO_HOT" and it.current_tier == "HOT"]
+    # TO_HOT: items with no warm_disk_files are idempotency skips (fully moved
+    # already) or straggler-upgraded items whose warm files have been cleaned up.
+    to_hot_skip = [it for it in items if it.outcome == "TO_HOT" and not it.warm_disk_files]
     to_hot_move: List["Item"] = []
     for it in items:
-        if it.outcome != "TO_HOT" or it.current_tier == "HOT":
+        if it.outcome != "TO_HOT":
             continue
         if not it.warm_disk_files:
-            log.warning("Moves: [SKIP] %s [TO_HOT] — no warm_disk_files (tier detection inactive?)",
-                        it.title_year)
-            continue
+            continue  # idempotency skip — nothing left on warm
         to_hot_move.append(it)
 
     # TO_WARM: item is on the hot pool; hot_pool_files must be populated.
@@ -4056,6 +4078,93 @@ def _test_movie_per_folder_extras_included():
     print("_test_movie_per_folder_extras_included: OK")
 
 
+def _test_straggler_stay_warm_upgraded_to_to_warm():
+    """STAY_WARM item with hot_pool_files is upgraded to TO_WARM by collect_all."""
+    item = _make_item(kind="movie", size_bytes=100)
+    item.outcome = "STAY_WARM"
+    item.current_tier = "WARM"
+    item.hot_pool_files = ["/mnt/zfs/Movies/Foo (2020)/Foo-trailer.mkv"]
+
+    straggler_to_warm = 0
+    if item.outcome == "STAY_WARM" and item.hot_pool_files:
+        item.outcome = "TO_WARM"
+        straggler_to_warm += 1
+
+    assert item.outcome == "TO_WARM", f"expected TO_WARM, got {item.outcome}"
+    assert straggler_to_warm == 1
+    print("_test_straggler_stay_warm_upgraded_to_to_warm: OK")
+
+
+def _test_straggler_stay_hot_upgraded_to_to_hot():
+    """STAY_HOT item with warm_disk_files is upgraded to TO_HOT by collect_all."""
+    item = _make_item(kind="movie", size_bytes=100)
+    item.outcome = "STAY_HOT"
+    item.current_tier = "HOT"
+    item.warm_disk_files = {"/mnt/disk5": ["/mnt/disk5/Movies/Foo (2020)/Foo.mkv"]}
+
+    straggler_to_hot = 0
+    if item.outcome == "STAY_HOT" and item.warm_disk_files:
+        item.outcome = "TO_HOT"
+        straggler_to_hot += 1
+
+    assert item.outcome == "TO_HOT", f"expected TO_HOT, got {item.outcome}"
+    assert straggler_to_hot == 1
+    print("_test_straggler_stay_hot_upgraded_to_to_hot: OK")
+
+
+def _test_straggler_no_upgrade_when_no_wrong_tier_files():
+    """STAY outcomes with no stranded files are not upgraded."""
+    stay_warm = _make_item(kind="movie", size_bytes=100)
+    stay_warm.outcome = "STAY_WARM"
+    stay_warm.hot_pool_files = []
+
+    stay_hot = _make_item(kind="movie", size_bytes=100)
+    stay_hot.outcome = "STAY_HOT"
+    stay_hot.warm_disk_files = {}
+
+    for it in (stay_warm, stay_hot):
+        if it.outcome == "STAY_WARM" and it.hot_pool_files:
+            it.outcome = "TO_WARM"
+        elif it.outcome == "STAY_HOT" and it.warm_disk_files:
+            it.outcome = "TO_HOT"
+
+    assert stay_warm.outcome == "STAY_WARM", f"must not upgrade: {stay_warm.outcome}"
+    assert stay_hot.outcome == "STAY_HOT", f"must not upgrade: {stay_hot.outcome}"
+    print("_test_straggler_no_upgrade_when_no_wrong_tier_files: OK")
+
+
+def _test_movie_straggler_to_warm_colocates_with_main_file():
+    """Movie straggler TO_WARM sends extras to the same disk as the main file."""
+    import tempfile, os as _os
+    global _disk_free_bytes
+    orig = _disk_free_bytes
+    try:
+        with tempfile.TemporaryDirectory() as root:
+            disk3 = _os.path.join(root, "disk3")
+            disk5 = _os.path.join(root, "disk5")
+            movie_dir = _os.path.join(disk5, "Movies", "Foo (2020)")
+            _os.makedirs(movie_dir, exist_ok=True)
+            _os.makedirs(disk3, exist_ok=True)
+            # Main movie file already on disk5.
+            main_file = _os.path.join(movie_dir, "Foo (2020).mkv")
+            with open(main_file, "wb") as fh:
+                fh.write(b"x" * (4 * 1024 ** 2))  # 4 MB
+
+            free_map = {disk3: 500 * 1024 ** 3, disk5: 200 * 1024 ** 3}
+            _disk_free_bytes = lambda p: free_map.get(p, 0)  # noqa: E731
+
+            item = _make_item(kind="movie", size_bytes=5 * 1024 ** 3,
+                              warm_disk_files={disk5: [main_file]})
+            disk, annot = _select_warm_destination(
+                item, [disk3, disk5], safety_margin_bytes=0
+            )
+            assert disk == disk5, f"expected disk5 (co-locate with main file), got {disk}"
+            assert annot and "co-locate" in annot, f"expected co-locate annotation, got {annot}"
+    finally:
+        _disk_free_bytes = orig
+    print("_test_movie_straggler_to_warm_colocates_with_main_file: OK")
+
+
 def _test_warm_disk_selection_to_warm_picks_most_free():
     """TO_WARM with two candidate disks — selects the one with most free space."""
     global _disk_free_bytes
@@ -4430,6 +4539,10 @@ if __name__ == "__main__":
         _test_size_verify_mixed_tier_preexisting_dst_passes()
         _test_companion_files_included_in_warm_disk_files()
         _test_movie_per_folder_extras_included()
+        _test_straggler_stay_warm_upgraded_to_to_warm()
+        _test_straggler_stay_hot_upgraded_to_to_hot()
+        _test_straggler_no_upgrade_when_no_wrong_tier_files()
+        _test_movie_straggler_to_warm_colocates_with_main_file()
         _test_empty_ancestor_dirs_pruned_after_delete()
         _test_warm_disk_selection_to_warm_picks_most_free()
         _test_warm_disk_selection_relocate_excludes_source()
