@@ -702,19 +702,32 @@ def classify_path(
 
 
 def _find_companion_files(media_path: str) -> List[str]:
-    """Return sidecar files in the same directory that share the media file's stem.
+    """Return sibling files in the same directory that should move with media_path.
 
-    Plex discovers external subtitles at play time by scanning the media
-    file's directory for files whose stem matches (or starts with the stem
-    followed by '.', to catch language tags like Movie.en.srt).  This
-    function replicates that logic so rsync moves companions alongside the
-    media file.
+    Two modes depending on folder structure:
 
-    Example: /disk/Movies/Moana (2016).mkv  →  finds:
-      Moana (2016).nfo, Moana (2016).en.srt, Moana (2016).sub, …
+    Movie-per-folder: when the parent directory name matches the media file's
+    stem (e.g. '.../Austin Powers in Goldmember (2002)/Austin Powers in
+    Goldmember (2002).mkv'), ALL other files in the directory are returned.
+    This covers Plex extras — trailers, featurettes, deleted scenes, etc. —
+    which Plex stores in the same folder using suffix conventions (-trailer,
+    -featurette, -deleted, …) and which have completely different stems from
+    the main title file.
+
+    Shared folder: when the parent is a year folder, library root, or any
+    other shared container (parent name != file stem), only files whose stem
+    equals the media stem or starts with stem + '.' are returned.  This is
+    the subtitle/NFO companion case for year-organised libraries where
+    multiple movies share one folder.
+
+    Detection: case-insensitive exact match between parent directory name and
+    media file stem.  Year folders (e.g. '2002') never match a movie stem.
+    Flat library roots (e.g. 'Movies') never match either.
     """
     parent = os.path.dirname(media_path)
     stem = os.path.splitext(os.path.basename(media_path))[0]
+    parent_name = os.path.basename(parent)
+    movie_per_folder = parent_name.lower() == stem.lower()
     companions: List[str] = []
     try:
         with os.scandir(parent) as it:
@@ -723,9 +736,12 @@ def _find_companion_files(media_path: str) -> List[str]:
                     continue
                 if entry.path == media_path:
                     continue
-                entry_stem = os.path.splitext(entry.name)[0]
-                if entry_stem == stem or entry_stem.startswith(stem + "."):
+                if movie_per_folder:
                     companions.append(entry.path)
+                else:
+                    entry_stem = os.path.splitext(entry.name)[0]
+                    if entry_stem == stem or entry_stem.startswith(stem + "."):
+                        companions.append(entry.path)
     except OSError:
         pass
     return companions
@@ -3957,20 +3973,21 @@ def _test_empty_ancestor_dirs_pruned_after_delete():
 
 
 def _test_companion_files_included_in_warm_disk_files():
-    """Companion files (nfo, srt, sub) are included in warm_disk_files alongside media."""
+    """Year-folder structure: srt/nfo companions included, unrelated movie excluded."""
     import tempfile, os as _os
 
     with tempfile.TemporaryDirectory() as root:
         disk = _os.path.join(root, "disk4")
         hot_mount = _os.path.join(root, "zfs_media")
-        movie_dir = _os.path.join(disk, "Movies", "Moana (2016)")
-        _os.makedirs(movie_dir, exist_ok=True)
+        # Year-folder structure: multiple movies share the '2016' folder.
+        year_dir = _os.path.join(disk, "Movies", "2016")
+        _os.makedirs(year_dir, exist_ok=True)
         _os.makedirs(hot_mount, exist_ok=True)
 
-        mkv = _os.path.join(movie_dir, "Moana (2016).mkv")
-        nfo = _os.path.join(movie_dir, "Moana (2016).nfo")
-        srt = _os.path.join(movie_dir, "Moana (2016).en.srt")
-        unrelated = _os.path.join(movie_dir, "other_movie.mkv")
+        mkv = _os.path.join(year_dir, "Moana (2016).mkv")
+        nfo = _os.path.join(year_dir, "Moana (2016).nfo")
+        srt = _os.path.join(year_dir, "Moana (2016).en.srt")
+        unrelated = _os.path.join(year_dir, "Other Movie (2016).mkv")
 
         for f in (mkv, nfo, srt, unrelated):
             with open(f, "wb") as fh:
@@ -3992,6 +4009,51 @@ def _test_companion_files_included_in_warm_disk_files():
         assert unrelated not in files, f"unrelated file must not be included: {files}"
 
     print("_test_companion_files_included_in_warm_disk_files: OK")
+
+
+def _test_movie_per_folder_extras_included():
+    """Movie-per-folder structure: ALL extras in the folder are included (any stem)."""
+    import tempfile, os as _os
+
+    with tempfile.TemporaryDirectory() as root:
+        disk = _os.path.join(root, "disk5")
+        hot_mount = _os.path.join(root, "zfs_media")
+        # Hot pool copy — main movie + extras all in the movie's own folder.
+        movie_dir = _os.path.join(hot_mount, "DVD Rips", "Movies",
+                                  "Austin Powers in Goldmember (2002)")
+        _os.makedirs(movie_dir, exist_ok=True)
+        _os.makedirs(disk, exist_ok=True)
+
+        main_mkv = _os.path.join(movie_dir,
+                                 "Austin Powers in Goldmember (2002).mkv")
+        trailer  = _os.path.join(movie_dir,
+                                 "Austin Powers in Goldmember-trailer.mkv")
+        featurette = _os.path.join(movie_dir, "Disco Fever-featurette.mkv")
+        deleted  = _os.path.join(movie_dir, "Bloopers-deleted.mkv")
+        nfo      = _os.path.join(movie_dir,
+                                 "Austin Powers in Goldmember (2002).nfo")
+
+        for f in (main_mkv, trailer, featurette, deleted, nfo):
+            with open(f, "wb") as fh:
+                fh.write(b"x" * 100)
+
+        parts = [(main_mkv, 100)]
+        tier, _, _, _, _, hot = resolve_item_current_tier(
+            parts=parts,
+            path_map=[],
+            hot_mount=hot_mount,
+            array_disks=[disk],
+        )
+
+        assert tier == "HOT", f"expected HOT, got {tier}"
+        # All extras must be in hot_pool_files for TO_WARM to pick them up.
+        assert main_mkv in hot, f"main mkv missing: {hot}"
+        assert trailer in hot, f"trailer missing: {hot}"
+        assert featurette in hot, f"featurette missing: {hot}"
+        assert deleted in hot, f"deleted scene missing: {hot}"
+        assert nfo in hot, f"nfo missing: {hot}"
+
+    print("_test_movie_per_folder_extras_included: OK")
 
 
 def _test_warm_disk_selection_to_warm_picks_most_free():
@@ -4367,6 +4429,7 @@ if __name__ == "__main__":
         _test_multidisk_series_all_source_dirs_rsynced()
         _test_size_verify_mixed_tier_preexisting_dst_passes()
         _test_companion_files_included_in_warm_disk_files()
+        _test_movie_per_folder_extras_included()
         _test_empty_ancestor_dirs_pruned_after_delete()
         _test_warm_disk_selection_to_warm_picks_most_free()
         _test_warm_disk_selection_relocate_excludes_source()

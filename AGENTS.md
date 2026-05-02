@@ -469,11 +469,29 @@ etc.). Sidecar files (`.srt`, `.nfo`, `.sub`, language-tagged variants like
 by scanning the media file's directory for files whose stem matches. If they
 are left on the warm disk after the media file moves, Plex cannot find them.
 
-`_find_companion_files(media_path)` scans the media file's parent directory
-for any file whose stem equals the media stem or starts with `stem + "."`.
-Results are appended to `warm_disk_files[disk]` so rsync picks them up.
-Do not replace this with an API-based approach — the API does not expose
-sidecar files.
+`_find_companion_files(media_path)` operates in two modes based on folder
+structure:
+
+**Movie-per-folder** (parent directory name == media file stem, e.g.
+`.../Austin Powers in Goldmember (2002)/Austin Powers in Goldmember (2002).mkv`):
+ALL other files in the directory are returned. Plex extras — trailers,
+featurettes, deleted scenes, behind-the-scenes, music videos — are stored here
+using Plex's suffix conventions (`-trailer.mkv`, `-featurette.mkv`, etc.) and
+have completely different stems from the main title file. Stem-only matching
+would silently leave every extra behind on the source disk.
+
+**Shared folder** (year folder, library root, or any other parent not named
+after the movie — parent name ≠ file stem): only files whose stem equals the
+media stem or starts with `stem + "."` are returned. This is the subtitle/NFO
+companion case for year-organised libraries (e.g. `.../2002/Movie.mkv`) where
+multiple movies share one folder and returning all files would move unrelated
+movies' files.
+
+Detection is a case-insensitive exact match between parent directory name and
+media file stem. Year folders (`2002`) and library roots (`Movies`) never match
+a movie stem. Do not replace this with an API-based approach — Plex's extras
+API (`movie.extras()`) requires one extra network call per movie and is not
+needed when the filesystem structure already encodes the information.
 
 **Why empty ancestor directories are pruned after source delete.**
 After `os.unlink` on each source file, `_run_move_pass` walks every ancestor
