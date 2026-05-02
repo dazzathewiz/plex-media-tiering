@@ -206,6 +206,12 @@ moves:
   # moves to run in the background without saturating the array.
   bandwidth_limit_mbps: null
   # - 50    # example: cap at 50 MB/s
+  # Throughput estimates used for the ETA shown at the start of each run.
+  # TO_HOT writes to the ZFS/NVMe hot pool (typically fast).
+  # TO_WARM and RELOCATE_WARM write to spinning-disk array (typically slower).
+  # Adjust to reflect your actual hardware if the ETA is consistently off.
+  estimated_hot_mbps: 200
+  estimated_warm_mbps: 50
   # Destination warm-disk selection for TO_WARM and RELOCATE_WARM moves.
   warm_disk_selection:
     # Only strategy in v1. For each item needing a warm destination:

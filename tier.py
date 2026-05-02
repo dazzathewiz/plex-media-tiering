@@ -186,6 +186,12 @@ DEFAULT_CONFIG = {
         "size_verify": True,
         "parity_check_blocking": True,
         "bandwidth_limit_mbps": None,
+        # Initial throughput estimates for ETA at the start of each run.
+        # Actual speeds vary by hardware; adjust to match your environment.
+        # TO_HOT writes to the ZFS pool (NVMe/SSD); TO_WARM/RELOCATE_WARM
+        # write to spinning-disk array — typically much slower.
+        "estimated_hot_mbps": 200,
+        "estimated_warm_mbps": 50,
         "warm_disk_selection": {
             # How to pick the destination warm disk for TO_WARM / RELOCATE_WARM.
             # Only strategy in v1: prefer the disk that already holds the most
@@ -822,6 +828,40 @@ def resolve_item_current_tier(
                     seen.add(companion)
                     extras.append(companion)
         disk_files[disk].extend(extras)
+
+    # Cross-tier companion probe: for WARM files in movie-per-folder layouts,
+    # scan the equivalent hot pool directory for extras stranded by a prior
+    # partial move (main file already moved to warm, extras left on hot pool).
+    # Typical scenario: a prior run moved the main .mkv but not the featurettes,
+    # trailers, or deleted scenes in the same folder.
+    if hot_mount:
+        hot_probed: set = set()
+        for disk, files in disk_files.items():
+            d = disk.rstrip("/")
+            for mf in files:
+                parent = os.path.dirname(mf)
+                stem = os.path.splitext(os.path.basename(mf))[0]
+                if os.path.basename(parent).lower() != stem.lower():
+                    continue  # not a movie-per-folder layout; skip
+                if not mf.startswith(d + "/"):
+                    continue
+                rel = mf[len(d):]  # e.g. /DVD Rips/Movies/Title (YYYY)/Title (YYYY).mkv
+                hot_dir = os.path.dirname(hot_mount.rstrip("/") + rel)
+                if hot_dir in hot_probed:
+                    continue
+                hot_probed.add(hot_dir)
+                if not os.path.isdir(hot_dir):
+                    continue
+                try:
+                    with os.scandir(hot_dir) as scan_it:
+                        for entry in scan_it:
+                            if not entry.is_file(follow_symlinks=False):
+                                continue
+                            if entry.path not in seen:
+                                seen.add(entry.path)
+                                hot_files.append(entry.path)
+                except OSError:
+                    pass
 
     dominant = max(disk_bytes, key=disk_bytes.__getitem__) if disk_bytes else None
     # Build display-only source dirs (common ancestor per disk, dominant first).
@@ -1879,9 +1919,6 @@ def _fmt_eta(seconds: float) -> str:
 
 # ---------- Move executor (P2) ----------
 
-# Assumed throughput for ETA estimates (spinning array → ZFS NVMe).
-_ASSUMED_THROUGHPUT_BPS = 200 * 1024 * 1024  # 200 MB/s
-
 
 def _disk_free_bytes(path: str) -> int:
     """Return free bytes on the filesystem at path, or 0 on error."""
@@ -2136,6 +2173,8 @@ def _run_move_pass(items: List["Item"], cfg: dict, apply: bool) -> None:
 
     warm_sel_cfg = (moves_cfg.get("warm_disk_selection") or {})
     safety_margin_bytes = int(float(warm_sel_cfg.get("safety_margin_gb") or 50) * 1024 ** 3)
+    hot_bps = int(float(moves_cfg.get("estimated_hot_mbps") or 200)) * 1024 * 1024
+    warm_bps = int(float(moves_cfg.get("estimated_warm_mbps") or 50)) * 1024 * 1024
 
     # Tally SHOULD_BE_* outcomes (tier unknown — nothing to move).
     skip_outcomes: dict = {}
@@ -2223,22 +2262,29 @@ def _run_move_pass(items: List["Item"], cfg: dict, apply: bool) -> None:
     to_warm_ok = [it for it in to_warm_move if to_warm_dests[id(it)][0] is not None]
     relocate_ok = [it for it in relocate_move if relocate_dests[id(it)][0] is not None]
 
-    total_bytes = (
-        sum(it.size_bytes for it in to_hot_move)
-        + sum(it.size_bytes for it in to_warm_ok)
+    hot_bytes = sum(it.size_bytes for it in to_hot_move)
+    warm_bytes = (
+        sum(it.size_bytes for it in to_warm_ok)
         + sum(it.size_bytes for it in relocate_ok)
     )
+    total_bytes = hot_bytes + warm_bytes
+
+    def _eta() -> str:
+        secs = (hot_bytes / hot_bps if hot_bps and hot_bytes else 0.0) + \
+               (warm_bytes / warm_bps if warm_bps and warm_bytes else 0.0)
+        return _fmt_eta(secs) if secs else "0s"
 
     # --- DRY-RUN ---
     if not apply:
-        eta = _fmt_eta(total_bytes / _ASSUMED_THROUGHPUT_BPS) if total_bytes else "0s"
         log.info(
             "[DRY-RUN] Moves: TO_HOT=%d TO_WARM=%d RELOCATE_WARM=%d"
-            " (%d already-HOT skipped) — %s total — ETA ~%s at 200 MB/s",
+            " (%d already-HOT skipped) — %s total — ETA ~%s"
+            " (%d MB/s hot / %d MB/s warm)",
             len(to_hot_move), len(to_warm_ok), len(relocate_ok),
             len(to_hot_skip),
             _fmt_size(total_bytes / (1024 ** 3)),
-            eta,
+            _eta(),
+            hot_bps // (1024 * 1024), warm_bps // (1024 * 1024),
         )
         for it in to_hot_skip:
             log.info("[DRY-RUN]   %s [TO_HOT] — already on hot pool (SKIPPED)", it.title_year)
@@ -2281,11 +2327,12 @@ def _run_move_pass(items: List["Item"], cfg: dict, apply: bool) -> None:
     delete_after = moves_cfg.get("delete_source_after_verify", True)
     size_verify = moves_cfg.get("size_verify", True)
 
-    eta = _fmt_eta(total_bytes / _ASSUMED_THROUGHPUT_BPS) if total_bytes else "0s"
     log.info(
-        "Moves: TO_HOT=%d TO_WARM=%d RELOCATE_WARM=%d (apply mode) — %s total — ETA ~%s",
+        "Moves: TO_HOT=%d TO_WARM=%d RELOCATE_WARM=%d (apply mode) — %s total — ETA ~%s"
+        " (%d MB/s hot / %d MB/s warm)",
         len(to_hot_move), len(to_warm_ok), len(relocate_ok),
-        _fmt_size(total_bytes / (1024 ** 3)), eta,
+        _fmt_size(total_bytes / (1024 ** 3)), _eta(),
+        hot_bps // (1024 * 1024), warm_bps // (1024 * 1024),
     )
     for it in to_hot_skip:
         log.info("  [SKIPPED] %s [TO_HOT] — already on hot pool (no-op)", it.title_year)
@@ -4078,6 +4125,49 @@ def _test_movie_per_folder_extras_included():
     print("_test_movie_per_folder_extras_included: OK")
 
 
+def _test_cross_tier_companion_probe():
+    """Main file moved to warm in a prior run; extras stranded on hot pool are discovered."""
+    import tempfile, os as _os
+
+    with tempfile.TemporaryDirectory() as root:
+        disk = _os.path.join(root, "disk5")
+        hot_mount = _os.path.join(root, "zfs_media")
+        # Warm disk: only the main .mkv made it here in a prior run.
+        warm_movie_dir = _os.path.join(disk, "DVD Rips", "Movies",
+                                       "Austin Powers (2002)")
+        # Hot pool: main movie folder still has the extras that were never moved.
+        hot_movie_dir = _os.path.join(hot_mount, "DVD Rips", "Movies",
+                                      "Austin Powers (2002)")
+        _os.makedirs(warm_movie_dir, exist_ok=True)
+        _os.makedirs(hot_movie_dir, exist_ok=True)
+
+        main_warm = _os.path.join(warm_movie_dir, "Austin Powers (2002).mkv")
+        trailer_hot = _os.path.join(hot_movie_dir,
+                                    "Austin Powers-trailer.mkv")
+        featurette_hot = _os.path.join(hot_movie_dir, "Disco Fever-featurette.mkv")
+
+        for f in (main_warm, trailer_hot, featurette_hot):
+            with open(f, "wb") as fh:
+                fh.write(b"x" * 100)
+
+        parts = [(main_warm, 100)]
+        tier, _, _, _, _, hot = resolve_item_current_tier(
+            parts=parts,
+            path_map=[],
+            hot_mount=hot_mount,
+            array_disks=[disk],
+        )
+
+        assert tier == "WARM", f"expected WARM, got {tier}"
+        # Main file is on warm; extras stranded on hot pool should be discovered.
+        assert trailer_hot in hot, f"trailer missing from hot_pool_files: {hot}"
+        assert featurette_hot in hot, f"featurette missing from hot_pool_files: {hot}"
+        # Main warm file must NOT appear in hot_pool_files.
+        assert main_warm not in hot, f"warm file must not appear in hot_pool_files: {hot}"
+
+    print("_test_cross_tier_companion_probe: OK")
+
+
 def _test_straggler_stay_warm_upgraded_to_to_warm():
     """STAY_WARM item with hot_pool_files is upgraded to TO_WARM by collect_all."""
     item = _make_item(kind="movie", size_bytes=100)
@@ -4539,6 +4629,7 @@ if __name__ == "__main__":
         _test_size_verify_mixed_tier_preexisting_dst_passes()
         _test_companion_files_included_in_warm_disk_files()
         _test_movie_per_folder_extras_included()
+        _test_cross_tier_companion_probe()
         _test_straggler_stay_warm_upgraded_to_to_warm()
         _test_straggler_stay_hot_upgraded_to_to_hot()
         _test_straggler_no_upgrade_when_no_wrong_tier_files()
