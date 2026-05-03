@@ -707,6 +707,36 @@ def classify_path(
     return "UNKNOWN"
 
 
+# Matches sort-title article form: "Bounty Hunter, The (2010)" or "Bounty Hunter, The"
+_SORT_TITLE_RE = re.compile(r'^(.+),\s+(the|a|an)\s*(\(\d{4}\))?\s*$', re.IGNORECASE)
+
+
+def _is_movie_per_folder(parent_name: str, stem: str) -> bool:
+    """Return True when parent_name and stem refer to the same movie title.
+
+    Handles two naming conventions:
+    - Exact: 'Austin Powers (2002)' folder + 'Austin Powers (2002).mkv'
+    - Sort-title inversion: 'The Bounty Hunter (2010)' folder +
+      'Bounty Hunter, The (2010).mkv' (Plex renames articles to the end).
+    """
+    if parent_name.lower() == stem.lower():
+        return True
+
+    def _strip(s: str) -> str:
+        s = s.strip()
+        for art in ("the ", "a ", "an "):
+            if s.lower().startswith(art):
+                return s[len(art):]
+        m = _SORT_TITLE_RE.match(s)
+        if m:
+            base = m.group(1).strip()
+            year = (m.group(3) or "").strip()
+            return (base + (" " + year if year else "")).strip()
+        return s
+
+    return _strip(parent_name).lower() == _strip(stem).lower()
+
+
 def _find_companion_files(media_path: str) -> List[str]:
     """Return sibling files in the same directory that should move with media_path.
 
@@ -726,14 +756,14 @@ def _find_companion_files(media_path: str) -> List[str]:
     the subtitle/NFO companion case for year-organised libraries where
     multiple movies share one folder.
 
-    Detection: case-insensitive exact match between parent directory name and
-    media file stem.  Year folders (e.g. '2002') never match a movie stem.
-    Flat library roots (e.g. 'Movies') never match either.
+    Detection: _is_movie_per_folder() — handles exact match and article
+    inversions ('The Foo' folder / 'Foo, The.mkv' sort-title convention).
+    Year folders ('2002') and library roots ('Movies') never match.
     """
     parent = os.path.dirname(media_path)
     stem = os.path.splitext(os.path.basename(media_path))[0]
     parent_name = os.path.basename(parent)
-    movie_per_folder = parent_name.lower() == stem.lower()
+    movie_per_folder = _is_movie_per_folder(parent_name, stem)
     companions: List[str] = []
     try:
         with os.scandir(parent) as it:
@@ -841,7 +871,7 @@ def resolve_item_current_tier(
             for mf in files:
                 parent = os.path.dirname(mf)
                 stem = os.path.splitext(os.path.basename(mf))[0]
-                if os.path.basename(parent).lower() != stem.lower():
+                if not _is_movie_per_folder(os.path.basename(parent), stem):
                     continue  # not a movie-per-folder layout; skip
                 if not mf.startswith(d + "/"):
                     continue
@@ -4168,6 +4198,23 @@ def _test_cross_tier_companion_probe():
     print("_test_cross_tier_companion_probe: OK")
 
 
+def _test_movie_per_folder_article_inversion():
+    """_is_movie_per_folder matches when folder uses natural title, file uses sort-title article form."""
+    # Exact match still works
+    assert _is_movie_per_folder("Austin Powers (2002)", "Austin Powers (2002)")
+    # Article at start of folder, moved to end in file stem (Plex sort-title convention)
+    assert _is_movie_per_folder("The Bounty Hunter (2010)", "Bounty Hunter, The (2010)")
+    assert _is_movie_per_folder("A Beautiful Mind (2001)", "Beautiful Mind, A (2001)")
+    assert _is_movie_per_folder("An American Werewolf in London (1981)", "American Werewolf in London, An (1981)")
+    # Case-insensitive
+    assert _is_movie_per_folder("the bounty hunter (2010)", "Bounty Hunter, The (2010)")
+    # Unrelated titles must not match
+    assert not _is_movie_per_folder("The Matrix (1999)", "Bounty Hunter, The (2010)")
+    # Same title without year mismatch
+    assert _is_movie_per_folder("The Bounty Hunter", "Bounty Hunter, The")
+    print("_test_movie_per_folder_article_inversion: OK")
+
+
 def _test_straggler_stay_warm_upgraded_to_to_warm():
     """STAY_WARM item with hot_pool_files is upgraded to TO_WARM by collect_all."""
     item = _make_item(kind="movie", size_bytes=100)
@@ -4630,6 +4677,7 @@ if __name__ == "__main__":
         _test_companion_files_included_in_warm_disk_files()
         _test_movie_per_folder_extras_included()
         _test_cross_tier_companion_probe()
+        _test_movie_per_folder_article_inversion()
         _test_straggler_stay_warm_upgraded_to_to_warm()
         _test_straggler_stay_hot_upgraded_to_to_hot()
         _test_straggler_no_upgrade_when_no_wrong_tier_files()
