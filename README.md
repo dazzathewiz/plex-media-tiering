@@ -5,10 +5,12 @@ watch history and age, and recommends whether each item should sit on the HOT
 tier (HDD ZFS pool) or the WARM tier (Unraid parity array). Scheduled to run
 monthly or when the ZFS pool fills past a threshold.
 
-**Current status: Phase P2.1 — TO_HOT moves.** The script connects to Plex,
-computes scores, detects the current tier of each item, and (when
-`moves.enabled: true`) dry-runs or executes rsync moves from the Unraid parity
-array to the hot ZFS pool. Pass `--apply` to execute; default is dry-run.
+**Current status: Phase P2.2 + P2.3 — all three move directions.** The script
+connects to Plex, computes scores, detects the current tier of each item, and
+(when `moves.enabled: true`) dry-runs or executes rsync moves in all three
+directions: TO_HOT (warm array → hot pool), TO_WARM (hot pool → warm array),
+and RELOCATE_WARM (evicting warm disk → healthy warm disk). Pass `--apply` to
+execute; default is dry-run.
 
 ## Phase roadmap
 
@@ -22,8 +24,9 @@ array to the hot ZFS pool. Pass `--apply` to execute; default is dry-run.
 | P0.5 | Disk eviction — mark warm-tier array disks as evicting; items on them get `RELOCATE_WARM`. Data model + reporting only; actual moves are P2. | **Done** |
 | P1 | Filesystem probing to detect current tier. Auto-detect array disks + Plex path translation. Majority-bytes rollup. | **Done** |
 | P2.1 | Move executor — TO_HOT direction. rsync from warm array to hot pool. Dry-run by default; `--apply` executes. | **Done** |
-| P2.2 | TO_WARM + RELOCATE_WARM moves. | Pending |
-| P2.3 | Plex rescan automation post-move. | Pending |
+| P2.2 | TO_WARM moves — demote items from hot pool to chosen warm disk (co-location + most-free selection). | **Done** |
+| P2.3 | RELOCATE_WARM moves — drain evicting warm disks to healthy warm disks. Evicting disk excluded from candidates. | **Done** |
+| P2.4 | Plex rescan automation — **intentionally not implemented**. Unraid's user-share union means Plex always reads through `/mnt/user/` regardless of which physical disk backs a file; TO_WARM and RELOCATE_WARM moves are invisible to Plex at the path level. Only TO_HOT (which moves files off the union to a separate ZFS mount) recommends a rescan. | N/A |
 | P3 | Hardened safeguards (lock file, currently-playing skip, free-space check, move-size cap). | Pending |
 | P4 | Scheduled cron + size-triggered wrapper. | Pending |
 
@@ -613,11 +616,38 @@ moves:
   apply: true   # execute moves without --apply on the CLI
 ```
 
-### Scope (P2.1)
+### Scope
 
-Only `TO_HOT` items are moved in P2.1. Items with outcome `TO_WARM`,
-`RELOCATE_WARM`, `SHOULD_BE_HOT`, or `SHOULD_BE_WARM` are tallied in a single
-skip line and left for P2.2/P2.3.
+All three move directions are active:
+
+| Direction | Source | Destination | Trigger |
+| --- | --- | --- | --- |
+| `TO_HOT` | Warm array disk | Hot pool | Score above `score_to_hot`, recency floor, or pin |
+| `TO_WARM` | Hot pool | Warm array disk | Score drops below `score_to_warm` |
+| `RELOCATE_WARM` | Evicting warm disk | Healthy warm disk | Item on a disk listed in `array_disk_evict.disks` |
+
+Items with outcome `SHOULD_BE_HOT` or `SHOULD_BE_WARM` (tier detection
+inactive) are reported but not moved.
+
+**Warm disk selection** (`TO_WARM` and `RELOCATE_WARM`): tier.py picks the
+destination warm disk using the `co_locate_then_most_free` strategy:
+
+1. Exclude the source disk (RELOCATE_WARM) or no exclusion (TO_WARM).
+2. Filter candidates by free space ≥ item size + `safety_margin_gb`.
+3. Among qualified disks, prefer the one that already holds the most bytes of
+   this item (co-location — keeps a series on one spindle for efficient binging).
+4. Fallback: most-free disk.
+
+**Minority-evict handling**: if a series has its majority bytes on a safe disk
+but a season or two on an evicting disk, only those evicting-disk files are
+moved. The majority files on the safe disk are untouched and the move
+co-locates with the safe disk automatically.
+
+**Straggler cleanup**: after scoring, items that are majority-on-HOT but still
+have files on warm disks (`STAY_HOT + warm stragglers`) are automatically
+promoted to `TO_HOT` to finish the migration. Similarly, items pinned to HOT
+(`PIN_HOT`) that physically live on a warm disk are converted to `TO_HOT` so
+the pin takes effect.
 
 ### Source deletion
 
