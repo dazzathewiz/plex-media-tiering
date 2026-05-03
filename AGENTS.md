@@ -338,13 +338,87 @@ The eviction pass needs to attribute a series to exactly one disk. The
 chosen rule is **majority bytes**: whichever array disk holds the most
 bytes of the item wins and is stored as `Item.current_disk`. Consequences:
 
-- An item with only a small minority of bytes on an evicting disk does
-  **not** trigger `RELOCATE_WARM` — if 90% of a series is on disk1 and
-  10% on disk7, evicting disk7 does not justify moving the whole series.
-- `Item.current_disk` is only populated when `current_tier == "WARM"`.
-  HOT items don't get one — there is no per-disk concept on the ZFS pool.
+- An item with minority bytes on an evicting disk **does** trigger
+  `RELOCATE_WARM`, but only those minority files are moved. If 90% of a
+  series is on disk1 and 10% on disk7, evicting disk7 sets
+  `relocate_source_override = {disk7: [minority files]}` and overrides
+  `current_disk` to disk7. `_select_warm_destination` then excludes disk7
+  and co-locates with disk1 (the majority disk already in `warm_disk_files`).
+  Only the 10% moves; the 90% on disk1 is untouched.
+- `Item.current_disk` is set to the majority warm disk for `current_tier ==
+  "WARM"` items, and overridden to the evicting disk for minority-evict items
+  during the eviction pass. It is `None` for HOT-majority and UNKNOWN items.
 - Do not refactor to "first disk found" or a list of all disks containing
   the item. The majority-bytes winner is intentional.
+
+### HOT-majority items populate `warm_disk_files` for stragglers
+
+`resolve_item_current_tier()` always returns `warm_disk_files` even when
+`split["HOT"] > 0.5`. Early versions returned an empty dict for HOT-majority
+items, which silently broke two downstream features:
+
+1. **Straggler promotion** (`collect_all` post-scoring): `STAY_HOT +
+   warm_disk_files → TO_HOT` could never fire because `warm_disk_files` was
+   always `{}` for HOT items. A show like Chicago Med with most seasons on the
+   hot pool but a few seasons still on warm disks would report `STAY_HOT`
+   forever instead of finishing the migration.
+
+2. **Minority-evict detection**: the eviction pass scans `warm_disk_files` for
+   files on evicting disks. With an empty dict, HOT-majority items with warm
+   stragglers on an evicting disk were invisible to the eviction pass.
+
+Fix: return `warm_source_dirs` and `dict(disk_files)` for the HOT-majority
+branch. `current_disk` stays `None` (the item's primary residence is HOT, not
+a warm spindle). The straggler pass and eviction pass read `warm_disk_files`
+to find minority warm files.
+
+### Straggler promotion: STAY_HOT and PIN_HOT with warm stragglers → TO_HOT
+
+`collect_all`'s straggler pass (after scoring and eviction) converts:
+
+- `STAY_HOT + non-empty warm_disk_files` → `TO_HOT`: majority bytes are on the
+  hot pool but some files remain on warm disks (typical: a prior move was
+  interrupted after rsync but before source-delete, leaving orphaned seasons).
+- `PIN_HOT + non-empty warm_disk_files` → `TO_HOT`: item is library- or
+  title-pinned to HOT but physically still lives on a warm disk. The pin cannot
+  take effect until the file is actually on the hot pool. Converting to TO_HOT
+  lets P2 promote it; the next run shows `PIN_HOT` once promotion is complete.
+
+Neither conversion demotes anything. `warm_disk_files` being non-empty is the
+sole trigger — if it is empty (item genuinely already on HOT), no change.
+
+### Minority-evict: `Item.relocate_source_override`
+
+When the eviction pass detects that an item has files on an evicting disk but
+`current_disk` (majority bytes) is a *safe* disk, it:
+
+1. Sets `item.relocate_source_override = {evicting_disk: [minority files]}`
+   so `_exec_single_move` rsyncs only those files, not the whole `warm_disk_files`.
+2. Overrides `item.current_disk` to the evicting disk so `_select_warm_destination`
+   uses it as `exclude_disk`, which keeps the evicting disk out of candidates.
+3. Leaves `warm_disk_files` intact so co-location scoring can see the safe
+   majority disk and prefer it as the destination.
+
+Result: only the evicting-disk files move; the majority files on the safe disk
+are untouched; co-location naturally consolidates everything on one spindle.
+
+`relocate_source_override` is `None` for majority-evict items (the original
+case) and for all non-eviction moves. `None` means "use full `warm_disk_files`."
+
+### Article normalization in `_is_movie_per_folder`
+
+Plex's sort-title convention moves leading articles to the end:
+`The Bounty Hunter (2010)` folder → `Bounty Hunter, The (2010).mkv` file.
+
+`_is_movie_per_folder(parent_name, stem)` normalises both names to a canonical
+"natural order" form before comparing, using `_SORT_TITLE_RE` to detect and
+invert the sort-title article form. This prevents movie-per-folder companion
+detection from being bypassed when a library is organised with natural-order
+folder names but Plex-renamed sort-title filenames (or vice versa).
+
+The cross-tier companion probe (scanning the hot pool for stranded extras after
+a partial move) also uses `_is_movie_per_folder`, so article-inversion titles
+are handled there too.
 
 ### Graceful degradation
 
@@ -444,7 +518,8 @@ operates on these via `--files-from` in all three move directions:
 
 - TO_HOT: source = `warm_disk_files`, dst = hot pool.
 - TO_WARM: source = `{hot_pool_mount: hot_pool_files}`, dst = chosen warm disk.
-- RELOCATE_WARM: source = `warm_disk_files` (all disks), dst = chosen warm disk.
+- RELOCATE_WARM: source = `relocate_source_override` when set (minority-evict),
+  else `warm_disk_files` (all warm disks), dst = chosen warm disk.
 
 Do not refactor to title-derived or directory-derived paths — the actual
 filesystem paths are the ground truth, not the Plex title or the common-
@@ -573,13 +648,13 @@ state.json` — the volume is persistent and already mounted. The one
 exception is the move executor, which writes to the hot pool destination;
 that path is a separate read-write mount.
 
-### `--apply` is now live in P2.1 (TO_HOT only)
+### `--apply` covers all three move directions (P2.1–P2.3)
 
-`--apply` executes TO_HOT moves when `moves.enabled: true`. Adding
-support for new move directions (TO_WARM, RELOCATE_WARM) requires a
-corresponding phase bump to P2.2. The full P3 safety guards (currently-
-playing skip, free-space check, move-size cap, lock file) are still
-pending — don't add them piecemeal without the full P3 spec.
+`--apply` executes TO_HOT, TO_WARM, and RELOCATE_WARM moves when
+`moves.enabled: true`. All three directions are serialised in a single
+pass. The full P3 safety guards (currently-playing skip, free-space check,
+move-size cap, lock file) are still pending — don't add them piecemeal
+without the full P3 spec.
 
 ### Notifiers must not raise
 

@@ -616,11 +616,38 @@ moves:
   apply: true   # execute moves without --apply on the CLI
 ```
 
-### Scope (P2.1)
+### Scope
 
-Only `TO_HOT` items are moved in P2.1. Items with outcome `TO_WARM`,
-`RELOCATE_WARM`, `SHOULD_BE_HOT`, or `SHOULD_BE_WARM` are tallied in a single
-skip line and left for P2.2/P2.3.
+All three move directions are active:
+
+| Direction | Source | Destination | Trigger |
+| --- | --- | --- | --- |
+| `TO_HOT` | Warm array disk | Hot pool | Score above `score_to_hot`, recency floor, or pin |
+| `TO_WARM` | Hot pool | Warm array disk | Score drops below `score_to_warm` |
+| `RELOCATE_WARM` | Evicting warm disk | Healthy warm disk | Item on a disk listed in `array_disk_evict.disks` |
+
+Items with outcome `SHOULD_BE_HOT` or `SHOULD_BE_WARM` (tier detection
+inactive) are reported but not moved.
+
+**Warm disk selection** (`TO_WARM` and `RELOCATE_WARM`): tier.py picks the
+destination warm disk using the `co_locate_then_most_free` strategy:
+
+1. Exclude the source disk (RELOCATE_WARM) or no exclusion (TO_WARM).
+2. Filter candidates by free space ≥ item size + `safety_margin_gb`.
+3. Among qualified disks, prefer the one that already holds the most bytes of
+   this item (co-location — keeps a series on one spindle for efficient binging).
+4. Fallback: most-free disk.
+
+**Minority-evict handling**: if a series has its majority bytes on a safe disk
+but a season or two on an evicting disk, only those evicting-disk files are
+moved. The majority files on the safe disk are untouched and the move
+co-locates with the safe disk automatically.
+
+**Straggler cleanup**: after scoring, items that are majority-on-HOT but still
+have files on warm disks (`STAY_HOT + warm stragglers`) are automatically
+promoted to `TO_HOT` to finish the migration. Similarly, items pinned to HOT
+(`PIN_HOT`) that physically live on a warm disk are converted to `TO_HOT` so
+the pin takes effect.
 
 ### Source deletion
 

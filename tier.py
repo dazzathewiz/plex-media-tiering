@@ -406,7 +406,9 @@ class Item:
     # Actual warm-disk file paths for this item, keyed by disk mount path.
     # Used by the move executor: rsync transfers exactly these files regardless
     # of how the library is organised on disk (per-item folders vs shared
-    # year folders). Dominant disk is at key == current_disk.
+    # year folders). Dominant disk is at key == current_disk when current_tier
+    # is WARM; for HOT-majority items current_disk is None but this dict may
+    # still be non-empty (minority warm stragglers for straggler promotion).
     warm_disk_files: Dict[str, List[str]] = field(default_factory=dict)
     # Resolved absolute paths of files currently on the hot pool — populated
     # only when current_tier is HOT (or MIXED with hot bytes). Used by the
@@ -423,6 +425,13 @@ class Item:
     auto_inherit_pinned: bool = False  # True if auto-inherit fired for this item's collection
     # --- added-date floor flag (set by collect_* if floor threshold met) ---
     recently_added: bool = False
+    # --- eviction minority-override (set during eviction pass) ---
+    # When an item's majority bytes are on a safe disk but minority bytes are
+    # on an evicting disk, only the evicting-disk files need to move.  This
+    # field is set to {evicting_disk: [files]} so P2's RELOCATE_WARM executor
+    # moves only those files while warm_disk_files stays intact for co-location
+    # scoring in _select_warm_destination.  None = use full warm_disk_files.
+    relocate_source_override: Optional[Dict[str, List[str]]] = None
     # --- for --explain ---
     score_breakdown: dict = field(default_factory=dict)
 
@@ -909,7 +918,9 @@ def resolve_item_current_tier(
         return "UNKNOWN", {"HOT": 0.0, "WARM": 0.0, "UNKNOWN": 0.0}, None, [], {}, []
     split = {k: round(v / total, 4) for k, v in totals.items()}
     if split["HOT"] > 0.5:
-        return "HOT", split, None, [], {}, hot_files
+        # Return any minority warm files so the straggler pass can detect and
+        # promote stragglers left behind by a partial prior move.
+        return "HOT", split, None, warm_source_dirs, dict(disk_files), hot_files
     if split["WARM"] > 0.5:
         return "WARM", split, dominant, warm_source_dirs, dict(disk_files), hot_files
     if split["UNKNOWN"] > 0.5:
@@ -1880,7 +1891,8 @@ def collect_all(plex: PlexServer, cfg: dict, filter_libraries) -> List[Item]:
                     )
             items_on_evict = [
                 it for it in items
-                if it.current_disk is not None and it.current_disk in evict_disks
+                if (it.current_disk is not None and it.current_disk in evict_disks)
+                or any(d in evict_disks for d in it.warm_disk_files)
             ]
             log.info(
                 "Eviction: %d disks marked (%s), %d items currently on evicting disks",
@@ -1892,6 +1904,27 @@ def collect_all(plex: PlexServer, cfg: dict, filter_libraries) -> List[Item]:
                 if it.outcome == "STAY_WARM":
                     it.outcome = "RELOCATE_WARM"
                     relocate_count += 1
+                    # Minority-evict: item's majority bytes are on a safe disk;
+                    # only the evicting-disk files need to move.  Restrict the
+                    # rsync source to those files and point current_disk at the
+                    # evicting disk so _select_warm_destination excludes it,
+                    # allowing co-location with the safe majority disk.
+                    if it.current_disk not in evict_disks:
+                        evict_files = {
+                            d: it.warm_disk_files[d]
+                            for d in it.warm_disk_files
+                            if d in evict_disks
+                        }
+                        if evict_files:
+                            it.relocate_source_override = evict_files
+                            it.current_disk = max(
+                                evict_files.keys(),
+                                key=lambda d: sum(
+                                    os.path.getsize(f)
+                                    for f in evict_files[d]
+                                    if os.path.exists(f)
+                                ),
+                            )
                 elif it.outcome in _HOT_OUTCOMES:
                     implicit_hot_count += 1
             log.info(
@@ -1910,7 +1943,11 @@ def collect_all(plex: PlexServer, cfg: dict, filter_libraries) -> List[Item]:
         if it.outcome == "STAY_WARM" and it.hot_pool_files:
             it.outcome = "TO_WARM"
             straggler_to_warm += 1
-        elif it.outcome == "STAY_HOT" and it.warm_disk_files:
+        elif (it.outcome == "STAY_HOT" or it.outcome == "PIN_HOT") and it.warm_disk_files:
+            # STAY_HOT: majority bytes already on HOT but warm stragglers remain
+            #   (partial prior move — finish it).
+            # PIN_HOT: item is pinned to HOT but physically still on a warm
+            #   disk — promote it (next run it shows PIN_HOT once it's on HOT).
             it.outcome = "TO_HOT"
             straggler_to_hot += 1
     if straggler_to_warm or straggler_to_hot:
@@ -2334,7 +2371,8 @@ def _run_move_pass(items: List["Item"], cfg: dict, apply: bool) -> None:
             )
         for it in relocate_ok:
             dst, annot = relocate_dests[id(it)]
-            n_files = sum(len(f) for f in it.warm_disk_files.values())
+            _rsrc = it.relocate_source_override if it.relocate_source_override is not None else it.warm_disk_files
+            n_files = sum(len(f) for f in _rsrc.values())
             log.info(
                 "[DRY-RUN]   %s [RELOCATE_WARM] — %s — %d file(s) from %s → %s (%s)",
                 it.title_year, _fmt_size(it.size_bytes / (1024 ** 3)),
@@ -2388,9 +2426,14 @@ def _run_move_pass(items: List["Item"], cfg: dict, apply: bool) -> None:
         ))
     for it in relocate_ok:
         dst, annot = relocate_dests[id(it)]
+        src = (
+            it.relocate_source_override
+            if it.relocate_source_override is not None
+            else dict(it.warm_disk_files)
+        )
         move_list.append((
             "RELOCATE_WARM", it,
-            dict(it.warm_disk_files),
+            src,
             dst.rstrip("/") + "/",
             it.current_disk or "?", dst, annot or "",
         ))
@@ -3636,6 +3679,110 @@ def _test_eviction_movie_on_evict_disk_becomes_relocate():
     print("_test_eviction_movie_on_evict_disk_becomes_relocate: OK")
 
 
+def _test_hot_majority_warm_disk_files_populated():
+    """resolve_item_current_tier returns warm_disk_files even when HOT is the majority tier.
+
+    Regression guard: a partial prior move leaves some files on a warm disk.
+    The caller (straggler pass) needs warm_disk_files populated to detect and
+    promote the item to TO_HOT.
+    """
+    import tempfile, os as _os
+
+    with tempfile.TemporaryDirectory() as root:
+        disk1 = _os.path.join(root, "disk1")
+        hot   = _os.path.join(root, "hot_pool")
+        _os.makedirs(_os.path.join(disk1, "TV Shows", "Bones", "Season 09"), exist_ok=True)
+        _os.makedirs(_os.path.join(hot,   "TV Shows", "Bones", "Season 01"), exist_ok=True)
+
+        warm_file = _os.path.join(disk1, "TV Shows", "Bones", "Season 09", "s09e01.mkv")
+        hot_file  = _os.path.join(hot,   "TV Shows", "Bones", "Season 01", "s01e01.mkv")
+        # HOT file is much larger (majority)
+        with open(hot_file, "wb") as f:
+            f.write(b"\x00" * 10_000_000)
+        with open(warm_file, "wb") as f:
+            f.write(b"\x00" * 1_000_000)
+
+        user_prefix = "/mnt/user"
+        parts = [
+            (hot_file, 10_000_000),
+            (warm_file, 1_000_000),
+        ]
+        tier, _, dominant, _, wdf, _ = resolve_item_current_tier(
+            parts, [], hot, [disk1], user_prefix,
+        )
+        assert tier == "HOT", f"expected HOT majority, got {tier!r}"
+        assert dominant is None, "dominant should be None for HOT-majority items"
+        assert disk1 in wdf, f"warm_disk_files should include {disk1!r}, got {wdf.keys()}"
+        assert any(warm_file in wdf[disk1] for _ in [1]), \
+            f"warm file should be in warm_disk_files, got {wdf}"
+    print("_test_hot_majority_warm_disk_files_populated: OK")
+
+
+def _test_eviction_minority_warm_files_on_evict_disk():
+    """STAY_WARM item whose majority is on a safe disk but minority files are on an
+    evicting disk gets RELOCATE_WARM with relocate_source_override limiting the source
+    to the evicting disk only, and current_disk overridden to the evicting disk.
+
+    Models: Bones (majority disk1, S9/S12 minority on disk7=evicting).
+    """
+    import tempfile, os as _os
+
+    with tempfile.TemporaryDirectory() as root:
+        disk1 = _os.path.join(root, "disk1")
+        disk7 = _os.path.join(root, "disk7")
+        _os.makedirs(_os.path.join(disk1, "TV Shows", "Bones", "Season 01"), exist_ok=True)
+        _os.makedirs(_os.path.join(disk7, "TV Shows", "Bones", "Season 09"), exist_ok=True)
+
+        s01 = _os.path.join(disk1, "TV Shows", "Bones", "Season 01", "s01e01.mkv")
+        s09 = _os.path.join(disk7, "TV Shows", "Bones", "Season 09", "s09e01.mkv")
+        with open(s01, "wb") as f:
+            f.write(b"\x00" * 5_000_000)
+        with open(s09, "wb") as f:
+            f.write(b"\x00" * 1_000_000)
+
+        item = _make_item(kind="series", score=20.0, current_tier="WARM", current_disk=disk1)
+        item.outcome = "STAY_WARM"
+        item.warm_disk_files = {disk1: [s01], disk7: [s09]}
+
+        evict_cfg   = {"enabled": True, "disks": [disk7]}
+        evict_disks = _build_evict_disks(evict_cfg, [disk1, disk7])
+
+        items_on_evict = [
+            it for it in [item]
+            if (it.current_disk is not None and it.current_disk in evict_disks)
+            or any(d in evict_disks for d in it.warm_disk_files)
+        ]
+        assert len(items_on_evict) == 1, "minority-evict item must be included in items_on_evict"
+
+        for it in items_on_evict:
+            if it.outcome == "STAY_WARM":
+                it.outcome = "RELOCATE_WARM"
+                if it.current_disk not in evict_disks:
+                    evict_files = {
+                        d: it.warm_disk_files[d]
+                        for d in it.warm_disk_files if d in evict_disks
+                    }
+                    if evict_files:
+                        it.relocate_source_override = evict_files
+                        it.current_disk = max(
+                            evict_files.keys(),
+                            key=lambda d: sum(
+                                _os.path.getsize(f)
+                                for f in evict_files[d] if _os.path.exists(f)
+                            ),
+                        )
+
+        assert item.outcome == "RELOCATE_WARM", f"expected RELOCATE_WARM, got {item.outcome}"
+        assert item.current_disk == disk7, f"current_disk should be overridden to {disk7!r}, got {item.current_disk!r}"
+        assert item.relocate_source_override is not None, "relocate_source_override must be set"
+        assert disk7 in item.relocate_source_override, "override must contain evicting disk"
+        assert disk1 not in item.relocate_source_override, "override must NOT contain safe disk"
+        assert s09 in item.relocate_source_override[disk7], "override must contain the minority file"
+        # warm_disk_files still intact for co-location scoring
+        assert disk1 in item.warm_disk_files, "warm_disk_files must still contain safe disk for co-location"
+    print("_test_eviction_minority_warm_files_on_evict_disk: OK")
+
+
 def _test_destination_path_movie_tohot():
     """_compute_destination_path: movie with per-item folder -> correct hot path."""
     item = _make_item(
@@ -4240,7 +4387,7 @@ def _test_straggler_stay_hot_upgraded_to_to_hot():
     item.warm_disk_files = {"/mnt/disk5": ["/mnt/disk5/Movies/Foo (2020)/Foo.mkv"]}
 
     straggler_to_hot = 0
-    if item.outcome == "STAY_HOT" and item.warm_disk_files:
+    if (item.outcome == "STAY_HOT" or item.outcome == "PIN_HOT") and item.warm_disk_files:
         item.outcome = "TO_HOT"
         straggler_to_hot += 1
 
@@ -4249,8 +4396,25 @@ def _test_straggler_stay_hot_upgraded_to_to_hot():
     print("_test_straggler_stay_hot_upgraded_to_to_hot: OK")
 
 
+def _test_straggler_pin_hot_warm_upgraded_to_to_hot():
+    """PIN_HOT item with warm_disk_files is promoted to TO_HOT (pinned but still on warm disk)."""
+    item = _make_item(kind="movie", size_bytes=1_000_000_000)
+    item.outcome = "PIN_HOT"
+    item.current_tier = "WARM"
+    item.warm_disk_files = {"/mnt/disk7": ["/mnt/disk7/Movies/Harry Potter (2004)/Harry Potter (2004).mkv"]}
+
+    straggler_to_hot = 0
+    if (item.outcome == "STAY_HOT" or item.outcome == "PIN_HOT") and item.warm_disk_files:
+        item.outcome = "TO_HOT"
+        straggler_to_hot += 1
+
+    assert item.outcome == "TO_HOT", f"expected TO_HOT for pinned-but-warm item, got {item.outcome}"
+    assert straggler_to_hot == 1
+    print("_test_straggler_pin_hot_warm_upgraded_to_to_hot: OK")
+
+
 def _test_straggler_no_upgrade_when_no_wrong_tier_files():
-    """STAY outcomes with no stranded files are not upgraded."""
+    """STAY/PIN outcomes with no stranded files are not upgraded."""
     stay_warm = _make_item(kind="movie", size_bytes=100)
     stay_warm.outcome = "STAY_WARM"
     stay_warm.hot_pool_files = []
@@ -4259,14 +4423,19 @@ def _test_straggler_no_upgrade_when_no_wrong_tier_files():
     stay_hot.outcome = "STAY_HOT"
     stay_hot.warm_disk_files = {}
 
-    for it in (stay_warm, stay_hot):
+    pin_hot_already_hot = _make_item(kind="movie", size_bytes=100)
+    pin_hot_already_hot.outcome = "PIN_HOT"
+    pin_hot_already_hot.warm_disk_files = {}  # already on hot pool — no stragglers
+
+    for it in (stay_warm, stay_hot, pin_hot_already_hot):
         if it.outcome == "STAY_WARM" and it.hot_pool_files:
             it.outcome = "TO_WARM"
-        elif it.outcome == "STAY_HOT" and it.warm_disk_files:
+        elif (it.outcome == "STAY_HOT" or it.outcome == "PIN_HOT") and it.warm_disk_files:
             it.outcome = "TO_HOT"
 
     assert stay_warm.outcome == "STAY_WARM", f"must not upgrade: {stay_warm.outcome}"
     assert stay_hot.outcome == "STAY_HOT", f"must not upgrade: {stay_hot.outcome}"
+    assert pin_hot_already_hot.outcome == "PIN_HOT", f"must not upgrade: {pin_hot_already_hot.outcome}"
     print("_test_straggler_no_upgrade_when_no_wrong_tier_files: OK")
 
 
@@ -4664,6 +4833,8 @@ if __name__ == "__main__":
         _test_dominant_warm_disk_movie_with_year_folder()
         _test_dominant_warm_disk_single_file_item()
         _test_eviction_movie_on_evict_disk_becomes_relocate()
+        _test_hot_majority_warm_disk_files_populated()
+        _test_eviction_minority_warm_files_on_evict_disk()
         _test_destination_path_movie_tohot()
         _test_destination_path_series_tohot()
         _test_move_skipped_when_already_hot()
@@ -4680,6 +4851,7 @@ if __name__ == "__main__":
         _test_movie_per_folder_article_inversion()
         _test_straggler_stay_warm_upgraded_to_to_warm()
         _test_straggler_stay_hot_upgraded_to_to_hot()
+        _test_straggler_pin_hot_warm_upgraded_to_to_hot()
         _test_straggler_no_upgrade_when_no_wrong_tier_files()
         _test_movie_straggler_to_warm_colocates_with_main_file()
         _test_empty_ancestor_dirs_pruned_after_delete()
