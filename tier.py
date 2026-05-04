@@ -2253,6 +2253,20 @@ def _run_move_pass(items: List["Item"], cfg: dict, apply: bool) -> None:
 
     array_disks = resolve_array_disks(cfg)
 
+    # Evicting disks are implicitly write-protected: no new data should land on
+    # a disk that is being drained.  Subtract them from the candidate list used
+    # by _select_warm_destination so TO_WARM and RELOCATE_WARM moves never pick
+    # an evicting disk as the destination (RELOCATE_WARM already excludes its
+    # source disk via exclude_disk, but this covers TO_WARM and the non-source
+    # evicting disks in a multi-evict scenario).
+    evict_cfg = cfg.get("array_disk_evict") or {}
+    _evict_disks_for_write = (
+        _build_evict_disks(evict_cfg, array_disks)
+        if evict_cfg.get("enabled")
+        else set()
+    )
+    dest_array_disks = [d for d in array_disks if d not in _evict_disks_for_write]
+
     warm_sel_cfg = (moves_cfg.get("warm_disk_selection") or {})
     safety_margin_bytes = int(float(warm_sel_cfg.get("safety_margin_gb") or 50) * 1024 ** 3)
     hot_bps = int(float(moves_cfg.get("estimated_hot_mbps") or 200)) * 1024 * 1024
@@ -2315,10 +2329,10 @@ def _run_move_pass(items: List["Item"], cfg: dict, apply: bool) -> None:
 
     to_warm_dests: Dict[int, Tuple[Optional[str], Optional[str]]] = {}
     for it in to_warm_move:
-        if not array_disks:
+        if not dest_array_disks:
             to_warm_dests[id(it)] = (None, "no warm disks configured")
         else:
-            dst, annot = _select_warm_destination(it, array_disks, safety_margin_bytes)
+            dst, annot = _select_warm_destination(it, dest_array_disks, safety_margin_bytes)
             to_warm_dests[id(it)] = (dst, annot)
         if to_warm_dests[id(it)][0] is None:
             log.error("Moves: [FAILED] %s [TO_WARM] — %s (needs %s + %d GB margin)",
@@ -2328,11 +2342,11 @@ def _run_move_pass(items: List["Item"], cfg: dict, apply: bool) -> None:
 
     relocate_dests: Dict[int, Tuple[Optional[str], Optional[str]]] = {}
     for it in relocate_move:
-        if not array_disks:
+        if not dest_array_disks:
             relocate_dests[id(it)] = (None, "no warm disks configured")
         else:
             dst, annot = _select_warm_destination(
-                it, array_disks, safety_margin_bytes, exclude_disk=it.current_disk,
+                it, dest_array_disks, safety_margin_bytes, exclude_disk=it.current_disk,
             )
             relocate_dests[id(it)] = (dst, annot)
         if relocate_dests[id(it)][0] is None:
