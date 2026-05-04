@@ -2218,6 +2218,21 @@ def _check_parity_in_progress() -> bool:
         return False
 
 
+def _warm_src_label(item: "Item", files_dict: Optional[Dict[str, List[str]]] = None) -> str:
+    """Return a human-readable source-disk label for log lines.
+
+    Prefers item.current_disk (the dominant warm disk). Falls back to the
+    sorted comma-joined keys of files_dict (or item.warm_disk_files) for
+    HOT-majority straggler items where current_disk is None.
+    """
+    if item.current_disk:
+        return item.current_disk
+    disks = files_dict if files_dict is not None else item.warm_disk_files
+    if disks:
+        return ", ".join(sorted(disks.keys()))
+    return "?"
+
+
 def _run_move_pass(items: List["Item"], cfg: dict, apply: bool) -> None:
     """Dry-run or execute moves for TO_HOT, TO_WARM, and RELOCATE_WARM outcomes.
 
@@ -2360,7 +2375,7 @@ def _run_move_pass(items: List["Item"], cfg: dict, apply: bool) -> None:
             log.info(
                 "[DRY-RUN]   %s [TO_HOT] — %s — %d file(s) from %s → %s",
                 it.title_year, _fmt_size(it.size_bytes / (1024 ** 3)),
-                n_files, it.current_disk or "?", hot_mount,
+                n_files, _warm_src_label(it), hot_mount,
             )
         for it in to_warm_ok:
             dst, annot = to_warm_dests[id(it)]
@@ -2376,7 +2391,7 @@ def _run_move_pass(items: List["Item"], cfg: dict, apply: bool) -> None:
             log.info(
                 "[DRY-RUN]   %s [RELOCATE_WARM] — %s — %d file(s) from %s → %s (%s)",
                 it.title_year, _fmt_size(it.size_bytes / (1024 ** 3)),
-                n_files, it.current_disk or "?", dst, annot,
+                n_files, _warm_src_label(it, _rsrc), dst, annot,
             )
         return
 
@@ -2414,7 +2429,7 @@ def _run_move_pass(items: List["Item"], cfg: dict, apply: bool) -> None:
             "TO_HOT", it,
             dict(it.warm_disk_files),
             hot_mount.rstrip("/") + "/",
-            it.current_disk or "?", hot_mount, "",
+            _warm_src_label(it), hot_mount, "",
         ))
     for it in to_warm_ok:
         dst, annot = to_warm_dests[id(it)]
@@ -2435,7 +2450,7 @@ def _run_move_pass(items: List["Item"], cfg: dict, apply: bool) -> None:
             "RELOCATE_WARM", it,
             src,
             dst.rstrip("/") + "/",
-            it.current_disk or "?", dst, annot or "",
+            _warm_src_label(it, src), dst, annot or "",
         ))
 
     n_success = 0
