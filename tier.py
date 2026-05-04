@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-tier.py — Unraid media tiering script (Phase P2.2 + P2.3)
+tier.py — Unraid media tiering script (Phase P3)
 
 Pulls watch history and metadata from Plex, computes a heat score per
 media item (movies + TV series), probes the filesystem to determine
@@ -42,8 +42,11 @@ Phase status:
                     files within /mnt/user/; Plex path references remain
                     valid without a rescan. Only TO_HOT (which moves
                     files outside the union) recommends a rescan.
-  P3  (later)       Hardened safeguards (lock file, currently-playing skip,
-                    free-space check, max-move cap).
+  P3  (done)        Capacity-aware tiering — hot pool ceiling with
+                    promotion budget (OVER_BUDGET_HOT outcome), optional
+                    auto-demote of lowest-scoring HOT items when over
+                    ceiling, warm per-disk ceiling, --no-promote /
+                    --no-demote CLI flags.
   P4  (later)       Scheduled cron + size-triggered wrapper.
 
 Usage:
@@ -220,6 +223,23 @@ DEFAULT_CONFIG = {
         "on_plex_unreachable": True,
         "on_auth_failure": True,
         "on_script_error": True,
+    },
+    # Capacity-aware tiering (P3). Controls the hot pool promotion budget and
+    # optional auto-demotion when the pool is already over ceiling.
+    "capacity": {
+        # Refuse to fill the hot ZFS pool past this percentage.
+        # ZFS performance degrades above ~80%; keep headroom for snapshots.
+        "hot_ceiling_percent": 80,
+        # Skip warm array disks that are above this fill level when selecting
+        # a destination for TO_WARM / RELOCATE_WARM moves.
+        "warm_per_disk_ceiling_percent": 90,
+        # When True and the hot pool is already over the ceiling, force-demote
+        # the lowest-scoring STAY_HOT items to TO_WARM until the pool would
+        # come back under the ceiling. PIN_HOT items are always exempt.
+        "auto_demote_when_over_ceiling": False,
+        # Additional headroom to leave inside the ceiling (GB). Useful to
+        # account for snapshot growth or concurrent writes during the run.
+        "budget_safety_margin_gb": 0,
     },
 }
 
@@ -2001,11 +2021,17 @@ def _disk_free_bytes(path: str) -> int:
         return 0
 
 
+def _disk_usage(path: str):
+    """Return shutil.disk_usage namedtuple for path — module-level for test patching."""
+    return shutil.disk_usage(path)
+
+
 def _select_warm_destination(
     item: "Item",
     array_disks: List[str],
     safety_margin_bytes: int,
     exclude_disk: Optional[str] = None,
+    warm_ceiling_pct: float = 1.0,
 ) -> Tuple[Optional[str], Optional[str]]:
     """Choose a warm disk for TO_WARM or RELOCATE_WARM moves.
 
@@ -2015,16 +2041,31 @@ def _select_warm_destination(
 
     Selection rules:
       1. Exclude exclude_disk (used for RELOCATE_WARM to avoid the source disk).
-      2. Filter by capacity: free >= item.size_bytes + safety_margin_bytes.
-      3. Co-location: when warm_disk_files is non-empty (item already has files
+      2. Filter by ceiling: skip disks already at or above warm_ceiling_pct fill.
+      3. Filter by capacity: free >= item.size_bytes + safety_margin_bytes.
+      4. Co-location: when warm_disk_files is non-empty (item already has files
          on at least one warm disk), prefer the candidate disk that holds the most
          bytes of this item. Applies to series AND to movies with straggler files
          so extras always land on the same spindle as the main title.
-      4. Fallback: most free space.
+      5. Fallback: most free space.
     """
     candidates = [d for d in array_disks if d != exclude_disk]
     if not candidates:
         return None, "no candidate warm disks"
+
+    # Filter by per-disk ceiling before free-space check.
+    if warm_ceiling_pct < 1.0:
+        under_ceiling = []
+        for d in candidates:
+            try:
+                du = _disk_usage(d)
+                if du.total and (du.used / du.total) < warm_ceiling_pct:
+                    under_ceiling.append(d)
+            except OSError:
+                pass
+        if not under_ceiling:
+            return None, f"all warm disks over {int(warm_ceiling_pct * 100)}% ceiling"
+        candidates = under_ceiling
 
     needed = item.size_bytes + safety_margin_bytes
     qualified = [d for d in candidates if _disk_free_bytes(d) >= needed]
@@ -2239,6 +2280,148 @@ def _warm_src_label(item: "Item", files_dict: Optional[Dict[str, List[str]]] = N
     return "?"
 
 
+def _apply_capacity_budget(
+    items: List[Item],
+    cfg: dict,
+    no_promote: bool = False,
+    no_demote: bool = False,
+) -> None:
+    """Apply hot-pool capacity ceiling to TO_HOT promotions, and optionally
+    demote lowest-scoring HOT items when the pool is already over ceiling.
+
+    Promotion budget:
+      - Computes budget = ceiling_pct * pool_total - pool_used - safety_margin.
+      - Sorts TO_HOT items by score descending; items that exceed the budget
+        become OVER_BUDGET_HOT (counted in the WARM projected bucket).
+      - If no_promote=True: all TO_HOT → OVER_BUDGET_HOT regardless of budget.
+
+    Auto-demote (optional):
+      - Fires only when pool_used > ceiling_bytes AND
+        auto_demote_when_over_ceiling=true AND no_demote=False.
+      - Flips lowest-scoring STAY_HOT items to TO_WARM until the pool would
+        come under the ceiling. PIN_HOT items are always exempt.
+    """
+    cap_cfg = cfg.get("capacity") or {}
+    paths_cfg = cfg.get("paths") or {}
+    hot_mount = (paths_cfg.get("hot_pool_mount") or "").rstrip("/")
+
+    ceiling_pct = float(cap_cfg.get("hot_ceiling_percent") or 80) / 100.0
+    safety_margin_bytes = int(float(cap_cfg.get("budget_safety_margin_gb") or 0) * 1024 ** 3)
+    auto_demote = bool(cap_cfg.get("auto_demote_when_over_ceiling", False))
+    warm_ceiling_pct = float(cap_cfg.get("warm_per_disk_ceiling_percent") or 90) / 100.0
+
+    # --- Hot pool usage ---
+    pool_total = pool_used = 0
+    if hot_mount:
+        try:
+            du = _disk_usage(hot_mount)
+            pool_total = du.total
+            pool_used = du.used
+        except OSError:
+            pass
+
+    pool_pct = (pool_used / pool_total) if pool_total else 0.0
+    ceiling_bytes = int(pool_total * ceiling_pct) if pool_total else 0
+    over_ceiling = bool(pool_total and pool_used > ceiling_bytes)
+    budget_bytes = max(0, ceiling_bytes - pool_used - safety_margin_bytes) if pool_total else 0
+
+    if pool_total:
+        log.info(
+            "Capacity: hot pool %d%% full (%s / %s) — budget %s to %d%% ceiling%s",
+            int(pool_pct * 100),
+            _fmt_size(pool_used / (1024 ** 3)),
+            _fmt_size(pool_total / (1024 ** 3)),
+            _fmt_size(budget_bytes / (1024 ** 3)),
+            int(ceiling_pct * 100),
+            " (after safety margin)" if safety_margin_bytes else "",
+        )
+    else:
+        log.debug(
+            "Capacity: hot pool stats unavailable (hot_pool_mount=%r not set or inaccessible)",
+            hot_mount or "",
+        )
+
+    # --- Promotion budget ---
+    to_hot_items = sorted(
+        [it for it in items if it.outcome == "TO_HOT"],
+        key=lambda it: -it.score,
+    )
+    to_hot_total_bytes = sum(it.size_bytes for it in to_hot_items)
+
+    if no_promote:
+        for it in to_hot_items:
+            it.outcome = "OVER_BUDGET_HOT"
+        if to_hot_items:
+            log.info(
+                "Capacity: --no-promote set — all %d TO_HOT items (%s) deferred (OVER_BUDGET_HOT)",
+                len(to_hot_items), _fmt_size(to_hot_total_bytes / (1024 ** 3)),
+            )
+    elif to_hot_items:
+        remaining = budget_bytes
+        fit = deferred = 0
+        for it in to_hot_items:
+            if remaining >= it.size_bytes:
+                remaining -= it.size_bytes
+                fit += 1
+            else:
+                it.outcome = "OVER_BUDGET_HOT"
+                deferred += 1
+        log.info(
+            "Capacity: %d TO_HOT candidates totalling %s — fitting %d within budget, "
+            "%d deferred (OVER_BUDGET_HOT)",
+            len(to_hot_items), _fmt_size(to_hot_total_bytes / (1024 ** 3)), fit, deferred,
+        )
+
+    # --- Auto-demote when over ceiling ---
+    if over_ceiling and auto_demote and not no_demote:
+        bytes_to_shed = pool_used - ceiling_bytes
+        demote_candidates = sorted(
+            [it for it in items if it.outcome == "STAY_HOT"],
+            key=lambda it: it.score,
+        )
+        shed = demoted = 0
+        for it in demote_candidates:
+            if shed >= bytes_to_shed:
+                break
+            it.outcome = "TO_WARM"
+            shed += it.size_bytes
+            demoted += 1
+        pool_after_pct = ((pool_used - shed) / pool_total * 100) if pool_total else 0.0
+        log.info(
+            "Capacity: hot pool %d%% full — over %d%% ceiling, demoting lowest scorers",
+            int(pool_pct * 100), int(ceiling_pct * 100),
+        )
+        log.info(
+            "Capacity: demoted %d items (%s) to TO_WARM to bring pool to %.1f%%",
+            demoted, _fmt_size(shed / (1024 ** 3)), pool_after_pct,
+        )
+    elif no_demote and auto_demote and over_ceiling:
+        log.info("Capacity: --no-demote set — auto-demote pass skipped (pool over ceiling)")
+
+    # --- Warm disk ceiling status ---
+    array_disks = resolve_array_disks(cfg)
+    if array_disks:
+        over_warm_ceiling = []
+        for disk in array_disks:
+            try:
+                du = _disk_usage(disk)
+                if du.total and (du.used / du.total) >= warm_ceiling_pct:
+                    over_warm_ceiling.append(disk)
+            except OSError:
+                pass
+        if over_warm_ceiling:
+            log.info(
+                "Capacity: %d warm disk(s) over %d%% ceiling: %s",
+                len(over_warm_ceiling), int(warm_ceiling_pct * 100),
+                ", ".join(sorted(over_warm_ceiling)),
+            )
+        else:
+            log.info(
+                "Capacity: warm disks all under %d%% ceiling",
+                int(warm_ceiling_pct * 100),
+            )
+
+
 def _run_move_pass(items: List["Item"], cfg: dict, apply: bool) -> None:
     """Dry-run or execute moves for TO_HOT, TO_WARM, and RELOCATE_WARM outcomes.
 
@@ -2277,6 +2460,8 @@ def _run_move_pass(items: List["Item"], cfg: dict, apply: bool) -> None:
     safety_margin_bytes = int(float(warm_sel_cfg.get("safety_margin_gb") or 50) * 1024 ** 3)
     hot_bps = int(float(moves_cfg.get("estimated_hot_mbps") or 200)) * 1024 * 1024
     warm_bps = int(float(moves_cfg.get("estimated_warm_mbps") or 50)) * 1024 * 1024
+    cap_cfg = cfg.get("capacity") or {}
+    _warm_ceiling_pct = float(cap_cfg.get("warm_per_disk_ceiling_percent") or 100) / 100.0
 
     # Tally SHOULD_BE_* outcomes (tier unknown — nothing to move).
     skip_outcomes: dict = {}
@@ -2338,7 +2523,10 @@ def _run_move_pass(items: List["Item"], cfg: dict, apply: bool) -> None:
         if not dest_array_disks:
             to_warm_dests[id(it)] = (None, "no warm disks configured")
         else:
-            dst, annot = _select_warm_destination(it, dest_array_disks, safety_margin_bytes)
+            dst, annot = _select_warm_destination(
+                it, dest_array_disks, safety_margin_bytes,
+                warm_ceiling_pct=_warm_ceiling_pct,
+            )
             to_warm_dests[id(it)] = (dst, annot)
         if to_warm_dests[id(it)][0] is None:
             log.error("Moves: [FAILED] %s [TO_WARM] — %s (needs %s + %d GB margin)",
@@ -2352,7 +2540,8 @@ def _run_move_pass(items: List["Item"], cfg: dict, apply: bool) -> None:
             relocate_dests[id(it)] = (None, "no warm disks configured")
         else:
             dst, annot = _select_warm_destination(
-                it, dest_array_disks, safety_margin_bytes, exclude_disk=it.current_disk,
+                it, dest_array_disks, safety_margin_bytes,
+                exclude_disk=it.current_disk, warm_ceiling_pct=_warm_ceiling_pct,
             )
             relocate_dests[id(it)] = (dst, annot)
         if relocate_dests[id(it)][0] is None:
@@ -2540,7 +2729,9 @@ def _run_move_pass(items: List["Item"], cfg: dict, apply: bool) -> None:
 # executed. The bucket reflects where the item will END UP, not where it
 # currently sits — so TO_HOT + STAY_HOT + PIN_HOT all go into HOT.
 _HOT_OUTCOMES = {"SHOULD_BE_HOT", "PIN_HOT", "STAY_HOT", "TO_HOT"}
-_WARM_OUTCOMES = {"SHOULD_BE_WARM", "STAY_WARM", "TO_WARM", "RELOCATE_WARM"}
+# OVER_BUDGET_HOT: item scored TO_HOT but the hot pool budget denied promotion.
+# Counted in WARM projected totals — the item stays on warm this run.
+_WARM_OUTCOMES = {"SHOULD_BE_WARM", "STAY_WARM", "TO_WARM", "RELOCATE_WARM", "OVER_BUDGET_HOT"}
 # MIXED_NEUTRAL = item is split 50/50 with no direction to resolve it.
 # Leave under NEUTRAL; P2 takes no action.
 
@@ -2751,6 +2942,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="execute moves (requires moves.enabled=true in config; default is dry-run)",
     )
     p.add_argument(
+        "--no-promote", action="store_true",
+        help="block all TO_HOT moves this run; items become OVER_BUDGET_HOT regardless of budget",
+    )
+    p.add_argument(
+        "--no-demote", action="store_true",
+        help="skip auto-demote pass even if hot pool is over ceiling",
+    )
+    p.add_argument(
         "--log-file", type=Path, default=None,
         help="override logging.path from config",
     )
@@ -2785,6 +2984,14 @@ def _run(args) -> int:
 
     items = collect_all(plex, cfg, filter_libraries=args.library)
     items = apply_sort(items, args.sort)
+
+    # Capacity pass: apply hot pool budget and optional auto-demote before
+    # the move pass so the move queues reflect budget-adjusted outcomes.
+    _apply_capacity_budget(
+        items, cfg,
+        no_promote=getattr(args, "no_promote", False),
+        no_demote=getattr(args, "no_demote", False),
+    )
 
     # Move pass runs on the full scored list before --top truncation so every
     # TO_HOT item is considered regardless of display limit.
@@ -4911,6 +5118,223 @@ def _test_relocate_warm_co_locate_with_existing_partial():
     print("_test_relocate_warm_co_locate_with_existing_partial: OK")
 
 
+# ---------- P3 capacity tests ----------
+
+def _make_cap_cfg(
+    ceiling_pct=80,
+    warm_ceiling_pct=90,
+    safety_gb=0,
+    auto_demote=False,
+):
+    """Build a minimal cfg dict for capacity tests."""
+    return {
+        "paths": {"hot_pool_mount": "/mnt/hot", "array_disks": [], "array_disk_exclude": []},
+        "capacity": {
+            "hot_ceiling_percent": ceiling_pct,
+            "warm_per_disk_ceiling_percent": warm_ceiling_pct,
+            "budget_safety_margin_gb": safety_gb,
+            "auto_demote_when_over_ceiling": auto_demote,
+        },
+    }
+
+
+def _make_fake_disk_usage(total_gb, used_gb):
+    """Return a callable that mimics shutil.disk_usage for test patching."""
+    import collections
+    DU = collections.namedtuple("DU", ["total", "used", "free"])
+    GB = 1024 ** 3
+    total = int(total_gb * GB)
+    used = int(used_gb * GB)
+    return lambda _path: DU(total=total, used=used, free=total - used)
+
+
+def _test_capacity_budget_caps_to_hot_promotions():
+    """High-score item fits within budget; lower-score item is deferred."""
+    global _disk_usage
+    orig = _disk_usage
+    try:
+        # Pool: 10 TB total, 6 TB used. ceiling=80% → ceiling=8 TB, budget=2 TB.
+        # Item A (score=80, 1.5 TB) fits; item B (score=50, 1 TB) makes total 2.5 TB → deferred.
+        TB = 1024 ** 3 * 1024
+        _disk_usage = _make_fake_disk_usage(10 * 1024, 6 * 1024)  # GB args
+
+        item_a = _make_item(score=80.0, size_bytes=int(1.5 * TB), outcome="TO_HOT")
+        item_b = _make_item(score=50.0, size_bytes=TB, outcome="TO_HOT")
+        items = [item_a, item_b]
+
+        _apply_capacity_budget(items, _make_cap_cfg(ceiling_pct=80, safety_gb=0))
+
+        assert item_a.outcome == "TO_HOT", f"high-score item should fit, got {item_a.outcome}"
+        assert item_b.outcome == "OVER_BUDGET_HOT", f"low-score item should be deferred, got {item_b.outcome}"
+    finally:
+        _disk_usage = orig
+    print("_test_capacity_budget_caps_to_hot_promotions: OK")
+
+
+def _test_capacity_budget_zero_makes_all_over_budget():
+    """Pool exactly at ceiling → budget=0 → all TO_HOT items deferred."""
+    global _disk_usage
+    orig = _disk_usage
+    try:
+        # Pool: 10 TB total, 8 TB used. ceiling=80% → ceiling=8 TB, budget=0.
+        _disk_usage = _make_fake_disk_usage(10 * 1024, 8 * 1024)
+
+        items = [
+            _make_item(score=90.0, size_bytes=1, outcome="TO_HOT"),
+            _make_item(score=70.0, size_bytes=1, outcome="TO_HOT"),
+        ]
+        _apply_capacity_budget(items, _make_cap_cfg(ceiling_pct=80, safety_gb=0))
+
+        for it in items:
+            assert it.outcome == "OVER_BUDGET_HOT", f"expected OVER_BUDGET_HOT, got {it.outcome}"
+    finally:
+        _disk_usage = orig
+    print("_test_capacity_budget_zero_makes_all_over_budget: OK")
+
+
+def _test_capacity_over_ceiling_auto_demotes_lowest_scorers():
+    """Pool over ceiling + auto_demote=True → lowest STAY_HOT items become TO_WARM."""
+    global _disk_usage
+    orig = _disk_usage
+    try:
+        GB = 1024 ** 3
+        # Pool: 10 TB, used 9 TB → 90% > 80% ceiling → over by 1 TB.
+        _disk_usage = _make_fake_disk_usage(10 * 1024, 9 * 1024)
+
+        # Two STAY_HOT items. Low score is demoted first.
+        item_low = _make_item(score=25.0, size_bytes=int(1.5 * 1024 * GB), outcome="STAY_HOT")
+        item_high = _make_item(score=75.0, size_bytes=int(1.5 * 1024 * GB), outcome="STAY_HOT")
+        items = [item_high, item_low]  # order shouldn't matter; sort by score ascending
+
+        _apply_capacity_budget(items, _make_cap_cfg(ceiling_pct=80, auto_demote=True))
+
+        # Need to shed 1 TB. item_low is 1.5 TB — one demotion is enough.
+        assert item_low.outcome == "TO_WARM", f"expected TO_WARM, got {item_low.outcome}"
+        assert item_high.outcome == "STAY_HOT", f"high-score item should be exempt, got {item_high.outcome}"
+    finally:
+        _disk_usage = orig
+    print("_test_capacity_over_ceiling_auto_demotes_lowest_scorers: OK")
+
+
+def _test_capacity_over_ceiling_does_not_demote_pin_hot():
+    """PIN_HOT items are always exempt from auto-demote even when over ceiling."""
+    global _disk_usage
+    orig = _disk_usage
+    try:
+        # Pool: 10 TB, 9 TB used → over 80% ceiling.
+        _disk_usage = _make_fake_disk_usage(10 * 1024, 9 * 1024)
+
+        item_pin = _make_item(score=5.0, size_bytes=int(2 * 1024 * 1024 ** 3), outcome="PIN_HOT")
+        item_stay = _make_item(score=22.0, size_bytes=int(2 * 1024 * 1024 ** 3), outcome="STAY_HOT")
+        items = [item_pin, item_stay]
+
+        _apply_capacity_budget(items, _make_cap_cfg(ceiling_pct=80, auto_demote=True))
+
+        assert item_pin.outcome == "PIN_HOT", f"PIN_HOT must be exempt, got {item_pin.outcome}"
+        # item_stay should be demoted to bring pool under ceiling
+        assert item_stay.outcome == "TO_WARM", f"expected TO_WARM, got {item_stay.outcome}"
+    finally:
+        _disk_usage = orig
+    print("_test_capacity_over_ceiling_does_not_demote_pin_hot: OK")
+
+
+def _test_capacity_no_promote_flag_blocks_all_to_hot():
+    """--no-promote converts all TO_HOT items to OVER_BUDGET_HOT regardless of budget."""
+    global _disk_usage
+    orig = _disk_usage
+    try:
+        # Pool has ample budget — doesn't matter, --no-promote wins.
+        _disk_usage = _make_fake_disk_usage(10 * 1024, 1 * 1024)
+
+        items = [
+            _make_item(score=95.0, size_bytes=1, outcome="TO_HOT"),
+            _make_item(score=60.0, size_bytes=1, outcome="TO_HOT"),
+            _make_item(score=30.0, size_bytes=1, outcome="STAY_WARM"),  # unaffected
+        ]
+        _apply_capacity_budget(items, _make_cap_cfg(), no_promote=True)
+
+        assert items[0].outcome == "OVER_BUDGET_HOT"
+        assert items[1].outcome == "OVER_BUDGET_HOT"
+        assert items[2].outcome == "STAY_WARM", "STAY_WARM must be unaffected by --no-promote"
+    finally:
+        _disk_usage = orig
+    print("_test_capacity_no_promote_flag_blocks_all_to_hot: OK")
+
+
+def _test_capacity_no_demote_flag_blocks_to_warm():
+    """--no-demote suppresses the auto-demote pass even when pool is over ceiling."""
+    global _disk_usage
+    orig = _disk_usage
+    try:
+        # Pool: 9 TB / 10 TB → over 80% ceiling. auto_demote=True but no_demote=True.
+        _disk_usage = _make_fake_disk_usage(10 * 1024, 9 * 1024)
+
+        item = _make_item(score=22.0, size_bytes=int(2 * 1024 * 1024 ** 3), outcome="STAY_HOT")
+        _apply_capacity_budget(
+            [item], _make_cap_cfg(ceiling_pct=80, auto_demote=True), no_demote=True
+        )
+
+        assert item.outcome == "STAY_HOT", f"--no-demote must block auto-demote, got {item.outcome}"
+    finally:
+        _disk_usage = orig
+    print("_test_capacity_no_demote_flag_blocks_to_warm: OK")
+
+
+def _test_capacity_safety_margin_respected():
+    """Safety margin reduces the effective promotion budget."""
+    global _disk_usage
+    orig = _disk_usage
+    try:
+        GB = 1024 ** 3
+        # Pool: 10 TB, 6 TB used. ceiling=80% → 8 TB, raw budget = 2 TB.
+        # safety_margin = 1.5 TB → effective budget = 0.5 TB.
+        # Item of 1 TB does not fit.
+        _disk_usage = _make_fake_disk_usage(10 * 1024, 6 * 1024)
+
+        item = _make_item(score=80.0, size_bytes=int(1024 * GB), outcome="TO_HOT")
+        _apply_capacity_budget(
+            [item], _make_cap_cfg(ceiling_pct=80, safety_gb=1536)  # 1536 GB = 1.5 TB
+        )
+
+        assert item.outcome == "OVER_BUDGET_HOT", (
+            f"safety margin should shrink budget below item size, got {item.outcome}"
+        )
+    finally:
+        _disk_usage = orig
+    print("_test_capacity_safety_margin_respected: OK")
+
+
+def _test_capacity_warm_per_disk_ceiling_blocks_to_warm_when_full():
+    """All warm disks over the ceiling → _select_warm_destination returns None."""
+    global _disk_usage, _disk_free_bytes
+    orig_du = _disk_usage
+    orig_dfb = _disk_free_bytes
+    try:
+        GB = 1024 ** 3
+        import collections
+        DU = collections.namedtuple("DU", ["total", "used", "free"])
+        # Disks are 95% full; ceiling is 90%.
+        _disk_usage = lambda _p: DU(total=10 * 1024 * GB, used=int(9.5 * 1024 * GB),
+                                    free=int(0.5 * 1024 * GB))
+        _disk_free_bytes = lambda _p: int(0.5 * 1024 * GB)
+
+        item = _make_item(kind="movie", size_bytes=GB)
+        disk, annot = _select_warm_destination(
+            item, ["/mnt/disk1", "/mnt/disk2"],
+            safety_margin_bytes=0,
+            warm_ceiling_pct=0.90,
+        )
+
+        assert disk is None, f"expected None (all disks over ceiling), got {disk}"
+        assert annot is not None and "ceiling" in annot.lower(), (
+            f"expected ceiling message in annotation, got {annot!r}"
+        )
+    finally:
+        _disk_usage = orig_du
+        _disk_free_bytes = orig_dfb
+    print("_test_capacity_warm_per_disk_ceiling_blocks_to_warm_when_full: OK")
+
+
 if __name__ == "__main__":
     if "--_test" in sys.argv:
         _test_resolve_user_share()
@@ -4974,5 +5398,13 @@ if __name__ == "__main__":
         _test_to_warm_full_flow_end_to_end()
         _test_relocate_warm_full_flow_end_to_end()
         _test_relocate_warm_co_locate_with_existing_partial()
+        _test_capacity_budget_caps_to_hot_promotions()
+        _test_capacity_budget_zero_makes_all_over_budget()
+        _test_capacity_over_ceiling_auto_demotes_lowest_scorers()
+        _test_capacity_over_ceiling_does_not_demote_pin_hot()
+        _test_capacity_no_promote_flag_blocks_all_to_hot()
+        _test_capacity_no_demote_flag_blocks_to_warm()
+        _test_capacity_safety_margin_respected()
+        _test_capacity_warm_per_disk_ceiling_blocks_to_warm_when_full()
         sys.exit(0)
     sys.exit(main())

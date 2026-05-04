@@ -27,7 +27,7 @@ execute; default is dry-run.
 | P2.2 | TO_WARM moves — demote items from hot pool to chosen warm disk (co-location + most-free selection). | **Done** |
 | P2.3 | RELOCATE_WARM moves — drain evicting warm disks to healthy warm disks. Evicting disk excluded from candidates. | **Done** |
 | P2.4 | Plex rescan automation — **intentionally not implemented**. Unraid's user-share union means Plex always reads through `/mnt/user/` regardless of which physical disk backs a file; TO_WARM and RELOCATE_WARM moves are invisible to Plex at the path level. Only TO_HOT (which moves files off the union to a separate ZFS mount) recommends a rescan. | N/A |
-| P3 | Hardened safeguards (lock file, currently-playing skip, free-space check, move-size cap). | Pending |
+| P3 | Capacity-aware tiering — hot pool fill ceiling, promotion budget, `OVER_BUDGET_HOT` outcome, optional auto-demote of lowest-scoring HOT items, warm per-disk ceiling, `--no-promote` / `--no-demote` flags. | **Done** |
 | P4 | Scheduled cron + size-triggered wrapper. | Pending |
 
 ## Install
@@ -310,6 +310,7 @@ Outcomes:
 | `NEUTRAL` | In the score dead zone AND tier detection disabled. |
 | `MIXED_NEUTRAL` | Files are split exactly 50/50 across tiers with no score-based direction to resolve it. P2 leaves it alone. Very rare. |
 | `RELOCATE_WARM` | On a WARM disk marked for eviction. Score says keep warm, but P2 must move to a different warm disk. See [Disk eviction](#disk-eviction) below. |
+| `OVER_BUDGET_HOT` | Scored high enough for HOT but the hot pool budget was exhausted (or `--no-promote` was set). Item stays warm this run. Counted in projected WARM totals. |
 
 Tier detection activates automatically when `paths.hot_pool_mount` is set AND
 at least one array disk is known (either listed explicitly in `paths.array_disks`
@@ -708,6 +709,84 @@ Passes `--bwlimit` to rsync. `null` (default) = unthrottled.
    item. Confirm the destination has the file and the source still exists.
 3. After watching a few successful apply runs, set
    `delete_source_after_verify: true`.
+
+## Capacity-aware tiering (P3)
+
+The capacity layer sits between scoring and the move executor. It enforces a
+fill ceiling on the hot ZFS pool and, optionally, demotes the lowest-scoring
+items when the pool is already over that ceiling.
+
+### Hot pool ceiling and promotion budget
+
+```yaml
+capacity:
+  hot_ceiling_percent: 80        # refuse to fill ZFS pool past this
+  budget_safety_margin_gb: 0     # additional headroom inside the ceiling
+```
+
+Every run, `tier.py` reads the current pool usage and computes:
+
+```
+budget = (hot_ceiling_percent / 100 × pool_total) - pool_used - safety_margin_gb
+```
+
+`TO_HOT` candidates are then sorted by score (highest first) and allocated
+against the budget in order. Items that fit keep their `TO_HOT` outcome; items
+that don't fit get the outcome **`OVER_BUDGET_HOT`** — they stay warm this run
+and try again next time as scores evolve. If the budget is zero or negative,
+all `TO_HOT` items are deferred.
+
+The Capacity section of the log (before the move table) shows the full
+accounting:
+
+```
+Capacity: hot pool 67% full (10.2 / 15.0 TB) — budget 1.8 TB to 80% ceiling
+Capacity: 47 TO_HOT candidates totalling 3.4 TB — fitting 24 within budget, 23 deferred (OVER_BUDGET_HOT)
+Capacity: warm disks all under 90% ceiling
+```
+
+### Warm disk ceiling
+
+```yaml
+capacity:
+  warm_per_disk_ceiling_percent: 90   # skip warm disks above this fill level
+```
+
+When selecting a destination disk for `TO_WARM` or `RELOCATE_WARM` moves,
+disks already at or above `warm_per_disk_ceiling_percent` are excluded from
+candidates. If no qualifying disk remains, the item is logged as `[FAILED]` and
+left in place until space frees up on a warm disk.
+
+### Auto-demote when over ceiling
+
+```yaml
+capacity:
+  auto_demote_when_over_ceiling: false   # set true to enable
+```
+
+When `true` and the hot pool is **already over the ceiling** at run start,
+`tier.py` forces the lowest-scoring `STAY_HOT` items to `TO_WARM` — one by one
+in ascending score order — until the pool would come back under the ceiling.
+`PIN_HOT` items (library/title/collection pins) are always exempt; only items on
+HOT by score alone are candidates.
+
+The auto-demote block appears in the log before the move table:
+
+```
+Capacity: hot pool 84% full — over 80% ceiling, demoting lowest scorers
+Capacity: demoted 12 items (520 GB) to TO_WARM to bring pool to 79.6%
+```
+
+### CLI direction flags
+
+| Flag | Effect |
+|---|---|
+| `--no-promote` | Defers all `TO_HOT` items to `OVER_BUDGET_HOT` regardless of budget |
+| `--no-demote` | Skips the auto-demote pass even when the pool is over ceiling |
+
+Both flags are one-shot per-run overrides. They don't change `tiering.yaml`.
+Each is logged explicitly so dry-run output is unambiguous about why items are
+deferred or not demoted.
 
 ## Tuning
 

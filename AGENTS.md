@@ -49,7 +49,7 @@ CLAUDE.md and GEMINI.md are symlinks to this file.
 | P2.2 | TO_WARM moves — demote from hot pool to chosen warm disk; co_locate_then_most_free destination selection | Done |
 | P2.3 | RELOCATE_WARM moves — drain evicting warm disks to healthy warm disks; source disk excluded from candidates | Done |
 | P2.4 | Plex rescan automation — dropped (Unraid user-share union makes it unnecessary for in-union moves) | N/A |
-| P3   | Hardening: lock file, currently-playing skip, free-space check, move cap | Pending |
+| P3   | Capacity-aware tiering — hot pool ceiling + promotion budget (OVER_BUDGET_HOT), optional auto-demote, warm per-disk ceiling, --no-promote / --no-demote | Done |
 | P4   | Scheduled cron + size-triggered wrapper | Pending |
 
 ## Non-obvious design decisions
@@ -653,6 +653,61 @@ example:
 
 `DEFAULT_CONFIG` in `tier.py` is the source of truth for defaults and
 merges over the user config via `_deep_merge()`. Keep the two in sync.
+
+### Capacity-aware tiering (P3)
+
+`_apply_capacity_budget()` runs after `collect_all()` and before
+`_run_move_pass()` in `_run()`. It modifies item outcomes in-place so
+the move pass sees budget-adjusted queues.
+
+**Why `OVER_BUDGET_HOT` is its own outcome rather than overloading `STAY_WARM`.**
+An item assigned `OVER_BUDGET_HOT` scored high enough for HOT — it is being
+denied promotion this run purely because the pool has no room, not because its
+score dropped. Overloading `STAY_WARM` would lose that signal: operators need
+to be able to tell "this item is correctly warm" from "this item deserves HOT
+but the pool is full today". Using a distinct outcome also lets P2's move pass
+skip the item without special-casing (it's not in the TO_HOT queue) while the
+output table and summary still flag it clearly. The outcome is counted in
+`_WARM_OUTCOMES` so projected-WARM totals include items that will stay warm due
+to budget constraints.
+
+**Why `PIN_HOT` is exempt from auto-demote.**
+Auto-demote converts lowest-scoring `STAY_HOT` items to `TO_WARM` until the
+pool comes under the ceiling. `PIN_HOT` items (library-pinned, title-pinned,
+collection-pinned) reflect *explicit operator intent* — the user said "keep
+this on HOT regardless of score". Demoting them automatically would silently
+violate that intent, likely causing the item to be re-promoted next run (score
+is irrelevant for pins), creating a flip-flop loop. Only `STAY_HOT` items —
+those on HOT by score alone — are candidates.
+
+**Why pool-level ceilings and per-disk warm ceilings are separate knobs.**
+They guard against different failure modes:
+
+- `hot_ceiling_percent`: ZFS pool write-amplification and snapshot space.
+  Filling a ZFS pool past ~80% degrades performance and can starve snapshot
+  reservations. This is a pool-level property; individual vdevs don't matter.
+- `warm_per_disk_ceiling_percent`: Unraid array spindle health. An individual
+  spinning disk near 100% fill has higher fragmentation, slower seek times, and
+  leaves no room for Plex to write sidecar files. This is a per-disk property;
+  the pool-level ceiling is irrelevant. Enforced in `_select_warm_destination`
+  so any destination disk over the ceiling is excluded from candidates.
+
+**Why budget is computed against the ceiling, not against 100%.**
+Computing `budget = total - used - margin` (against 100%) would allow the pool
+to be filled right up to full, defeating the purpose of `hot_ceiling_percent`.
+Computing against the ceiling — `budget = ceiling_bytes - used - margin` —
+means the budget tracks remaining capacity *within the headroom policy*, which
+is what operators want. If the pool is already above the ceiling (e.g. was
+nearly full before this feature was added), the budget is clamped to zero,
+blocking all promotions until space is freed.
+
+**`--no-promote` and `--no-demote` CLI flags.**
+Both are one-shot overrides: they don't change config, only this run.
+`--no-promote` is useful for maintenance windows or when the operator wants
+to let the pool drain without new inflows. `--no-demote` prevents auto-demote
+from firing during a run where you want to inspect outcomes before committing
+to changes. Both are logged explicitly in the Capacity: output so dry-run
+output is unambiguous about why items are deferred or not demoted.
 
 ## Development rules
 
