@@ -387,23 +387,39 @@ to find minority warm files.
 Neither conversion demotes anything. `warm_disk_files` being non-empty is the
 sole trigger — if it is empty (item genuinely already on HOT), no change.
 
-### Minority-evict: `Item.relocate_source_override`
+### `Item.relocate_source_override` — evicting-disk files only
 
-When the eviction pass detects that an item has files on an evicting disk but
-`current_disk` (majority bytes) is a *safe* disk, it:
+`relocate_source_override` is set by the eviction pass for **all** RELOCATE_WARM
+items (both majority-evict and minority-evict). It restricts the rsync source and
+the subsequent delete to only the files that live on the evicting disk.
 
-1. Sets `item.relocate_source_override = {evicting_disk: [minority files]}`
-   so `_exec_single_move` rsyncs only those files, not the whole `warm_disk_files`.
-2. Overrides `item.current_disk` to the evicting disk so `_select_warm_destination`
-   uses it as `exclude_disk`, which keeps the evicting disk out of candidates.
-3. Leaves `warm_disk_files` intact so co-location scoring can see the safe
-   majority disk and prefer it as the destination.
+**Why this is required even for majority-evict items (data-loss guard).**
+`warm_disk_files` contains files from *all* warm disks an item spans. For a
+series majority on disk7 with minority seasons also on disk3, and disk7 being
+evicted: without `relocate_source_override`, the eviction move would:
 
-Result: only the evicting-disk files move; the majority files on the safe disk
-are untouched; co-location naturally consolidates everything on one spindle.
+1. Rsync from all warm sources (disk7 + disk3) to the destination (co-location
+   picks disk3, the safe majority-bytes disk).
+2. Size-verify passes — the disk3 files are already at the destination (they
+   never moved; rsync was a no-op for them).
+3. Delete runs against the full `warm_disk_files`, including disk3 — wiping
+   those files permanently.
 
-`relocate_source_override` is `None` for majority-evict items (the original
-case) and for all non-eviction moves. `None` means "use full `warm_disk_files`."
+Fix: always set `relocate_source_override = {evicting_disk: files_on_that_disk}`
+so the delete is bounded to exactly the files that were actually transferred.
+
+**Minority-evict additional step.** When `current_disk` (majority bytes) is a
+*safe* disk, the pass also overrides `item.current_disk` to the evicting disk so
+`_select_warm_destination` uses it as `exclude_disk`. This keeps the evicting
+disk out of destination candidates. `warm_disk_files` is left intact so
+co-location scoring can see the safe majority disk and prefer it as the
+destination.
+
+Result for all cases: only the evicting-disk files are rsynced and deleted;
+files on safe disks are untouched; co-location consolidates on one spindle.
+
+`relocate_source_override` is `None` for non-eviction moves. `None` means
+"use full `warm_disk_files`."
 
 ### Article normalization in `_is_movie_per_folder`
 
@@ -518,8 +534,8 @@ operates on these via `--files-from` in all three move directions:
 
 - TO_HOT: source = `warm_disk_files`, dst = hot pool.
 - TO_WARM: source = `{hot_pool_mount: hot_pool_files}`, dst = chosen warm disk.
-- RELOCATE_WARM: source = `relocate_source_override` when set (minority-evict),
-  else `warm_disk_files` (all warm disks), dst = chosen warm disk.
+- RELOCATE_WARM: source = `relocate_source_override` (always set by the eviction
+  pass — evicting-disk files only), dst = chosen warm disk.
 
 Do not refactor to title-derived or directory-derived paths — the actual
 filesystem paths are the ground truth, not the Plex title or the common-
