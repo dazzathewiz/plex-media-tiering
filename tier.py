@@ -1904,19 +1904,25 @@ def collect_all(plex: PlexServer, cfg: dict, filter_libraries) -> List[Item]:
                 if it.outcome == "STAY_WARM":
                     it.outcome = "RELOCATE_WARM"
                     relocate_count += 1
-                    # Minority-evict: item's majority bytes are on a safe disk;
-                    # only the evicting-disk files need to move.  Restrict the
-                    # rsync source to those files and point current_disk at the
-                    # evicting disk so _select_warm_destination excludes it,
-                    # allowing co-location with the safe majority disk.
-                    if it.current_disk not in evict_disks:
-                        evict_files = {
-                            d: it.warm_disk_files[d]
-                            for d in it.warm_disk_files
-                            if d in evict_disks
-                        }
-                        if evict_files:
-                            it.relocate_source_override = evict_files
+                    # Always restrict the rsync source to ONLY the evicting-disk
+                    # files.  warm_disk_files may include files from non-evicting
+                    # disks (older seasons of a series whose majority lives on the
+                    # evicting disk).  Without this guard the move executor would:
+                    #   1. rsync non-evicting-disk files to themselves (self-copy
+                    #      when co-location picks that disk as the destination)
+                    #   2. size_verify would PASS (the files are "already there")
+                    #   3. delete would remove them → data loss
+                    evict_files = {
+                        d: it.warm_disk_files[d]
+                        for d in it.warm_disk_files
+                        if d in evict_disks
+                    }
+                    if evict_files:
+                        it.relocate_source_override = evict_files
+                        # Minority-evict only: override current_disk to the
+                        # evicting disk so _select_warm_destination excludes it
+                        # from candidates (not the safe majority disk).
+                        if it.current_disk not in evict_disks:
                             it.current_disk = max(
                                 evict_files.keys(),
                                 key=lambda d: sum(
@@ -3812,6 +3818,81 @@ def _test_eviction_minority_warm_files_on_evict_disk():
     print("_test_eviction_minority_warm_files_on_evict_disk: OK")
 
 
+def _test_eviction_majority_evict_non_evict_files_excluded():
+    """RELOCATE_WARM for a majority-evict series restricts the source to evicting-disk files.
+
+    Guards against the data-loss scenario where warm_disk_files includes files
+    from non-evicting disks.  Without relocate_source_override, the move
+    executor would rsync non-evicting-disk files to themselves (when co-location
+    selects that disk as destination), pass size_verify, then delete them —
+    permanently destroying the data.
+
+    Models: BBTS majority on disk7 (evicting, S11+S12), minority on disk3 (S1-S10).
+    Expected: relocate_source_override = {disk7: [S11,S12]} only; disk3 files intact.
+    """
+    import tempfile, os as _os
+
+    with tempfile.TemporaryDirectory() as root:
+        disk3 = _os.path.join(root, "disk3")
+        disk7 = _os.path.join(root, "disk7")
+        _os.makedirs(_os.path.join(disk3, "TV Shows", "TBBT", "Season 01"), exist_ok=True)
+        _os.makedirs(_os.path.join(disk7, "TV Shows", "TBBT", "Season 11"), exist_ok=True)
+        _os.makedirs(_os.path.join(disk7, "TV Shows", "TBBT", "Season 12"), exist_ok=True)
+
+        s01 = _os.path.join(disk3, "TV Shows", "TBBT", "Season 01", "s01e01.mkv")
+        s11 = _os.path.join(disk7, "TV Shows", "TBBT", "Season 11", "s11e01.mkv")
+        s12 = _os.path.join(disk7, "TV Shows", "TBBT", "Season 12", "s12e01.mkv")
+        # disk7 is majority (5+5 GB vs 2 GB on disk3)
+        for path, sz in [(s01, 2_000_000), (s11, 5_000_000), (s12, 5_000_000)]:
+            with open(path, "wb") as f:
+                f.write(b"\x00" * sz)
+
+        # disk7 is majority → current_disk = disk7 (in evict_disks)
+        item = _make_item(kind="series", score=20.0, current_tier="WARM", current_disk=disk7)
+        item.outcome = "STAY_WARM"
+        item.warm_disk_files = {disk7: [s11, s12], disk3: [s01]}
+
+        evict_cfg   = {"enabled": True, "disks": [disk7]}
+        evict_disks = _build_evict_disks(evict_cfg, [disk3, disk7])
+
+        items_on_evict = [
+            it for it in [item]
+            if (it.current_disk is not None and it.current_disk in evict_disks)
+            or any(d in evict_disks for d in it.warm_disk_files)
+        ]
+        assert len(items_on_evict) == 1
+
+        for it in items_on_evict:
+            if it.outcome == "STAY_WARM":
+                it.outcome = "RELOCATE_WARM"
+                evict_files = {
+                    d: it.warm_disk_files[d]
+                    for d in it.warm_disk_files if d in evict_disks
+                }
+                if evict_files:
+                    it.relocate_source_override = evict_files
+                    if it.current_disk not in evict_disks:
+                        it.current_disk = max(
+                            evict_files.keys(),
+                            key=lambda d: sum(
+                                _os.path.getsize(f)
+                                for f in evict_files[d] if _os.path.exists(f)
+                            ),
+                        )
+
+        assert item.outcome == "RELOCATE_WARM"
+        assert item.current_disk == disk7, "majority-evict must keep current_disk on evicting disk"
+        assert item.relocate_source_override is not None
+        assert disk7 in item.relocate_source_override, "override must contain evicting disk"
+        assert disk3 not in item.relocate_source_override, \
+            "override must NOT contain non-evicting disk — would cause self-rsync data loss"
+        assert s11 in item.relocate_source_override[disk7]
+        assert s12 in item.relocate_source_override[disk7]
+        # warm_disk_files intact so co-location scoring can find disk3 as destination
+        assert disk3 in item.warm_disk_files
+    print("_test_eviction_majority_evict_non_evict_files_excluded: OK")
+
+
 def _test_destination_path_movie_tohot():
     """_compute_destination_path: movie with per-item folder -> correct hot path."""
     item = _make_item(
@@ -4864,6 +4945,7 @@ if __name__ == "__main__":
         _test_eviction_movie_on_evict_disk_becomes_relocate()
         _test_hot_majority_warm_disk_files_populated()
         _test_eviction_minority_warm_files_on_evict_disk()
+        _test_eviction_majority_evict_non_evict_files_excluded()
         _test_destination_path_movie_tohot()
         _test_destination_path_series_tohot()
         _test_move_skipped_when_already_hot()
