@@ -740,11 +740,16 @@ by the refdbytes issue; `free` is not.
 
 **The implemented priority chain** (`_pool_usage_bytes`):
 
-1. `_try_unraid_api(url, key, pool_name_filter)` — POST GraphQL to the Unraid
-   Connect API (`capacity.unraid_api_url` + `capacity.unraid_api_key`). Matches
-   on `capacity.unraid_pool_name` if set; otherwise uses the first ZFS pool
-   whose total ≥ `statvfs.free` as a size-floor heuristic. Requires Unraid
-   6.12+ and an API key (Settings → Management Access → API Keys).
+1. `_try_unraid_api(url, key, pool_name_filter, hot_mount)` — POST GraphQL to
+   the Unraid Connect API (`capacity.unraid_api_url` + `capacity.unraid_api_key`).
+   ZFS pools are modelled as cache entries in Unraid's array API; the correct
+   query is `{ array { caches { name fsType fsSize fsFree fsUsed } } }` (not a
+   `pools` top-level field — that does not exist in the schema). Match priority:
+   (a) `capacity.unraid_pool_name` exact match; (b) last path component of
+   `hot_pool_mount` (e.g. `/mnt/zfs_media` → `zfs_media`); (c) first ZFS
+   cache whose `fsSize ≥ statvfs.free`. Requires Unraid 6.12+ and an API key
+   (Settings → Management Access → API Keys). HTTPS required; use
+   `https://` in `unraid_api_url` — nginx redirects HTTP with a 302.
 2. `_try_zpool_cmd(pool_name)` — runs `zpool list -Hp -o size,alloc`. Works if
    ZFS userspace tools are present in the container. Pool name extracted from
    `/proc/mounts` via `_zfs_pool_name_for_mount`.

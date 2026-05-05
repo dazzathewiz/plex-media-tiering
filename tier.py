@@ -2129,35 +2129,28 @@ def _try_unraid_api(
     api_url: str,
     api_key: Optional[str],
     pool_name_filter: Optional[str],
+    hot_mount: str = "",
     free_floor_bytes: int = 0,
 ) -> Optional[Tuple[int, int]]:
     """Query the Unraid Connect GraphQL API for ZFS pool capacity.
 
-    Requires Unraid 6.12+ with Unraid Connect enabled and an API key
-    (Settings → Management Access → API keys in the Unraid UI).
+    Requires Unraid 6.12+ with an API key (Settings → Management Access →
+    API keys in the Unraid UI).  Uses the `array { caches }` query — ZFS
+    pools are modelled as cache entries in the Unraid array API.
 
-    pool_name_filter: match exactly this pool name (case-insensitive) if set.
-    free_floor_bytes: skip pools whose total is smaller than this value; used
-                      as a sanity heuristic when pool_name_filter is None.
+    Matching priority (first match wins):
+    1. pool_name_filter (capacity.unraid_pool_name config key) — exact,
+       case-insensitive match on the cache name.
+    2. Last path component of hot_mount — e.g. "/mnt/zfs_media" → "zfs_media".
+    3. First ZFS cache whose fsSize >= free_floor_bytes (size heuristic).
 
-    Returns (total_bytes, used_bytes) or None on any failure.  Failures are
-    always DEBUG-logged so an unconfigured or unavailable endpoint does not
-    produce WARNING/ERROR noise.
+    Returns (total_bytes, used_bytes) or None on any failure.  All failures
+    are DEBUG-logged so an unconfigured endpoint produces no noise.
     """
     import json
     import urllib.request
 
-    query = """
-    query {
-      pools {
-        name
-        filesystem
-        capacity {
-          kilobytes { total used free }
-        }
-      }
-    }
-    """
+    query = "{ array { caches { name fsType fsSize fsFree fsUsed } } }"
     try:
         payload = json.dumps({"query": query}).encode()
         req = urllib.request.Request(
@@ -2179,30 +2172,49 @@ def _try_unraid_api(
         log.debug("Capacity: Unraid API returned errors: %s", errors)
         return None
 
-    pools = (data.get("data") or {}).get("pools") or []
-    for pool in pools:
-        name = (pool.get("name") or "").strip()
-        fs = (pool.get("filesystem") or "").lower()
-        if pool_name_filter and name.lower() != pool_name_filter.lower():
+    caches = (data.get("data") or {}).get("array", {}).get("caches") or []
+
+    # Build candidate name filters in priority order.
+    name_candidates: List[str] = []
+    if pool_name_filter:
+        name_candidates.append(pool_name_filter.lower())
+    if hot_mount:
+        name_candidates.append(hot_mount.rstrip("/").split("/")[-1].lower())
+
+    def _pick(cache: dict) -> Optional[Tuple[int, int]]:
+        total = int(cache.get("fsSize") or 0)
+        used = int(cache.get("fsUsed") or 0)
+        if not total:
+            return None
+        return total, used
+
+    # Pass 1: name-based match.
+    for candidate in name_candidates:
+        for cache in caches:
+            if (cache.get("name") or "").lower() == candidate:
+                result = _pick(cache)
+                if result:
+                    log.debug(
+                        "Capacity: Unraid API matched cache %r by name: total=%d used=%d",
+                        cache["name"], *result,
+                    )
+                    return result
+
+    # Pass 2: first ZFS cache large enough to be the hot pool.
+    for cache in caches:
+        if (cache.get("fsType") or "").lower() != "zfs":
             continue
-        cap = (pool.get("capacity") or {}).get("kilobytes") or {}
-        total_kb = int(cap.get("total") or 0)
-        used_kb = int(cap.get("used") or 0)
-        total_bytes = total_kb * 1024
-        used_bytes = used_kb * 1024
-        if not total_bytes:
-            continue
-        if not pool_name_filter and total_bytes < free_floor_bytes:
-            continue
-        log.debug(
-            "Capacity: Unraid API matched pool %r (fs=%s): total=%d used=%d",
-            name, fs, total_bytes, used_bytes,
-        )
-        return total_bytes, used_bytes
+        result = _pick(cache)
+        if result and result[0] >= free_floor_bytes:
+            log.debug(
+                "Capacity: Unraid API matched cache %r by size heuristic: total=%d used=%d",
+                cache.get("name"), *result,
+            )
+            return result
 
     log.debug(
-        "Capacity: Unraid API returned %d pool(s) — no match for filter=%r",
-        len(pools), pool_name_filter,
+        "Capacity: Unraid API found %d cache(s) — no ZFS match for filter=%r mount=%r",
+        len(caches), pool_name_filter, hot_mount,
     )
     return None
 
@@ -2237,7 +2249,8 @@ def _pool_usage_bytes(
         except OSError:
             free_floor = 0
         result = _try_unraid_api(
-            unraid_api_url, unraid_api_key, unraid_pool_name, free_floor_bytes=free_floor,
+            unraid_api_url, unraid_api_key, unraid_pool_name,
+            hot_mount=mount, free_floor_bytes=free_floor,
         )
         if result is not None:
             log.debug("Capacity: hot pool via Unraid API: total=%d used=%d", *result)

@@ -744,9 +744,9 @@ under **Settings → Management Access → API Keys → New Key**, then set in
 
 ```yaml
 capacity:
-  unraid_api_url: "http://192.168.1.100/graphql"   # your Unraid host IP
+  unraid_api_url: "https://192.168.1.100/graphql"  # must be https — http redirects with 302
   unraid_api_key: "your-api-key-here"
-  unraid_pool_name: null   # auto-matched; set to e.g. "Zfs_media" if needed
+  unraid_pool_name: null   # auto-matched from hot_pool_mount; set explicitly if needed
 ```
 
 **Option B — set `hot_pool_total_gb` in `tiering.yaml` (simpler, no API key):**
