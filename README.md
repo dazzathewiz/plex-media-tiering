@@ -716,6 +716,68 @@ The capacity layer sits between scoring and the move executor. It enforces a
 fill ceiling on the hot ZFS pool and, optionally, demotes the lowest-scoring
 items when the pool is already over that ceiling.
 
+### Hot pool usage detection (ZFS)
+
+`tier.py` tries five methods in order to read hot pool usage, stopping at the
+first that succeeds:
+
+| Priority | Method | When it works |
+|---|---|---|
+| 1 | Unraid Connect GraphQL API | `unraid_api_url` + `unraid_api_key` configured |
+| 2 | `zpool list` command | ZFS userspace tools installed in the container |
+| 3 | `/proc/spl` kernel stats | `/proc/spl` bind-mounted from the Unraid host |
+| 4 | `hot_pool_total_gb` config key | You set the pool size manually in `tiering.yaml` |
+| 5 | `statvfs` fallback | Non-ZFS filesystems; **unreliable for ZFS** (see below) |
+
+**Why `statvfs` is unreliable for ZFS:** When all media files live in ZFS child
+datasets (e.g. `Zfs_media/Movies`), the root dataset reports `used = 0` via
+`statvfs`. The symptom is a log line like `Capacity: hot pool 0% full (0.0 GB /
+35.4 TB)` even when the pool is nearly half full. A `WARNING` is logged when
+this is detected.
+
+**Choose a fix based on your situation:**
+
+**Option A — Unraid Connect GraphQL API (recommended, Unraid 6.12+):**
+Fully automatic — no pool-size config needed. Get an API key from the Unraid UI
+under **Settings → Management Access → API Keys → New Key**, then set in
+`tiering.yaml`:
+
+```yaml
+capacity:
+  unraid_api_url: "http://192.168.1.100/graphql"   # your Unraid host IP
+  unraid_api_key: "your-api-key-here"
+  unraid_pool_name: null   # auto-matched; set to e.g. "Zfs_media" if needed
+```
+
+**Option B — set `hot_pool_total_gb` in `tiering.yaml` (simpler, no API key):**
+Find your pool's total size in GB by running on the **Unraid host**. The
+commands below derive the pool name directly from your `hot_pool_mount` path:
+
+```bash
+# Run on Unraid host. Replace /mnt/hot_pool with your paths.hot_pool_mount value.
+
+# Step 1 — find the ZFS pool name from the mount point:
+awk '$2=="/mnt/hot_pool" && $3=="zfs" {split($1,a,"/"); print a[1]; exit}' /proc/mounts
+
+# Step 2 — get pool size in GB (replace Zfs_media with the name from step 1):
+zpool list -Hp -o size Zfs_media | awk '{printf "%d\n", $1/1024/1024/1024}'
+
+# Or as a single combined command:
+POOL=$(awk '$2=="/mnt/hot_pool" && $3=="zfs" {split($1,a,"/"); print a[1]; exit}' /proc/mounts) \
+  && zpool list -Hp -o size $POOL | awk -v p="$POOL" '{printf "%d GB (%s)\n", $1/1024/1024/1024, p}'
+```
+
+Then set in `tiering.yaml`:
+
+```yaml
+capacity:
+  hot_pool_total_gb: 65536   # your pool size in GB (65536 = 64 TB)
+```
+
+`tier.py` uses `statvfs` for free space (which IS correct on ZFS) and derives
+`used = configured_total − free`. Requires a one-time manual config entry and
+an update if you expand the pool (add vdevs or replace drives).
+
 ### Hot pool ceiling and promotion budget
 
 ```yaml
@@ -736,13 +798,14 @@ that don't fit get the outcome **`OVER_BUDGET_HOT`** — they stay warm this run
 and try again next time as scores evolve. If the budget is zero or negative,
 all `TO_HOT` items are deferred.
 
-The Capacity section of the log (before the move table) shows the full
-accounting:
+The Capacity section of the log shows the full accounting, with one line per
+warm disk so you can spot disks approaching their ceiling:
 
 ```
-Capacity: hot pool 67% full (10.2 / 15.0 TB) — budget 1.8 TB to 80% ceiling
+Capacity: hot pool 39% full (24.9 / 63.8 TB) — budget 26.1 TB to 80% ceiling
 Capacity: 47 TO_HOT candidates totalling 3.4 TB — fitting 24 within budget, 23 deferred (OVER_BUDGET_HOT)
-Capacity: warm disks all under 90% ceiling
+Capacity: warm disk /mnt/disk1 — 4.2 / 8.0 TB (53%)
+Capacity: warm disk /mnt/disk2 — 7.6 / 8.0 TB (95%)  ← over 90% ceiling
 ```
 
 ### Warm disk ceiling

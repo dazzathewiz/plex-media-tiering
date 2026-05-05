@@ -240,6 +240,22 @@ DEFAULT_CONFIG = {
         # Additional headroom to leave inside the ceiling (GB). Useful to
         # account for snapshot growth or concurrent writes during the run.
         "budget_safety_margin_gb": 0,
+        # Manual hot pool size override (GB). Only needed when the hot pool is
+        # a ZFS pool and auto-detection fails inside the Docker container (the
+        # common symptom is "0% full" in the Capacity log line). See
+        # example.tiering.yaml for how to find the right value.
+        # Detection chain: Unraid API → zpool cmd → /proc/spl kstat → this override → statvfs.
+        "hot_pool_total_gb": None,
+        # Unraid Connect GraphQL API — queries pool stats without needing ZFS tools
+        # or config overrides. Requires Unraid 6.12+ with an API key from the
+        # Unraid Connect dashboard (Settings → Management Access → API keys).
+        # Leave url null to disable (no network call is made).
+        "unraid_api_url": None,
+        "unraid_api_key": None,
+        # ZFS pool name as Unraid reports it (e.g. "Zfs_media"). When null, the
+        # first ZFS pool returned by the API that is at least as large as
+        # statvfs.free is used as the match heuristic.
+        "unraid_pool_name": None,
     },
 }
 
@@ -2109,15 +2125,125 @@ def _try_zpool_kstat(pool_name: str) -> Optional[Tuple[int, int]]:
     return total_referenced + available, total_referenced
 
 
-def _pool_usage_bytes(mount: str) -> Tuple[int, int]:
+def _try_unraid_api(
+    api_url: str,
+    api_key: Optional[str],
+    pool_name_filter: Optional[str],
+    free_floor_bytes: int = 0,
+) -> Optional[Tuple[int, int]]:
+    """Query the Unraid Connect GraphQL API for ZFS pool capacity.
+
+    Requires Unraid 6.12+ with Unraid Connect enabled and an API key
+    (Settings → Management Access → API keys in the Unraid UI).
+
+    pool_name_filter: match exactly this pool name (case-insensitive) if set.
+    free_floor_bytes: skip pools whose total is smaller than this value; used
+                      as a sanity heuristic when pool_name_filter is None.
+
+    Returns (total_bytes, used_bytes) or None on any failure.  Failures are
+    always DEBUG-logged so an unconfigured or unavailable endpoint does not
+    produce WARNING/ERROR noise.
+    """
+    import json
+    import urllib.request
+
+    query = """
+    query {
+      pools {
+        name
+        filesystem
+        capacity {
+          kilobytes { total used free }
+        }
+      }
+    }
+    """
+    try:
+        payload = json.dumps({"query": query}).encode()
+        req = urllib.request.Request(
+            api_url,
+            data=payload,
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            method="POST",
+        )
+        if api_key:
+            req.add_header("x-api-key", api_key)
+        with urllib.request.urlopen(req, timeout=5) as resp:  # noqa: S310
+            data = json.loads(resp.read())
+    except Exception as exc:  # noqa: BLE001
+        log.debug("Capacity: Unraid API request failed: %s", exc)
+        return None
+
+    errors = data.get("errors")
+    if errors:
+        log.debug("Capacity: Unraid API returned errors: %s", errors)
+        return None
+
+    pools = (data.get("data") or {}).get("pools") or []
+    for pool in pools:
+        name = (pool.get("name") or "").strip()
+        fs = (pool.get("filesystem") or "").lower()
+        if pool_name_filter and name.lower() != pool_name_filter.lower():
+            continue
+        cap = (pool.get("capacity") or {}).get("kilobytes") or {}
+        total_kb = int(cap.get("total") or 0)
+        used_kb = int(cap.get("used") or 0)
+        total_bytes = total_kb * 1024
+        used_bytes = used_kb * 1024
+        if not total_bytes:
+            continue
+        if not pool_name_filter and total_bytes < free_floor_bytes:
+            continue
+        log.debug(
+            "Capacity: Unraid API matched pool %r (fs=%s): total=%d used=%d",
+            name, fs, total_bytes, used_bytes,
+        )
+        return total_bytes, used_bytes
+
+    log.debug(
+        "Capacity: Unraid API returned %d pool(s) — no match for filter=%r",
+        len(pools), pool_name_filter,
+    )
+    return None
+
+
+def _pool_usage_bytes(
+    mount: str,
+    total_gb_override: Optional[float] = None,
+    unraid_api_url: Optional[str] = None,
+    unraid_api_key: Optional[str] = None,
+    unraid_pool_name: Optional[str] = None,
+) -> Tuple[int, int]:
     """Return (total_bytes, used_bytes) for the hot pool at mount.
 
-    Tries three methods in order — stopping at the first that works:
-    1. zpool command (accurate, requires ZFS userspace tools in container).
-    2. /proc/spl/kstat/zfs/ kernel stats (accurate inside Docker, no tools needed).
-    3. shutil.disk_usage fallback (correct for non-ZFS; wrong for ZFS pools
-       where files live in child datasets — refdbytes shows 0 as 'used').
+    Priority chain — stops at the first successful method:
+
+    1. Unraid Connect GraphQL API — if capacity.unraid_api_url is configured.
+       Accurate, no ZFS tools needed, works inside Docker via the host network.
+       Requires Unraid 6.12+ and an API key.
+    2. zpool command — accurate; requires ZFS userspace tools in the container.
+    3. /proc/spl kstat — accurate inside Docker when /proc/spl is bind-mounted
+                         from the host (no ZFS tools needed).
+    4. hot_pool_total_gb config override — user supplies pool total; statvfs.free
+                         (correct on ZFS) is used to derive used = total − free.
+    5. statvfs fallback — correct for non-ZFS; wrong for ZFS child datasets.
+                         Emits a WARNING when used=0 to prompt configuration.
     """
+    # --- Method 1: Unraid Connect GraphQL API ---
+    if unraid_api_url:
+        try:
+            du = _disk_usage(mount)
+            free_floor = du.free  # heuristic: pool total must be >= statvfs free
+        except OSError:
+            free_floor = 0
+        result = _try_unraid_api(
+            unraid_api_url, unraid_api_key, unraid_pool_name, free_floor_bytes=free_floor,
+        )
+        if result is not None:
+            log.debug("Capacity: hot pool via Unraid API: total=%d used=%d", *result)
+            return result
+
+    # --- Methods 2 & 3: zpool command / /proc/spl kstat ---
     pool_name = _zfs_pool_name_for_mount(mount)
     if pool_name:
         result = _try_zpool_cmd(pool_name)
@@ -2128,8 +2254,27 @@ def _pool_usage_bytes(mount: str) -> Tuple[int, int]:
         if result is not None:
             log.debug("Capacity: hot pool via kstat: total=%d used=%d", *result)
             return result
+
+    # --- Method 4: hot_pool_total_gb config override ---
+    if total_gb_override:
+        try:
+            du = _disk_usage(mount)
+            total = int(float(total_gb_override) * 1024 ** 3)
+            used = max(0, total - du.free)
+            log.debug("Capacity: hot pool via config override: total=%d used=%d", total, used)
+            return total, used
+        except OSError:
+            pass
+
+    # --- Method 5: statvfs fallback ---
     try:
         du = _disk_usage(mount)
+        if du.used == 0 and du.total > 0:
+            log.warning(
+                "Capacity: hot pool used=0 — if this is a ZFS pool with files in child "
+                "datasets, configure capacity.unraid_api_url or capacity.hot_pool_total_gb "
+                "in tiering.yaml for accurate reporting. See README for options."
+            )
         return du.total, du.used
     except OSError:
         return 0, 0
@@ -2420,12 +2565,19 @@ def _apply_capacity_budget(
     warm_ceiling_pct = float(cap_cfg.get("warm_per_disk_ceiling_percent") or 90) / 100.0
 
     # --- Hot pool usage ---
-    # _pool_usage_bytes tries 'zpool list' first for accurate ZFS pool-level
-    # accounting (shutil.disk_usage on a ZFS root dataset returns 0 for 'used'
-    # when all files live in child datasets), then falls back to disk_usage.
+    total_gb_override = cap_cfg.get("hot_pool_total_gb") or None
+    unraid_api_url = (cap_cfg.get("unraid_api_url") or "").strip() or None
+    unraid_api_key = (cap_cfg.get("unraid_api_key") or "").strip() or None
+    unraid_pool_name = (cap_cfg.get("unraid_pool_name") or "").strip() or None
     pool_total = pool_used = 0
     if hot_mount:
-        pool_total, pool_used = _pool_usage_bytes(hot_mount)
+        pool_total, pool_used = _pool_usage_bytes(
+            hot_mount,
+            total_gb_override=total_gb_override,
+            unraid_api_url=unraid_api_url,
+            unraid_api_key=unraid_api_key,
+            unraid_pool_name=unraid_pool_name,
+        )
 
     pool_pct = (pool_used / pool_total) if pool_total else 0.0
     ceiling_bytes = int(pool_total * ceiling_pct) if pool_total else 0
@@ -2505,28 +2657,27 @@ def _apply_capacity_budget(
     elif no_demote and auto_demote and over_ceiling:
         log.info("Capacity: --no-demote set — auto-demote pass skipped (pool over ceiling)")
 
-    # --- Warm disk ceiling status ---
+    # --- Warm disk per-disk usage ---
     array_disks = resolve_array_disks(cfg)
     if array_disks:
-        over_warm_ceiling = []
-        for disk in array_disks:
+        ceiling_label = int(warm_ceiling_pct * 100)
+        for disk in sorted(array_disks):
             try:
                 du = _disk_usage(disk)
-                if du.total and (du.used / du.total) >= warm_ceiling_pct:
-                    over_warm_ceiling.append(disk)
+                if not du.total:
+                    continue
+                pct = du.used / du.total * 100
+                over = pct >= warm_ceiling_pct * 100
+                log.info(
+                    "Capacity: warm disk %s — %s / %s (%d%%)%s",
+                    disk,
+                    _fmt_size(du.used / (1024 ** 3)),
+                    _fmt_size(du.total / (1024 ** 3)),
+                    int(pct),
+                    f"  ← over {ceiling_label}% ceiling" if over else "",
+                )
             except OSError:
-                pass
-        if over_warm_ceiling:
-            log.info(
-                "Capacity: %d warm disk(s) over %d%% ceiling: %s",
-                len(over_warm_ceiling), int(warm_ceiling_pct * 100),
-                ", ".join(sorted(over_warm_ceiling)),
-            )
-        else:
-            log.info(
-                "Capacity: warm disks all under %d%% ceiling",
-                int(warm_ceiling_pct * 100),
-            )
+                log.warning("Capacity: warm disk %s — could not read usage", disk)
 
 
 def _run_move_pass(items: List["Item"], cfg: dict, apply: bool) -> None:

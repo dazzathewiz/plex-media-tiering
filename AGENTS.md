@@ -709,6 +709,64 @@ from firing during a run where you want to inspect outcomes before committing
 to changes. Both are logged explicitly in the Capacity: output so dry-run
 output is unambiguous about why items are deferred or not demoted.
 
+**ZFS hot pool usage: why statvfs fails inside Docker, and the fallback chain.**
+
+ZFS exposes pool stats via `statvfs` as follows (on the root dataset):
+- `used`  = `refdbytes` — bytes stored **directly** in the root dataset only.
+- `total` = `refdbytes + availbytes` — NOT pool total; roughly equals pool free.
+
+When all media files live in child datasets (e.g. `Zfs_media/Movies`), the
+root dataset's `refdbytes` is 0, so `used = 0` and `total ≈ pool free`. This
+makes `shutil.disk_usage` return nonsense (`0% full, total ≈ 35 TB` when the
+pool is actually `39% full, total = 63.8 TB`).
+
+Options considered and why they were rejected or accepted:
+
+| Method | Accurate | Works in Docker | Dependencies | Notes |
+|---|---|---|---|---|
+| `statvfs` (plain) | ✗ ZFS child datasets | Yes | None | Fallback only; WARNING emitted when `used=0` |
+| `du` recursive | ✗ logical, not on-disk | Yes (slow) | None | Metadata-heavy; ignores compression ratio |
+| ZFS tools in image | ✓ | Yes | zfsutils-linux | Image bloat, version mismatch, security surface |
+| `/dev/zfs` passthrough | ✓ | Yes | Privileged mount | Significant security risk; rejected |
+| `/proc/spl` bind-mount | ✓ | Yes (if mounted) | Docker config change | No ZFS tools needed; clean read-only kernel stats |
+| Unraid GraphQL API | ✓ | Yes | Unraid 6.12+, auth | Unraid-specific; complex auth setup |
+| `hot_pool_total_gb` config | ✓ (with statvfs free) | Yes | Manual config | Simple, no deps; requires one-time config; update when pool grows |
+
+**Why `statvfs.free` is reliable even when `used` is wrong.**
+ZFS statvfs does report `f_bavail` (available bytes for new writes) correctly —
+it reflects the actual pool free space. So `used = configured_total - statvfs_free`
+is accurate when `hot_pool_total_gb` is set. Only `total` and `used` are broken
+by the refdbytes issue; `free` is not.
+
+**The implemented priority chain** (`_pool_usage_bytes`):
+
+1. `_try_unraid_api(url, key, pool_name_filter)` — POST GraphQL to the Unraid
+   Connect API (`capacity.unraid_api_url` + `capacity.unraid_api_key`). Matches
+   on `capacity.unraid_pool_name` if set; otherwise uses the first ZFS pool
+   whose total ≥ `statvfs.free` as a size-floor heuristic. Requires Unraid
+   6.12+ and an API key (Settings → Management Access → API Keys).
+2. `_try_zpool_cmd(pool_name)` — runs `zpool list -Hp -o size,alloc`. Works if
+   ZFS userspace tools are present in the container. Pool name extracted from
+   `/proc/mounts` via `_zfs_pool_name_for_mount`.
+3. `_try_zpool_kstat(pool_name)` — reads `/proc/spl/kstat/zfs/<pool>/objset-*`.
+   Kernel module exposes these host-globally, but Docker containers have an
+   isolated `/proc` namespace. Works only if the user adds
+   `--volume /proc/spl:/proc/spl:ro` to container extra parameters.
+4. `hot_pool_total_gb` config override — `total = cfg_gb × 1024³`,
+   `used = total − statvfs.free`. Requires one-time YAML config entry. To find
+   the value, run on the Unraid host (replace mount and pool name as needed):
+   `zpool list -Hp -o size Zfs_media | awk '{printf "%d\n", $1/1024/1024/1024}'`
+5. `statvfs` fallback — logs a WARNING when `used=0` so operators know to
+   configure one of the above options.
+
+**Per-disk warm capacity log.** The warm disk section now logs one INFO line per
+disk (via `shutil.disk_usage`, which is correct for spinning-disk ext4/xfs):
+```
+Capacity: warm disk /mnt/disk1 — 4.2 / 8.0 TB (53%)
+Capacity: warm disk /mnt/disk2 — 7.6 / 8.0 TB (95%)  ← over 90% ceiling
+```
+This replaces the previous "warm disks all under N% ceiling" summary line.
+
 ## Development rules
 
 ### Write only to `/config` at runtime

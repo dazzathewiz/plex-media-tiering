@@ -237,9 +237,10 @@ moves:
 #   If the budget is zero or negative, ALL TO_HOT items are deferred.
 #
 # Dry-run output includes a Capacity: section before the move table:
-#   Capacity: hot pool 67% full (10.2 / 15.0 TB) — budget 1.8 TB to 80% ceiling
+#   Capacity: hot pool 39% full (24.9 / 63.8 TB) — budget 26.1 TB to 80% ceiling
 #   Capacity: 47 TO_HOT candidates totalling 3.4 TB — fitting 24, 23 deferred
-#   Capacity: warm disks all under 90% ceiling
+#   Capacity: warm disk /mnt/disk1 — 4.2 / 8.0 TB (53%)
+#   Capacity: warm disk /mnt/disk2 — 7.6 / 8.0 TB (95%)  ← over 90% ceiling
 capacity:
   # Refuse to fill the hot ZFS pool past this percentage.
   # ZFS write performance degrades above ~80%; snapshots need headroom too.
@@ -263,3 +264,43 @@ capacity:
   # Set to 0 to use the ceiling as the hard limit with no extra margin.
   budget_safety_margin_gb: 0
   # - 100   # example: keep an extra 100 GB back from the ceiling
+
+  # --- Hot pool capacity detection ---
+  #
+  # tier.py needs accurate ZFS pool stats (total/used). statvfs inside Docker
+  # returns used=0 when all files live in ZFS child datasets — symptom is
+  # "0% full" in the Capacity log. Configure ONE of the two options below.
+  #
+  # Detection priority (first success wins):
+  #   1. Unraid Connect GraphQL API  ← configure below if you have an API key
+  #   2. 'zpool' command             ← works if ZFS tools happen to be installed
+  #   3. /proc/spl kstat             ← works with: --volume /proc/spl:/proc/spl:ro
+  #   4. hot_pool_total_gb override  ← configure below as a simpler fallback
+  #   5. statvfs                     ← WARNING logged when used=0 (unreliable for ZFS)
+
+  # Option A — Unraid Connect GraphQL API (Unraid 6.12+).
+  # Get an API key: Unraid UI → Settings → Management Access → API Keys → New Key.
+  # The URL is your Unraid host IP on port 80 (or 443 if HTTPS is enabled).
+  # Advantage: fully automatic, no pool-name config needed in most cases.
+  unraid_api_url: null       # e.g. "http://192.168.1.100/graphql"
+  unraid_api_key: null       # API key string from the Unraid UI
+  unraid_pool_name: null     # ZFS pool name (e.g. "Zfs_media"); auto-matched if null
+
+  # Option B — manual pool size override.
+  # Advantage: no API key needed; works everywhere; requires one-time config.
+  # Run the commands below on the Unraid host to find your pool size.
+  # Replace /mnt/hot_pool with your paths.hot_pool_mount value:
+  #
+  #   # Step 1 — find ZFS pool name from the mount point:
+  #   awk '$2=="/mnt/hot_pool" && $3=="zfs" {split($1,a,"/"); print a[1]; exit}' /proc/mounts
+  #
+  #   # Step 2 — get size in GB (replace Zfs_media with pool name from step 1):
+  #   zpool list -Hp -o size Zfs_media | awk '{printf "%d\n", $1/1024/1024/1024}'
+  #
+  #   # Or as a single command:
+  #   POOL=$(awk '$2=="/mnt/hot_pool" && $3=="zfs" {split($1,a,"/"); print a[1]; exit}' /proc/mounts) \
+  #     && zpool list -Hp -o size $POOL | awk -v p="$POOL" '{printf "%d GB (%s)\n", $1/1024/1024/1024, p}'
+  #
+  # Update this value if you expand the pool (add vdevs / replace drives).
+  hot_pool_total_gb: null
+  # hot_pool_total_gb: 65536                     # example: 64 TB (64 × 1024 GB)
