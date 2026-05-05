@@ -2026,6 +2026,65 @@ def _disk_usage(path: str):
     return shutil.disk_usage(path)
 
 
+def _try_zpool_usage(mount: str) -> Optional[Tuple[int, int]]:
+    """Return (total_bytes, alloc_bytes) for the ZFS pool containing mount.
+
+    shutil.disk_usage on a ZFS root dataset returns refdbytes (bytes stored
+    directly in that dataset) as 'used' — which is 0 when all files live in
+    child datasets.  Pool-level accounting requires 'zpool list'.
+
+    Runs 'zfs list' to find the pool name, then 'zpool list -Hp -o size,alloc'.
+    Returns None if ZFS commands are unavailable, the mount is not a ZFS
+    filesystem, or any step fails.
+    """
+    try:
+        r = subprocess.run(
+            ["zfs", "list", "-H", "-o", "name,mountpoint"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode != 0:
+            return None
+        mount_norm = mount.rstrip("/")
+        pool_name = None
+        for line in r.stdout.strip().splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 2 and parts[1].rstrip("/") == mount_norm:
+                pool_name = parts[0].split("/")[0]
+                break
+        if not pool_name:
+            return None
+        r2 = subprocess.run(
+            ["zpool", "list", "-Hp", "-o", "size,alloc", pool_name],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r2.returncode != 0:
+            return None
+        parts2 = r2.stdout.strip().split()
+        if len(parts2) >= 2:
+            return int(parts2[0]), int(parts2[1])
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _pool_usage_bytes(mount: str) -> Tuple[int, int]:
+    """Return (total_bytes, used_bytes) for the hot pool at mount.
+
+    Tries ZFS pool-level accounting first (accurate for pools where files
+    live in child datasets).  Falls back to shutil.disk_usage for non-ZFS
+    filesystems or when ZFS tools are unavailable.
+    """
+    zfs = _try_zpool_usage(mount)
+    if zfs is not None:
+        log.debug("Capacity: hot pool stats via zpool (ZFS-accurate): total=%d alloc=%d", *zfs)
+        return zfs
+    try:
+        du = _disk_usage(mount)
+        return du.total, du.used
+    except OSError:
+        return 0, 0
+
+
 def _select_warm_destination(
     item: "Item",
     array_disks: List[str],
@@ -2311,14 +2370,12 @@ def _apply_capacity_budget(
     warm_ceiling_pct = float(cap_cfg.get("warm_per_disk_ceiling_percent") or 90) / 100.0
 
     # --- Hot pool usage ---
+    # _pool_usage_bytes tries 'zpool list' first for accurate ZFS pool-level
+    # accounting (shutil.disk_usage on a ZFS root dataset returns 0 for 'used'
+    # when all files live in child datasets), then falls back to disk_usage.
     pool_total = pool_used = 0
     if hot_mount:
-        try:
-            du = _disk_usage(hot_mount)
-            pool_total = du.total
-            pool_used = du.used
-        except OSError:
-            pass
+        pool_total, pool_used = _pool_usage_bytes(hot_mount)
 
     pool_pct = (pool_used / pool_total) if pool_total else 0.0
     ceiling_bytes = int(pool_total * ceiling_pct) if pool_total else 0
