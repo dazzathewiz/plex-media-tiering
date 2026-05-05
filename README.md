@@ -28,7 +28,8 @@ execute; default is dry-run.
 | P2.3 | RELOCATE_WARM moves — drain evicting warm disks to healthy warm disks. Evicting disk excluded from candidates. | **Done** |
 | P2.4 | Plex rescan automation — **intentionally not implemented**. Unraid's user-share union means Plex always reads through `/mnt/user/` regardless of which physical disk backs a file; TO_WARM and RELOCATE_WARM moves are invisible to Plex at the path level. Only TO_HOT (which moves files off the union to a separate ZFS mount) recommends a rescan. | N/A |
 | P3 | Capacity-aware tiering — hot pool fill ceiling, promotion budget, `OVER_BUDGET_HOT` outcome, optional auto-demote of lowest-scoring HOT items, warm per-disk ceiling, `--no-promote` / `--no-demote` flags. | **Done** |
-| P4 | Scheduled cron + size-triggered wrapper. | Pending |
+| P3.5 | Move hardening — move-size cap (`OVER_SIZE_CAP`). | **Done** |
+| P4 | Scheduling primitives — lock file, structured exit codes, cron docs. | Pending |
 
 ## Install
 
@@ -311,6 +312,7 @@ Outcomes:
 | `MIXED_NEUTRAL` | Files are split exactly 50/50 across tiers with no score-based direction to resolve it. P2 leaves it alone. Very rare. |
 | `RELOCATE_WARM` | On a WARM disk marked for eviction. Score says keep warm, but P2 must move to a different warm disk. See [Disk eviction](#disk-eviction) below. |
 | `OVER_BUDGET_HOT` | Scored high enough for HOT but the hot pool budget was exhausted (or `--no-promote` was set). Item stays warm this run. Counted in projected WARM totals. |
+| `OVER_SIZE_CAP` | Item's size exceeds `moves.max_single_move_gb`. Move deferred this run; retried in full next run when the cap may have changed. Counted in projected WARM totals. |
 
 Tier detection activates automatically when `paths.hot_pool_mount` is set AND
 at least one array disk is known (either listed explicitly in `paths.array_disks`
@@ -854,6 +856,42 @@ Capacity: demoted 12 items (520 GB) to TO_WARM to bring pool to 79.6%
 Both flags are one-shot per-run overrides. They don't change `tiering.yaml`.
 Each is logged explicitly so dry-run output is unambiguous about why items are
 deferred or not demoted.
+
+## Move hardening (P3.5)
+
+### Move-size cap
+
+`moves.max_single_move_gb` sets a per-item size limit. Items larger than
+the cap are deferred as `OVER_SIZE_CAP` and reconsidered on the next run.
+The default is `0` (disabled — no cap).
+
+```yaml
+moves:
+  max_single_move_gb: 50   # defer anything larger than 50 GB
+```
+
+**Why you'd set this.** A single large series (100+ GB) can dominate an
+entire run on a slow spinning-disk array. Capping at 50 GB keeps each run
+under a predictable time budget while smaller items still get moved. The
+large item retries in full on the next run — there is no partial-move
+tracking.
+
+**The cap is strictly greater-than.** An item exactly equal to
+`max_single_move_gb` is allowed through. Set the cap above your largest
+expected item if you want a true "never move anything this big" guard.
+
+**Dry-run shows OVER_SIZE_CAP too.** The size check runs before any rsync,
+so capped items appear in dry-run output without requiring `--apply`:
+
+```
+[OVER_SIZE_CAP]  Dune: Part Two (2024)  72.1 GB — exceeds 50 GB cap
+```
+
+The end-of-run summary includes a tally:
+
+```
+  OVER_SIZE_CAP      1 items  72.1 GB  (exceeds 50 GB cap)
+```
 
 ## Tuning
 

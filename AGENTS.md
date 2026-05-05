@@ -50,7 +50,8 @@ CLAUDE.md and GEMINI.md are symlinks to this file.
 | P2.3 | RELOCATE_WARM moves — drain evicting warm disks to healthy warm disks; source disk excluded from candidates | Done |
 | P2.4 | Plex rescan automation — dropped (Unraid user-share union makes it unnecessary for in-union moves) | N/A |
 | P3   | Capacity-aware tiering — hot pool ceiling + promotion budget (OVER_BUDGET_HOT), optional auto-demote, warm per-disk ceiling, --no-promote / --no-demote | Done |
-| P4   | Scheduled cron + size-triggered wrapper | Pending |
+| P3.5 | Move hardening — move-size cap (OVER_SIZE_CAP) | Done |
+| P4   | Scheduling primitives — lock file, structured exit codes, cron docs | Pending |
 
 ## Non-obvious design decisions
 
@@ -788,9 +789,39 @@ that path is a separate read-write mount.
 
 `--apply` executes TO_HOT, TO_WARM, and RELOCATE_WARM moves when
 `moves.enabled: true`. All three directions are serialised in a single
-pass. The full P3 safety guards (currently-playing skip, free-space check,
-move-size cap, lock file) are still pending — don't add them piecemeal
-without the full P3 spec.
+pass. Before each move the executor checks whether the item's size exceeds
+`moves.max_single_move_gb` (OVER_SIZE_CAP). The lock file (P4) is not yet
+implemented — concurrent runs are not prevented.
+
+### OVER_SIZE_CAP is an execution gate, not a scoring outcome
+
+The size of an item is known from `collect_all()` — no extra I/O required.
+The cap check runs before the rsync call; capped items retain their scoring
+outcome (e.g. `TO_HOT`) in the summary so the next run can attempt them
+without re-scoring. This is consistent with `OVER_BUDGET_HOT`: both are
+"correct answer, wrong time" deferral states.
+
+### Why there is no currently-playing skip
+
+The intuitive "don't move a file Plex is reading" guard was considered and
+rejected for three reasons:
+
+**Unix semantics make it unnecessary.** rsync copies then deletes the source.
+If Plex holds an open file descriptor at delete time, the inode reference count
+keeps the data alive until Plex closes the FD — the stream completes cleanly.
+Media files are never written during playback, so the size-verify step is
+unaffected.
+
+**The session list is stale by design.** A single fetch at run start is
+meaningless for a batch that can take tens of minutes; per-item fetching adds
+Plex API calls for zero correctness gain.
+
+**It inverts the intent for binge sessions.** If a user starts watching a WARM
+series, every run during the binge would skip it — the item never reaches HOT
+during the window it most deserves promotion. The right response to "someone just
+started watching a WARM show" is fast promotion, not deferral. That capability
+belongs in a daily promote-only cadence with a configurable minimum-episode
+threshold, not in a move-time skip.
 
 ### Notifiers must not raise
 
