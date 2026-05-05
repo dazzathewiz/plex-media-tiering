@@ -2026,58 +2026,108 @@ def _disk_usage(path: str):
     return shutil.disk_usage(path)
 
 
-def _try_zpool_usage(mount: str) -> Optional[Tuple[int, int]]:
-    """Return (total_bytes, alloc_bytes) for the ZFS pool containing mount.
+def _zfs_pool_name_for_mount(mount: str) -> Optional[str]:
+    """Return ZFS pool name for mount by parsing /proc/mounts (no ZFS tools needed).
 
-    shutil.disk_usage on a ZFS root dataset returns refdbytes (bytes stored
-    directly in that dataset) as 'used' — which is 0 when all files live in
-    child datasets.  Pool-level accounting requires 'zpool list'.
-
-    Runs 'zfs list' to find the pool name, then 'zpool list -Hp -o size,alloc'.
-    Returns None if ZFS commands are unavailable, the mount is not a ZFS
-    filesystem, or any step fails.
+    Docker containers' /proc/mounts reflects bind-mounts with the original ZFS
+    device name (e.g. 'Zfs_media /mnt/hot_pool zfs rw,...').  The pool name is
+    the first path component of the device name.  Returns None for non-ZFS mounts
+    or if /proc/mounts is unreadable.
     """
+    mount_norm = mount.rstrip("/")
+    best_len = -1
+    best_device: Optional[str] = None
+    try:
+        with open("/proc/mounts") as _f:
+            for line in _f:
+                cols = line.split()
+                if len(cols) < 3 or cols[2] != "zfs":
+                    continue
+                mnt = cols[1].rstrip("/")
+                if mount_norm == mnt or mount_norm.startswith(mnt + "/"):
+                    if len(mnt) > best_len:
+                        best_len = len(mnt)
+                        best_device = cols[0]
+    except OSError:
+        pass
+    if best_device:
+        return best_device.split("/")[0]
+    return None
+
+
+def _try_zpool_cmd(pool_name: str) -> Optional[Tuple[int, int]]:
+    """Return (total, alloc) via 'zpool list' command.  None if unavailable."""
     try:
         r = subprocess.run(
-            ["zfs", "list", "-H", "-o", "name,mountpoint"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if r.returncode != 0:
-            return None
-        mount_norm = mount.rstrip("/")
-        pool_name = None
-        for line in r.stdout.strip().splitlines():
-            parts = line.split("\t")
-            if len(parts) >= 2 and parts[1].rstrip("/") == mount_norm:
-                pool_name = parts[0].split("/")[0]
-                break
-        if not pool_name:
-            return None
-        r2 = subprocess.run(
             ["zpool", "list", "-Hp", "-o", "size,alloc", pool_name],
             capture_output=True, text=True, timeout=5,
         )
-        if r2.returncode != 0:
-            return None
-        parts2 = r2.stdout.strip().split()
-        if len(parts2) >= 2:
-            return int(parts2[0]), int(parts2[1])
+        if r.returncode == 0:
+            parts = r.stdout.strip().split()
+            if len(parts) >= 2:
+                return int(parts[0]), int(parts[1])
     except Exception:  # noqa: BLE001
         pass
     return None
 
 
+def _try_zpool_kstat(pool_name: str) -> Optional[Tuple[int, int]]:
+    """Return (total, used) from /proc/spl/kstat/zfs/<pool>/objset-* kernel stats.
+
+    Sums dk_referenced across all datasets for pool-wide used bytes.  Reads
+    dk_available (pool free space) from any objset file.  Accessible inside
+    Docker containers on Unraid without ZFS userspace tools — the kernel module
+    exposes these stats globally via procfs.
+    Returns None if the kstat directory doesn't exist or stats are missing.
+    """
+    kstat_dir = f"/proc/spl/kstat/zfs/{pool_name}"
+    if not os.path.isdir(kstat_dir):
+        return None
+    total_referenced = 0
+    available: Optional[int] = None
+    try:
+        for fname in os.listdir(kstat_dir):
+            if not fname.startswith("objset-"):
+                continue
+            try:
+                kv: dict = {}
+                with open(os.path.join(kstat_dir, fname)) as _f:
+                    for line in _f:
+                        cols = line.split()
+                        if len(cols) >= 3:
+                            kv[cols[0]] = cols[2]
+                if "dk_referenced" in kv:
+                    total_referenced += int(kv["dk_referenced"])
+                if "dk_available" in kv and available is None:
+                    available = int(kv["dk_available"])
+            except (OSError, ValueError):
+                continue
+    except OSError:
+        return None
+    if available is None:
+        return None
+    return total_referenced + available, total_referenced
+
+
 def _pool_usage_bytes(mount: str) -> Tuple[int, int]:
     """Return (total_bytes, used_bytes) for the hot pool at mount.
 
-    Tries ZFS pool-level accounting first (accurate for pools where files
-    live in child datasets).  Falls back to shutil.disk_usage for non-ZFS
-    filesystems or when ZFS tools are unavailable.
+    Tries three methods in order — stopping at the first that works:
+    1. zpool command (accurate, requires ZFS userspace tools in container).
+    2. /proc/spl/kstat/zfs/ kernel stats (accurate inside Docker, no tools needed).
+    3. shutil.disk_usage fallback (correct for non-ZFS; wrong for ZFS pools
+       where files live in child datasets — refdbytes shows 0 as 'used').
     """
-    zfs = _try_zpool_usage(mount)
-    if zfs is not None:
-        log.debug("Capacity: hot pool stats via zpool (ZFS-accurate): total=%d alloc=%d", *zfs)
-        return zfs
+    pool_name = _zfs_pool_name_for_mount(mount)
+    if pool_name:
+        result = _try_zpool_cmd(pool_name)
+        if result is not None:
+            log.debug("Capacity: hot pool via zpool cmd: total=%d alloc=%d", *result)
+            return result
+        result = _try_zpool_kstat(pool_name)
+        if result is not None:
+            log.debug("Capacity: hot pool via kstat: total=%d used=%d", *result)
+            return result
     try:
         du = _disk_usage(mount)
         return du.total, du.used
