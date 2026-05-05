@@ -49,7 +49,7 @@ CLAUDE.md and GEMINI.md are symlinks to this file.
 | P2.2 | TO_WARM moves — demote from hot pool to chosen warm disk; co_locate_then_most_free destination selection | Done |
 | P2.3 | RELOCATE_WARM moves — drain evicting warm disks to healthy warm disks; source disk excluded from candidates | Done |
 | P2.4 | Plex rescan automation — dropped (Unraid user-share union makes it unnecessary for in-union moves) | N/A |
-| P3   | Hardening: lock file, currently-playing skip, free-space check, move cap | Pending |
+| P3   | Capacity-aware tiering — hot pool ceiling + promotion budget (OVER_BUDGET_HOT), optional auto-demote, warm per-disk ceiling, --no-promote / --no-demote | Done |
 | P4   | Scheduled cron + size-triggered wrapper | Pending |
 
 ## Non-obvious design decisions
@@ -653,6 +653,126 @@ example:
 
 `DEFAULT_CONFIG` in `tier.py` is the source of truth for defaults and
 merges over the user config via `_deep_merge()`. Keep the two in sync.
+
+### Capacity-aware tiering (P3)
+
+`_apply_capacity_budget()` runs after `collect_all()` and before
+`_run_move_pass()` in `_run()`. It modifies item outcomes in-place so
+the move pass sees budget-adjusted queues.
+
+**Why `OVER_BUDGET_HOT` is its own outcome rather than overloading `STAY_WARM`.**
+An item assigned `OVER_BUDGET_HOT` scored high enough for HOT — it is being
+denied promotion this run purely because the pool has no room, not because its
+score dropped. Overloading `STAY_WARM` would lose that signal: operators need
+to be able to tell "this item is correctly warm" from "this item deserves HOT
+but the pool is full today". Using a distinct outcome also lets P2's move pass
+skip the item without special-casing (it's not in the TO_HOT queue) while the
+output table and summary still flag it clearly. The outcome is counted in
+`_WARM_OUTCOMES` so projected-WARM totals include items that will stay warm due
+to budget constraints.
+
+**Why `PIN_HOT` is exempt from auto-demote.**
+Auto-demote converts lowest-scoring `STAY_HOT` items to `TO_WARM` until the
+pool comes under the ceiling. `PIN_HOT` items (library-pinned, title-pinned,
+collection-pinned) reflect *explicit operator intent* — the user said "keep
+this on HOT regardless of score". Demoting them automatically would silently
+violate that intent, likely causing the item to be re-promoted next run (score
+is irrelevant for pins), creating a flip-flop loop. Only `STAY_HOT` items —
+those on HOT by score alone — are candidates.
+
+**Why pool-level ceilings and per-disk warm ceilings are separate knobs.**
+They guard against different failure modes:
+
+- `hot_ceiling_percent`: ZFS pool write-amplification and snapshot space.
+  Filling a ZFS pool past ~80% degrades performance and can starve snapshot
+  reservations. This is a pool-level property; individual vdevs don't matter.
+- `warm_per_disk_ceiling_percent`: Unraid array spindle health. An individual
+  spinning disk near 100% fill has higher fragmentation, slower seek times, and
+  leaves no room for Plex to write sidecar files. This is a per-disk property;
+  the pool-level ceiling is irrelevant. Enforced in `_select_warm_destination`
+  so any destination disk over the ceiling is excluded from candidates.
+
+**Why budget is computed against the ceiling, not against 100%.**
+Computing `budget = total - used - margin` (against 100%) would allow the pool
+to be filled right up to full, defeating the purpose of `hot_ceiling_percent`.
+Computing against the ceiling — `budget = ceiling_bytes - used - margin` —
+means the budget tracks remaining capacity *within the headroom policy*, which
+is what operators want. If the pool is already above the ceiling (e.g. was
+nearly full before this feature was added), the budget is clamped to zero,
+blocking all promotions until space is freed.
+
+**`--no-promote` and `--no-demote` CLI flags.**
+Both are one-shot overrides: they don't change config, only this run.
+`--no-promote` is useful for maintenance windows or when the operator wants
+to let the pool drain without new inflows. `--no-demote` prevents auto-demote
+from firing during a run where you want to inspect outcomes before committing
+to changes. Both are logged explicitly in the Capacity: output so dry-run
+output is unambiguous about why items are deferred or not demoted.
+
+**ZFS hot pool usage: why statvfs fails inside Docker, and the fallback chain.**
+
+ZFS exposes pool stats via `statvfs` as follows (on the root dataset):
+- `used`  = `refdbytes` — bytes stored **directly** in the root dataset only.
+- `total` = `refdbytes + availbytes` — NOT pool total; roughly equals pool free.
+
+When all media files live in child datasets (e.g. `Zfs_media/Movies`), the
+root dataset's `refdbytes` is 0, so `used = 0` and `total ≈ pool free`. This
+makes `shutil.disk_usage` return nonsense (`0% full, total ≈ 35 TB` when the
+pool is actually `39% full, total = 63.8 TB`).
+
+Options considered and why they were rejected or accepted:
+
+| Method | Accurate | Works in Docker | Dependencies | Notes |
+|---|---|---|---|---|
+| `statvfs` (plain) | ✗ ZFS child datasets | Yes | None | Fallback only; WARNING emitted when `used=0` |
+| `du` recursive | ✗ logical, not on-disk | Yes (slow) | None | Metadata-heavy; ignores compression ratio |
+| ZFS tools in image | ✓ | Yes | zfsutils-linux | Image bloat, version mismatch, security surface |
+| `/dev/zfs` passthrough | ✓ | Yes | Privileged mount | Significant security risk; rejected |
+| `/proc/spl` bind-mount | ✓ | Yes (if mounted) | Docker config change | No ZFS tools needed; clean read-only kernel stats |
+| Unraid GraphQL API | ✓ | Yes | Unraid 6.12+, auth | Unraid-specific; complex auth setup |
+| `hot_pool_total_gb` config | ✓ (with statvfs free) | Yes | Manual config | Simple, no deps; requires one-time config; update when pool grows |
+
+**Why `statvfs.free` is reliable even when `used` is wrong.**
+ZFS statvfs does report `f_bavail` (available bytes for new writes) correctly —
+it reflects the actual pool free space. So `used = configured_total - statvfs_free`
+is accurate when `hot_pool_total_gb` is set. Only `total` and `used` are broken
+by the refdbytes issue; `free` is not.
+
+**The implemented priority chain** (`_pool_usage_bytes`):
+
+1. `_try_unraid_api(url, key, pool_name_filter, hot_mount)` — POST GraphQL to
+   the Unraid Connect API (`capacity.unraid_api_url` + `capacity.unraid_api_key`).
+   ZFS pools are modelled as cache entries in Unraid's array API; the correct
+   query is `{ array { caches { name fsType fsSize fsFree fsUsed } } }` (not a
+   `pools` top-level field — that does not exist in the schema). Match priority:
+   (a) `capacity.unraid_pool_name` exact match; (b) last path component of
+   `hot_pool_mount` (e.g. `/mnt/zfs_media` → `zfs_media`); (c) first ZFS
+   cache whose `fsSize ≥ statvfs.free`. Requires Unraid 6.12+ and an API key
+   (Settings → Management Access → API Keys). HTTPS required; use
+   `https://` in `unraid_api_url` — nginx redirects HTTP with a 302.
+2. `_try_zpool_cmd(pool_name)` — runs `zpool list -Hp -o size,alloc`. Works if
+   ZFS userspace tools are present in the container. Pool name extracted from
+   `/proc/mounts` via `_zfs_pool_name_for_mount`.
+3. `_try_zpool_kstat(pool_name)` — reads `/proc/spl/kstat/zfs/<pool>/objset-*`.
+   Kernel module exposes these host-globally, but Docker containers have an
+   isolated `/proc` namespace. Works only if the user adds
+   `--volume /proc/spl:/proc/spl:ro` to container extra parameters.
+4. `hot_pool_total_gb` config override — `total = cfg_gb × 1024³`,
+   `used = total − statvfs.free`. Requires one-time YAML config entry. To find
+   the value, run on the Unraid host (replace pool name as needed). Use `zfs get`
+   (dataset layer, accounts for RAIDZ parity) — `zpool list` size/alloc/free are
+   raw vdev bytes and do NOT reflect parity overhead:
+   `zfs get -Hp -o value available,used Zfs_media | awk '{s+=$1} END {printf "%d\n", s/1024/1024/1024}'`
+5. `statvfs` fallback — logs a WARNING when `used=0` so operators know to
+   configure one of the above options.
+
+**Per-disk warm capacity log.** The warm disk section now logs one INFO line per
+disk (via `shutil.disk_usage`, which is correct for spinning-disk ext4/xfs):
+```
+Capacity: warm disk /mnt/disk1 — 4.2 / 8.0 TB (53%)
+Capacity: warm disk /mnt/disk2 — 7.6 / 8.0 TB (95%)  ← over 90% ceiling
+```
+This replaces the previous "warm disks all under N% ceiling" summary line.
 
 ## Development rules
 
