@@ -2182,8 +2182,10 @@ def _try_unraid_api(
         name_candidates.append(hot_mount.rstrip("/").split("/")[-1].lower())
 
     def _pick(cache: dict) -> Optional[Tuple[int, int]]:
-        total = int(cache.get("fsSize") or 0)
-        used = int(cache.get("fsUsed") or 0)
+        # Unraid API returns fsSize/fsUsed/fsFree in SI kilobytes (1 kB = 1000 bytes).
+        # Multiply by 1000 to get bytes for consistent internal accounting.
+        total = int(cache.get("fsSize") or 0) * 1000
+        used = int(cache.get("fsUsed") or 0) * 1000
         if not total:
             return None
         return total, used
