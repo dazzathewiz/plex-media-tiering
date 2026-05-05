@@ -759,8 +759,10 @@ by the refdbytes issue; `free` is not.
    `--volume /proc/spl:/proc/spl:ro` to container extra parameters.
 4. `hot_pool_total_gb` config override — `total = cfg_gb × 1024³`,
    `used = total − statvfs.free`. Requires one-time YAML config entry. To find
-   the value, run on the Unraid host (replace mount and pool name as needed):
-   `zpool list -Hp -o size Zfs_media | awk '{printf "%d\n", $1/1024/1024/1024}'`
+   the value, run on the Unraid host (replace pool name as needed). Use `zfs get`
+   (dataset layer, accounts for RAIDZ parity) — `zpool list` size/alloc/free are
+   raw vdev bytes and do NOT reflect parity overhead:
+   `zfs get -Hp -o value available,used Zfs_media | awk '{s+=$1} END {printf "%d\n", s/1024/1024/1024}'`
 5. `statvfs` fallback — logs a WARNING when `used=0` so operators know to
    configure one of the above options.
 

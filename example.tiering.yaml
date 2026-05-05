@@ -294,12 +294,15 @@ capacity:
   #   # Step 1 — find ZFS pool name from the mount point:
   #   awk '$2=="/mnt/hot_pool" && $3=="zfs" {split($1,a,"/"); print a[1]; exit}' /proc/mounts
   #
-  #   # Step 2 — get size in GB (replace Zfs_media with pool name from step 1):
-  #   zpool list -Hp -o size Zfs_media | awk '{printf "%d\n", $1/1024/1024/1024}'
+  #   # Step 2 — get USABLE size in GiB (accounts for RAIDZ parity overhead).
+  #   # Use 'zfs get' (ZFS dataset layer) — 'zpool list' size/alloc/free are raw
+  #   # vdev bytes and do NOT reflect parity overhead. Replace Zfs_media below:
+  #   zfs get -Hp -o value available,used Zfs_media | awk '{s+=$1} END {printf "%d\n", s/1024/1024/1024}'
   #
   #   # Or as a single command:
   #   POOL=$(awk '$2=="/mnt/hot_pool" && $3=="zfs" {split($1,a,"/"); print a[1]; exit}' /proc/mounts) \
-  #     && zpool list -Hp -o size $POOL | awk -v p="$POOL" '{printf "%d GB (%s)\n", $1/1024/1024/1024, p}'
+  #     && zfs get -Hp -o value available,used $POOL \
+  #     | awk -v p="$POOL" '{s+=$1} END {printf "%d (%s)\n", s/1024/1024/1024, p}'
   #
   # Update this value if you expand the pool (add vdevs / replace drives).
   hot_pool_total_gb: null

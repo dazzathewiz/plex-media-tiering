@@ -759,12 +759,16 @@ commands below derive the pool name directly from your `hot_pool_mount` path:
 # Step 1 — find the ZFS pool name from the mount point:
 awk '$2=="/mnt/hot_pool" && $3=="zfs" {split($1,a,"/"); print a[1]; exit}' /proc/mounts
 
-# Step 2 — get pool size in GB (replace Zfs_media with the name from step 1):
-zpool list -Hp -o size Zfs_media | awk '{printf "%d\n", $1/1024/1024/1024}'
+# Step 2 — get USABLE pool size in GiB (accounts for RAIDZ parity overhead).
+# Uses 'zfs get' (ZFS dataset layer) not 'zpool list' — zpool's size/alloc/free
+# are raw vdev bytes and do not reflect parity overhead.
+# Replace Zfs_media with the name from step 1:
+zfs get -Hp -o value available,used Zfs_media | awk '{s+=$1} END {printf "%d\n", s/1024/1024/1024}'
 
 # Or as a single combined command:
 POOL=$(awk '$2=="/mnt/hot_pool" && $3=="zfs" {split($1,a,"/"); print a[1]; exit}' /proc/mounts) \
-  && zpool list -Hp -o size $POOL | awk -v p="$POOL" '{printf "%d GB (%s)\n", $1/1024/1024/1024, p}'
+  && zfs get -Hp -o value available,used $POOL \
+  | awk -v p="$POOL" '{s+=$1} END {printf "%d (%s)\n", s/1024/1024/1024, p}'
 ```
 
 Then set in `tiering.yaml`:
