@@ -28,7 +28,7 @@ execute; default is dry-run.
 | P2.3 | RELOCATE_WARM moves — drain evicting warm disks to healthy warm disks. Evicting disk excluded from candidates. | **Done** |
 | P2.4 | Plex rescan automation — **intentionally not implemented**. Unraid's user-share union means Plex always reads through `/mnt/user/` regardless of which physical disk backs a file; TO_WARM and RELOCATE_WARM moves are invisible to Plex at the path level. Only TO_HOT (which moves files off the union to a separate ZFS mount) recommends a rescan. | N/A |
 | P3 | Capacity-aware tiering — hot pool fill ceiling, promotion budget, `OVER_BUDGET_HOT` outcome, optional auto-demote of lowest-scoring HOT items, warm per-disk ceiling, `--no-promote` / `--no-demote` flags. | **Done** |
-| P3.5 | Move hardening — move-size cap (`OVER_SIZE_CAP`). | **Done** |
+| P3.5 | Move hardening — run-level I/O budget (`max_total_move_gb`). | **Done** |
 | P4 | Scheduling primitives — lock file, structured exit codes, cron docs. | Pending |
 
 ## Install
@@ -312,7 +312,6 @@ Outcomes:
 | `MIXED_NEUTRAL` | Files are split exactly 50/50 across tiers with no score-based direction to resolve it. P2 leaves it alone. Very rare. |
 | `RELOCATE_WARM` | On a WARM disk marked for eviction. Score says keep warm, but P2 must move to a different warm disk. See [Disk eviction](#disk-eviction) below. |
 | `OVER_BUDGET_HOT` | Scored high enough for HOT but the hot pool budget was exhausted (or `--no-promote` was set). Item stays warm this run. Counted in projected WARM totals. |
-| `OVER_SIZE_CAP` | Item's size exceeds `moves.max_single_move_gb`. Move deferred this run; retried in full next run when the cap may have changed. Counted in projected WARM totals. |
 
 Tier detection activates automatically when `paths.hot_pool_mount` is set AND
 at least one array disk is known (either listed explicitly in `paths.array_disks`
@@ -859,39 +858,32 @@ deferred or not demoted.
 
 ## Move hardening (P3.5)
 
-### Move-size cap
+### Run-level I/O budget
 
-`moves.max_single_move_gb` sets a per-item size limit. Items larger than
-the cap are deferred as `OVER_SIZE_CAP` and reconsidered on the next run.
-The default is `0` (disabled — no cap).
+`moves.max_total_move_gb` limits how much data the move pass transfers in
+a single run. Once that many GB have been **successfully** moved the pass
+stops; remaining items keep their scoring outcomes and are reconsidered on
+the next run. The default is `0` (disabled — no limit).
 
 ```yaml
 moves:
-  max_single_move_gb: 50   # defer anything larger than 50 GB
+  max_total_move_gb: 200   # stop after 200 GB transferred
 ```
 
-**Why you'd set this.** A single large series (100+ GB) can dominate an
-entire run on a slow spinning-disk array. Capping at 50 GB keeps each run
-under a predictable time budget while smaller items still get moved. The
-large item retries in full on the next run — there is no partial-move
-tracking.
+**When to use it.** On slow spinning-disk arrays a full move pass can run
+for hours. Setting a budget keeps each run under a predictable time window
+(e.g. an overnight cron job) while still making progress each day.
 
-**The cap is strictly greater-than.** An item exactly equal to
-`max_single_move_gb` is allowed through. Set the cap above your largest
-expected item if you want a true "never move anything this big" guard.
+**Cap is `>=`, not `>`.** The item whose transfer brings the cumulative
+total exactly to the cap is still attempted; the *next* item is the first
+one stopped. Only successfully verified moves count toward the budget — a
+failed move does not consume budget, so the following item is not
+incorrectly blocked.
 
-**Dry-run shows OVER_SIZE_CAP too.** The size check runs before any rsync,
-so capped items appear in dry-run output without requiring `--apply`:
-
-```
-[OVER_SIZE_CAP]  Dune: Part Two (2024)  72.1 GB — exceeds 50 GB cap
-```
-
-The end-of-run summary includes a tally:
-
-```
-  OVER_SIZE_CAP      1 items  72.1 GB  (exceeds 50 GB cap)
-```
+**Distinct from P3's pool-ceiling cap.** `capacity.hot_ceiling_percent`
+is a correctness guard — it prevents overfilling the ZFS pool. `max_total_move_gb`
+is a run-duration guard — it has no bearing on pool fill level. Both can
+be active simultaneously.
 
 ## Tuning
 
