@@ -225,6 +225,13 @@ moves:
     # Conservative: a fully accurate check would subtract existing series
     # bytes already on the target, but the simple upper-bound is safer.
     safety_margin_gb: 50
+  # Stop the move pass once this many GB have been successfully transferred in a
+  # single run (0 = no limit). Remaining items are left in place and reconsidered
+  # next run. Useful for bounding run time on slow array disks or active hours.
+  # Distinct from capacity.hot_ceiling_percent — that guards pool fill level;
+  # this guards run duration.
+  # Example: 200
+  max_total_move_gb: 0
 
 # Capacity-aware tiering (P3) — keeps the hot ZFS pool under a fill ceiling
 # and optionally demotes lowest-scoring items when the pool is already over.

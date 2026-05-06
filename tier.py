@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-tier.py — Unraid media tiering script (Phase P3)
+tier.py — Unraid media tiering script (Phase P3.5)
 
 Pulls watch history and metadata from Plex, computes a heat score per
 media item (movies + TV series), probes the filesystem to determine
@@ -47,7 +47,12 @@ Phase status:
                     auto-demote of lowest-scoring HOT items when over
                     ceiling, warm per-disk ceiling, --no-promote /
                     --no-demote CLI flags.
-  P4  (later)       Scheduled cron + size-triggered wrapper.
+  P3.5 (done)       Move hardening — run-level I/O budget. Once
+                    moves.max_total_move_gb has been successfully
+                    transferred the move pass stops; remaining items
+                    keep their scoring outcomes and retry next run.
+  P4  (later)       Scheduling primitives — lock file, structured exit
+                    codes, cron docs.
 
 Usage:
     tier.py [--config PATH] [--library NAME ...] [--json|--csv PATH]
@@ -204,6 +209,13 @@ DEFAULT_CONFIG = {
             # Items that would exceed this margin are skipped with [FAILED].
             "safety_margin_gb": 50,
         },
+        # Stop the move pass once this many GB have been successfully
+        # transferred in a single run (0 = no limit). Remaining items keep
+        # their scoring outcomes and are retried next run. Distinct from
+        # capacity.hot_ceiling_percent (pool fill guard) — this bounds I/O
+        # duration. Cap is >=: the item that crosses the threshold is still
+        # attempted; the next item is the first blocked.
+        "max_total_move_gb": 0,
     },
     "logging": {
         "path": "/config/tier.log",  # container-friendly default
@@ -2942,7 +2954,19 @@ def _run_move_pass(items: List["Item"], cfg: dict, apply: bool) -> None:
     run_start = datetime.now(timezone.utc)
     total_count = len(move_list)
 
+    max_total_bytes = float(moves_cfg.get("max_total_move_gb") or 0) * 1024 ** 3
+    moved_bytes = 0
+
     for idx, (direction, it, files_by_src, dst_root, src_label, dst_label, annot) in enumerate(move_list, 1):
+        if max_total_bytes > 0 and moved_bytes >= max_total_bytes:
+            remaining = total_count - idx + 1
+            log.info(
+                "Run cap reached: %.1f GB moved — stopping move pass "
+                "(%d item(s) remaining, will retry next run).",
+                moved_bytes / (1024 ** 3), remaining,
+            )
+            break
+
         prefix = f"  [{idx}/{total_count}]"
         item_start = datetime.now(timezone.utc)
         size_str = _fmt_size(it.size_bytes / (1024 ** 3))
@@ -2975,6 +2999,7 @@ def _run_move_pass(items: List["Item"], cfg: dict, apply: bool) -> None:
                 src_label, dst_label, annot_sfx,
             )
             n_success += 1
+            moved_bytes += it.size_bytes
             affected_libraries.add(it.library)
 
     total_elapsed = (datetime.now(timezone.utc) - run_start).total_seconds()
@@ -5608,6 +5633,264 @@ def _test_capacity_warm_per_disk_ceiling_blocks_to_warm_when_full():
     print("_test_capacity_warm_per_disk_ceiling_blocks_to_warm_when_full: OK")
 
 
+def _test_run_cap_stops_after_limit():
+    """Two items totalling > cap → first moves, second does not; early-stop log emitted."""
+    rsync_calls = []
+    log_messages = []
+
+    def _fake_run(cmd, **_):
+        if cmd and cmd[0] == "rsync":
+            rsync_calls.append(cmd)
+        class R:
+            returncode = 0
+            stderr = ""
+        return R()
+
+    class _CapturingHandler(logging.Handler):
+        def emit(self, record):
+            log_messages.append(record.getMessage())
+
+    GB = 1024 ** 3
+    # item_a (60 GB) > cap (50 GB): before item_a moved_bytes=0 < 50*GB → proceeds.
+    # After item_a succeeds: moved_bytes=60*GB >= 50*GB → item_b is blocked.
+    item_a = _make_item(
+        kind="movie", library="Movies",
+        current_tier="WARM", current_disk="/mnt/disk1",
+        warm_disk_files={"/mnt/disk1": ["/mnt/disk1/Movies/A.mkv"]},
+        size_bytes=60 * GB,
+    )
+    item_a.outcome = "TO_HOT"
+    item_b = _make_item(
+        kind="movie", library="Movies",
+        current_tier="WARM", current_disk="/mnt/disk1",
+        warm_disk_files={"/mnt/disk1": ["/mnt/disk1/Movies/B.mkv"]},
+        size_bytes=60 * GB,
+    )
+    item_b.outcome = "TO_HOT"
+
+    cfg = {
+        "moves": {
+            "enabled": True, "rsync_options": ["-aH"],
+            "delete_source_after_verify": False, "size_verify": False,
+            "parity_check_blocking": False, "bandwidth_limit_mbps": None,
+            "max_total_move_gb": 50,
+        },
+        "paths": {"hot_pool_mount": "/mnt/zfs_media"},
+    }
+
+    handler = _CapturingHandler()
+    log.addHandler(handler)
+    orig_level = log.level
+    log.setLevel(logging.DEBUG)
+    orig = subprocess.run
+    try:
+        subprocess.run = _fake_run
+        _run_move_pass([item_a, item_b], cfg, apply=True)
+    finally:
+        subprocess.run = orig
+        log.removeHandler(handler)
+        log.setLevel(orig_level)
+
+    # item_a (60 GB) moves; after success moved_bytes=60*GB >= 50*GB cap → item_b blocked.
+    assert len(rsync_calls) == 1, f"expected 1 rsync call, got {len(rsync_calls)}"
+    assert item_a.outcome == "TO_HOT", f"first item outcome should be unchanged, got {item_a.outcome!r}"
+    assert item_b.outcome == "TO_HOT", f"second item outcome should be unchanged, got {item_b.outcome!r}"
+    assert any("Run cap reached" in m for m in log_messages), (
+        f"expected early-stop log line, got: {log_messages}"
+    )
+    print("_test_run_cap_stops_after_limit: OK")
+
+
+def _test_run_cap_zero_disables_cap():
+    """max_total_move_gb: 0 → all items move regardless of total size."""
+    rsync_calls = []
+
+    def _fake_run(cmd, **_):
+        if cmd and cmd[0] == "rsync":
+            rsync_calls.append(cmd)
+        class R:
+            returncode = 0
+            stderr = ""
+        return R()
+
+    GB = 1024 ** 3
+    item_a = _make_item(
+        kind="movie", library="Movies",
+        current_tier="WARM", current_disk="/mnt/disk1",
+        warm_disk_files={"/mnt/disk1": ["/mnt/disk1/Movies/A.mkv"]},
+        size_bytes=500 * GB,
+    )
+    item_a.outcome = "TO_HOT"
+    item_b = _make_item(
+        kind="movie", library="Movies",
+        current_tier="WARM", current_disk="/mnt/disk1",
+        warm_disk_files={"/mnt/disk1": ["/mnt/disk1/Movies/B.mkv"]},
+        size_bytes=500 * GB,
+    )
+    item_b.outcome = "TO_HOT"
+
+    cfg = {
+        "moves": {
+            "enabled": True, "rsync_options": ["-aH"],
+            "delete_source_after_verify": False, "size_verify": False,
+            "parity_check_blocking": False, "bandwidth_limit_mbps": None,
+            "max_total_move_gb": 0,
+        },
+        "paths": {"hot_pool_mount": "/mnt/zfs_media"},
+    }
+
+    orig = subprocess.run
+    try:
+        subprocess.run = _fake_run
+        _run_move_pass([item_a, item_b], cfg, apply=True)
+    finally:
+        subprocess.run = orig
+
+    assert len(rsync_calls) == 2, f"cap=0 must not stop any moves, got {len(rsync_calls)} rsync calls"
+    print("_test_run_cap_zero_disables_cap: OK")
+
+
+def _test_run_cap_counts_successful_moves_only():
+    """A failed move does not count toward the run budget.
+
+    item_a fails size-verify → moved_bytes stays 0.
+    item_b (same size) should still be attempted even though a naive
+    accumulator would think the cap was reached.
+    """
+    import tempfile, os as _os
+
+    GB = 1024 ** 3
+    with tempfile.TemporaryDirectory() as root:
+        disk = _os.path.join(root, "disk1")
+        hot_mount = _os.path.join(root, "zfs_media")
+
+        src_a = _os.path.join(disk, "Movies", "A.mkv")
+        dst_a = _os.path.join(hot_mount, "Movies", "A.mkv")
+        src_b = _os.path.join(disk, "Movies", "B.mkv")
+
+        _os.makedirs(_os.path.dirname(src_a), exist_ok=True)
+        _os.makedirs(_os.path.dirname(dst_a), exist_ok=True)
+        # A: src=1 KB, dst already exists at 5 MB → size mismatch → verify fails
+        with open(src_a, "wb") as f:
+            f.write(b"x" * 1024)
+        with open(dst_a, "wb") as f:
+            f.write(b"y" * (5 * 1024 * 1024))
+        # B: only src, no dst yet
+        with open(src_b, "wb") as f:
+            f.write(b"z" * 1024)
+
+        rsync_calls = []
+
+        def _fake_run(cmd, **_):
+            if cmd and cmd[0] == "rsync":
+                rsync_calls.append(cmd)
+            class R:
+                returncode = 0
+                stderr = ""
+            return R()  # rsync succeeds but dst is already wrong for A
+
+        item_a = _make_item(
+            kind="movie", library="Movies",
+            current_tier="WARM", current_disk=disk,
+            warm_disk_files={disk: [src_a]},
+            size_bytes=60 * GB,
+        )
+        item_a.outcome = "TO_HOT"
+        item_b = _make_item(
+            kind="movie", library="Movies",
+            current_tier="WARM", current_disk=disk,
+            warm_disk_files={disk: [src_b]},
+            size_bytes=60 * GB,
+        )
+        item_b.outcome = "TO_HOT"
+
+        cfg = {
+            "moves": {
+                "enabled": True, "rsync_options": ["-aH"],
+                "delete_source_after_verify": True, "size_verify": True,
+                "parity_check_blocking": False, "bandwidth_limit_mbps": None,
+                "max_total_move_gb": 80,
+            },
+            "paths": {"hot_pool_mount": hot_mount},
+        }
+
+        orig = subprocess.run
+        try:
+            subprocess.run = _fake_run
+            _run_move_pass([item_a, item_b], cfg, apply=True)
+        finally:
+            subprocess.run = orig
+
+        # Both items should have been attempted (2 rsync calls).
+        assert len(rsync_calls) == 2, (
+            f"both items must be attempted when first fails verify, got {len(rsync_calls)} rsync call(s)"
+        )
+    print("_test_run_cap_counts_successful_moves_only: OK")
+
+
+def _test_run_cap_exact_boundary():
+    """Cumulative bytes exactly equal cap after first item → second item still attempted.
+
+    Cap is >=: the item that brings the total exactly to the cap is moved;
+    only the *next* item is blocked.
+    """
+    rsync_calls = []
+
+    def _fake_run(cmd, **_):
+        if cmd and cmd[0] == "rsync":
+            rsync_calls.append(cmd)
+        class R:
+            returncode = 0
+            stderr = ""
+        return R()
+
+    GB = 1024 ** 3
+    # Each item is exactly 50 GB; cap is 50 GB.
+    # After item_a succeeds: moved_bytes == 50 GB == cap_bytes → item_b check: 50 >= 50 → blocked.
+    # Wait — that means item_b IS blocked. But spec says "cap is >=: item that crosses threshold
+    # is still attempted; next item is blocked." So item at exactly cap is moved, next is not.
+    # With moved_bytes starting at 0: before item_a, 0 >= 50*GB? No → item_a moves.
+    # After item_a succeeds: moved_bytes = 50*GB. Before item_b: 50*GB >= 50*GB → blocked.
+    # So item_b should NOT be rsynced. That is the correct ">=" boundary behaviour.
+    item_a = _make_item(
+        kind="movie", library="Movies",
+        current_tier="WARM", current_disk="/mnt/disk1",
+        warm_disk_files={"/mnt/disk1": ["/mnt/disk1/Movies/A.mkv"]},
+        size_bytes=50 * GB,
+    )
+    item_a.outcome = "TO_HOT"
+    item_b = _make_item(
+        kind="movie", library="Movies",
+        current_tier="WARM", current_disk="/mnt/disk1",
+        warm_disk_files={"/mnt/disk1": ["/mnt/disk1/Movies/B.mkv"]},
+        size_bytes=50 * GB,
+    )
+    item_b.outcome = "TO_HOT"
+
+    cfg = {
+        "moves": {
+            "enabled": True, "rsync_options": ["-aH"],
+            "delete_source_after_verify": False, "size_verify": False,
+            "parity_check_blocking": False, "bandwidth_limit_mbps": None,
+            "max_total_move_gb": 50,
+        },
+        "paths": {"hot_pool_mount": "/mnt/zfs_media"},
+    }
+
+    orig = subprocess.run
+    try:
+        subprocess.run = _fake_run
+        _run_move_pass([item_a, item_b], cfg, apply=True)
+    finally:
+        subprocess.run = orig
+
+    # item_a (50 GB) moves; after success moved_bytes=50 GB == cap → item_b is blocked.
+    assert len(rsync_calls) == 1, (
+        f"expected item_a to move and item_b to be blocked at exact boundary, got {len(rsync_calls)} rsync call(s)"
+    )
+    print("_test_run_cap_exact_boundary: OK")
+
+
 if __name__ == "__main__":
     if "--_test" in sys.argv:
         _test_resolve_user_share()
@@ -5679,5 +5962,9 @@ if __name__ == "__main__":
         _test_capacity_no_demote_flag_blocks_to_warm()
         _test_capacity_safety_margin_respected()
         _test_capacity_warm_per_disk_ceiling_blocks_to_warm_when_full()
+        _test_run_cap_stops_after_limit()
+        _test_run_cap_zero_disables_cap()
+        _test_run_cap_counts_successful_moves_only()
+        _test_run_cap_exact_boundary()
         sys.exit(0)
     sys.exit(main())

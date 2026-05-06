@@ -28,7 +28,8 @@ execute; default is dry-run.
 | P2.3 | RELOCATE_WARM moves — drain evicting warm disks to healthy warm disks. Evicting disk excluded from candidates. | **Done** |
 | P2.4 | Plex rescan automation — **intentionally not implemented**. Unraid's user-share union means Plex always reads through `/mnt/user/` regardless of which physical disk backs a file; TO_WARM and RELOCATE_WARM moves are invisible to Plex at the path level. Only TO_HOT (which moves files off the union to a separate ZFS mount) recommends a rescan. | N/A |
 | P3 | Capacity-aware tiering — hot pool fill ceiling, promotion budget, `OVER_BUDGET_HOT` outcome, optional auto-demote of lowest-scoring HOT items, warm per-disk ceiling, `--no-promote` / `--no-demote` flags. | **Done** |
-| P4 | Scheduled cron + size-triggered wrapper. | Pending |
+| P3.5 | Move hardening — run-level I/O budget (`max_total_move_gb`). | **Done** |
+| P4 | Scheduling primitives — lock file, structured exit codes, cron docs. | Pending |
 
 ## Install
 
@@ -854,6 +855,35 @@ Capacity: demoted 12 items (520 GB) to TO_WARM to bring pool to 79.6%
 Both flags are one-shot per-run overrides. They don't change `tiering.yaml`.
 Each is logged explicitly so dry-run output is unambiguous about why items are
 deferred or not demoted.
+
+## Move hardening (P3.5)
+
+### Run-level I/O budget
+
+`moves.max_total_move_gb` limits how much data the move pass transfers in
+a single run. Once that many GB have been **successfully** moved the pass
+stops; remaining items keep their scoring outcomes and are reconsidered on
+the next run. The default is `0` (disabled — no limit).
+
+```yaml
+moves:
+  max_total_move_gb: 200   # stop after 200 GB transferred
+```
+
+**When to use it.** On slow spinning-disk arrays a full move pass can run
+for hours. Setting a budget keeps each run under a predictable time window
+(e.g. an overnight cron job) while still making progress each day.
+
+**Cap is `>=`, not `>`.** The item whose transfer brings the cumulative
+total exactly to the cap is still attempted; the *next* item is the first
+one stopped. Only successfully verified moves count toward the budget — a
+failed move does not consume budget, so the following item is not
+incorrectly blocked.
+
+**Distinct from P3's pool-ceiling cap.** `capacity.hot_ceiling_percent`
+is a correctness guard — it prevents overfilling the ZFS pool. `max_total_move_gb`
+is a run-duration guard — it has no bearing on pool fill level. Both can
+be active simultaneously.
 
 ## Tuning
 

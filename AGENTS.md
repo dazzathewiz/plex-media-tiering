@@ -50,7 +50,8 @@ CLAUDE.md and GEMINI.md are symlinks to this file.
 | P2.3 | RELOCATE_WARM moves — drain evicting warm disks to healthy warm disks; source disk excluded from candidates | Done |
 | P2.4 | Plex rescan automation — dropped (Unraid user-share union makes it unnecessary for in-union moves) | N/A |
 | P3   | Capacity-aware tiering — hot pool ceiling + promotion budget (OVER_BUDGET_HOT), optional auto-demote, warm per-disk ceiling, --no-promote / --no-demote | Done |
-| P4   | Scheduled cron + size-triggered wrapper | Pending |
+| P3.5 | Move hardening — run-level I/O budget (max_total_move_gb) | Done |
+| P4   | Scheduling primitives — lock file, structured exit codes, cron docs | Pending |
 
 ## Non-obvious design decisions
 
@@ -788,9 +789,45 @@ that path is a separate read-write mount.
 
 `--apply` executes TO_HOT, TO_WARM, and RELOCATE_WARM moves when
 `moves.enabled: true`. All three directions are serialised in a single
-pass. The full P3 safety guards (currently-playing skip, free-space check,
-move-size cap, lock file) are still pending — don't add them piecemeal
-without the full P3 spec.
+pass. The lock file (P4) is not yet implemented — concurrent runs are
+not prevented.
+
+### `max_total_move_gb` is a run-time budget, not a correctness guard
+
+P3's pool-ceiling budget (`OVER_BUDGET_HOT`) is a correctness constraint —
+don't fill the ZFS pool past its ceiling. `max_total_move_gb` is
+orthogonal: it lets operators cap how much I/O a single run performs,
+useful when scheduling runs during active hours or on slow array disks.
+Items not reached before the cap are not marked with any special outcome —
+they simply weren't processed this run and will be reconsidered next time.
+Default is 0 (no limit).
+
+A per-item size cap (`max_single_move_gb`) was considered and rejected:
+skipping an item because it is large is arbitrary when the pool-fill case
+is already covered by `OVER_BUDGET_HOT`. The run-level budget is the
+useful version of the idea.
+
+### Why there is no currently-playing skip
+
+The intuitive "don't move a file Plex is reading" guard was considered and
+rejected for three reasons:
+
+**Unix semantics make it unnecessary.** rsync copies then deletes the source.
+If Plex holds an open file descriptor at delete time, the inode reference count
+keeps the data alive until Plex closes the FD — the stream completes cleanly.
+Media files are never written during playback, so the size-verify step is
+unaffected.
+
+**The session list is stale by design.** A single fetch at run start is
+meaningless for a batch that can take tens of minutes; per-item fetching adds
+Plex API calls for zero correctness gain.
+
+**It inverts the intent for binge sessions.** If a user starts watching a WARM
+series, every run during the binge would skip it — the item never reaches HOT
+during the window it most deserves promotion. The right response to "someone just
+started watching a WARM show" is fast promotion, not deferral. That capability
+belongs in a daily promote-only cadence with a configurable minimum-episode
+threshold, not in a move-time skip.
 
 ### Notifiers must not raise
 
