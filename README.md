@@ -29,7 +29,7 @@ execute; default is dry-run.
 | P2.4 | Plex rescan automation — **intentionally not implemented**. Unraid's user-share union means Plex always reads through `/mnt/user/` regardless of which physical disk backs a file; TO_WARM and RELOCATE_WARM moves are invisible to Plex at the path level. Only TO_HOT (which moves files off the union to a separate ZFS mount) recommends a rescan. | N/A |
 | P3 | Capacity-aware tiering — hot pool fill ceiling, promotion budget, `OVER_BUDGET_HOT` outcome, optional auto-demote of lowest-scoring HOT items, warm per-disk ceiling, `--no-promote` / `--no-demote` flags. | **Done** |
 | P3.5 | Move hardening — run-level I/O budget (`max_total_move_gb`). | **Done** |
-| P4 | Scheduling primitives — lock file, structured exit codes, cron docs. | Pending |
+| P4.1 | Scheduling primitives — single-instance lock with stale-PID reclaim, `last_run.json` state file, `skip_if_run_within_minutes` recency guard, formalised exit-code contract. | **Done** |
 
 ## Install
 
@@ -950,15 +950,48 @@ All thresholds live in `tiering.yaml`. After the first few runs, look for:
 Use `--explain TITLE` to see the scoring math for any single item. Pinned and
 recency-floor promotions appear under the `override` key in the breakdown.
 
+## Scheduling (P4.1)
+
+tier.py is safe to run from cron or any scheduler. It acquires a
+single-instance lock (`/config/state/tier.lock`) at startup — if another
+instance is running the new invocation exits immediately with code 5
+(`LOCK_HELD`) without touching Plex or moving anything. A crashed run's
+stale lock is reclaimed automatically by checking whether the recorded PID
+is still alive.
+
+After every completed run (success or crash), a run-state file
+`/config/state/last_run.json` is written with timing, exit code, and move
+counters. The `skip_if_run_within_minutes` config knob reads this file and
+exits with code 6 (`SKIPPED_RECENT`) if the previous run finished recently
+— useful when a monthly cron and a manual trigger can fire in the same hour.
+
+```yaml
+scheduling:
+  skip_if_run_within_minutes: 0   # 0 = disabled
+```
+
+Both `LOCK_HELD` and `SKIPPED_RECENT` are **expected** scheduler outcomes.
+Seeing them in cron mail does not indicate a failure and does not trigger
+the error notifier.
+
+### Cron example
+
+```
+# Monthly full run, 03:00 on the 1st — offset from Unraid parity check
+0 3 1 * * docker start -a tier
+```
+
 ## Exit codes
 
-| Code | Meaning |
-|---|---|
-| 0 | Success |
-| 1 | Config error (file missing, token placeholder, empty libraries) |
-| 2 | Plex unreachable or auth failed |
-| 4 | Unhandled runtime error (notification fired if configured) |
-| 130 | Interrupted (SIGINT) |
+| Code | Meaning | Error? |
+| --- | --- | --- |
+| 0 | Success | No |
+| 1 | Config error (file missing, token placeholder, empty libraries) | Yes |
+| 2 | Plex unreachable or auth failed | Yes |
+| 4 | Unhandled runtime error (notification fired if configured) | Yes |
+| 5 | Lock held — another tier.py instance is running | No |
+| 6 | Skipped — previous run finished within `skip_if_run_within_minutes` | No |
+| 130 | Interrupted (SIGINT) | No |
 
 ## Repo layout (when published)
 

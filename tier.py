@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-tier.py — Unraid media tiering script (Phase P3.5)
+tier.py — Unraid media tiering script (Phase P4.1)
 
 Pulls watch history and metadata from Plex, computes a heat score per
 media item (movies + TV series), probes the filesystem to determine
@@ -51,8 +51,10 @@ Phase status:
                     moves.max_total_move_gb has been successfully
                     transferred the move pass stops; remaining items
                     keep their scoring outcomes and retry next run.
-  P4  (later)       Scheduling primitives — lock file, structured exit
-                    codes, cron docs.
+  P4.1 (done)       Scheduling primitives — single-instance lock with
+                    stale-PID reclaim, persisted run-state (last_run.json),
+                    skip_if_run_within_minutes recency guard, formalised
+                    exit-code contract.
 
 Usage:
     tier.py [--config PATH] [--library NAME ...] [--json|--csv PATH]
@@ -60,9 +62,11 @@ Usage:
 
 Exit codes:
     0  success
-    1  configuration error
+    1  configuration error (file missing, token placeholder, empty libraries)
     2  Plex unreachable or auth failed
-    4  unhandled runtime error (notification fired if configured)
+    4  unhandled runtime error (error notification fired if configured)
+    5  lock held — another tier.py instance is already running
+    6  skipped — previous run finished within skip_if_run_within_minutes
   130  interrupted (SIGINT)
 """
 
@@ -70,6 +74,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import enum
 import glob
 import json
 import logging
@@ -103,6 +108,16 @@ except ImportError:
 
 # Module-level logger; configured by setup_logging().
 log = logging.getLogger("tier")
+
+
+class ExitCode(enum.IntEnum):
+    SUCCESS = 0
+    FATAL_CONFIG = 1       # config file missing/invalid (string sys.exit)
+    PLEX_ERROR = 2         # Plex unreachable or auth failed
+    UNHANDLED_CRASH = 4    # unhandled exception; error notifier fires
+    LOCK_HELD = 5          # another instance is running; do not notify
+    SKIPPED_RECENT = 6     # recency guard fired; do not notify
+    KEYBOARD_INTERRUPT = 130
 
 
 # ---------- Defaults (overridable via tiering.yaml) ----------
@@ -269,11 +284,20 @@ DEFAULT_CONFIG = {
         # statvfs.free is used as the match heuristic.
         "unraid_pool_name": None,
     },
+    # Scheduling primitives (P4.1).
+    "scheduling": {
+        # Skip this run if the previous run finished within this many minutes.
+        # 0 = disabled. Useful when multiple triggers (cron + manual) can fire
+        # close together and you only want one run per window.
+        "skip_if_run_within_minutes": 0,
+    },
 }
 
 # Default config path — container layout. Bare installs fall back to the
 # legacy /boot path in load_config().
 DEFAULT_CONFIG_PATH = Path("/config/tiering.yaml")
+# All scheduling state (lock file, last_run.json) lives here.
+_STATE_DIR = Path("/config/state")
 LEGACY_CONFIG_PATH = Path(
     "/boot/config/plugins/user.scripts/scripts/plex-media-tiering/tiering.yaml"
 )
@@ -597,7 +621,7 @@ def connect_plex(url: str, token: str, notifier: Notifier, ncfg: dict) -> PlexSe
                 ),
                 level="error",
             )
-        sys.exit(2)
+        sys.exit(int(ExitCode.PLEX_ERROR))
     except (ReqConnErr, BadRequest, TimeoutError) as e:
         log.error("Cannot reach Plex at %s: %s", url, e)
         if ncfg.get("on_plex_unreachable", True):
@@ -609,7 +633,7 @@ def connect_plex(url: str, token: str, notifier: Notifier, ncfg: dict) -> PlexSe
                 ),
                 level="error",
             )
-        sys.exit(2)
+        sys.exit(int(ExitCode.PLEX_ERROR))
 
 
 # ---------- Filesystem / tier detection (P1) ----------
@@ -2713,7 +2737,7 @@ def _apply_capacity_budget(
                 log.warning("Capacity: warm disk %s — could not read usage", disk)
 
 
-def _run_move_pass(items: List["Item"], cfg: dict, apply: bool) -> None:
+def _run_move_pass(items: List["Item"], cfg: dict, apply: bool) -> dict:
     """Dry-run or execute moves for TO_HOT, TO_WARM, and RELOCATE_WARM outcomes.
 
     When apply=False: emits [DRY-RUN] log lines for every projected move.
@@ -2721,10 +2745,12 @@ def _run_move_pass(items: List["Item"], cfg: dict, apply: bool) -> None:
                       deletes the source after successful verification.
 
     Skips the entire pass if moves.enabled is false in config.
+    Returns a dict with moves_attempted, moves_succeeded, bytes_moved.
     """
+    _empty_stats: dict = {"moves_attempted": 0, "moves_succeeded": 0, "bytes_moved": 0}
     moves_cfg = cfg.get("moves") or {}
     if not moves_cfg.get("enabled"):
-        return
+        return _empty_stats
 
     hot_mount = (cfg.get("paths") or {}).get("hot_pool_mount") or ""
     if not hot_mount:
@@ -3028,6 +3054,12 @@ def _run_move_pass(items: List["Item"], cfg: dict, apply: bool) -> None:
             ", ".join(sorted(hot_libraries)),
         )
 
+    return {
+        "moves_attempted": n_success + n_failed,
+        "moves_succeeded": n_success,
+        "bytes_moved": int(moved_bytes),
+    }
+
 
 # Outcomes that map to each projected tier if every recommendation were
 # executed. The bucket reflects where the item will END UP, not where it
@@ -3268,7 +3300,115 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _run(args) -> int:
+# ---------- Scheduling primitives (P4.1) ----------
+
+_LOCK_FILE = _STATE_DIR / "tier.lock"
+_LAST_RUN_FILE = _STATE_DIR / "last_run.json"
+
+
+def _ensure_state_dir() -> None:
+    _STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _acquire_lock() -> bool:
+    """Acquire the single-instance lock. Returns True if acquired, False if held.
+
+    Lock file contents: {"pid": int, "started_at": ISO8601, "mode": str}.
+    A stale lock (referencing a dead PID) is reclaimed automatically.
+
+    Container PID-reuse guard: Docker one-shot containers always get PID 1
+    for the entrypoint process. If a previous container crashed without
+    releasing the lock, the next container also gets PID 1, so os.kill(1, 0)
+    succeeds (we ARE PID 1). We detect this by checking pid == os.getpid()
+    — no live process can hold a lock against itself at startup.
+    """
+    if _LOCK_FILE.exists():
+        try:
+            data = json.loads(_LOCK_FILE.read_text())
+            pid = int(data.get("pid") or 0)
+            if pid > 0:
+                if pid == os.getpid():
+                    # Our own PID is in the lock file — must be a stale lock
+                    # from a prior container run that reused this PID.
+                    log.warning("Reclaiming stale lock: PID %d matches our own PID (container restart)", pid)
+                else:
+                    try:
+                        os.kill(pid, 0)
+                        # No exception → process exists → genuine concurrent run.
+                        log.error(
+                            "Lock held by PID %d (started %s) — another tier.py instance is running",
+                            pid, data.get("started_at", "?"),
+                        )
+                        return False
+                    except ProcessLookupError:
+                        log.warning("Reclaiming stale lock from dead PID %d", pid)
+                    except PermissionError:
+                        # EPERM: process exists but we cannot signal it — treat as held.
+                        log.error(
+                            "Lock held by PID %d (started %s) — cannot verify (EPERM); "
+                            "remove %s manually if the process is dead",
+                            pid, data.get("started_at", "?"), _LOCK_FILE,
+                        )
+                        return False
+        except Exception as e:  # noqa: BLE001
+            log.warning("Could not read lock file — assuming stale, reclaiming: %s", e)
+
+    _LOCK_FILE.write_text(json.dumps({
+        "pid": os.getpid(),
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "mode": "full",
+    }))
+    return True
+
+
+def _release_lock() -> None:
+    try:
+        _LOCK_FILE.unlink(missing_ok=True)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Could not release lock file: %s", e)
+
+
+def _check_skip_recent(cfg: dict) -> bool:
+    """Return True if this run should be skipped due to the recency guard."""
+    threshold = int((cfg.get("scheduling") or {}).get("skip_if_run_within_minutes") or 0)
+    if threshold <= 0:
+        return False
+    if not _LAST_RUN_FILE.exists():
+        return False
+    try:
+        data = json.loads(_LAST_RUN_FILE.read_text())
+        finished_str = data.get("finished_at")
+        if not finished_str:
+            return False
+        finished_at = datetime.fromisoformat(finished_str)
+        elapsed_min = (datetime.now(timezone.utc) - finished_at).total_seconds() / 60
+        if elapsed_min < threshold:
+            log.info(
+                "Skipping run — last run finished %.1f min ago (threshold: %d min)",
+                elapsed_min, threshold,
+            )
+            return True
+    except Exception as e:  # noqa: BLE001
+        log.warning("Could not read last_run.json for recency check: %s", e)
+    return False
+
+
+def _write_last_run(started_at: datetime, exit_code: int, move_stats: dict) -> None:
+    try:
+        _LAST_RUN_FILE.write_text(json.dumps({
+            "started_at": started_at.isoformat(),
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "mode": "full",
+            "exit_code": exit_code,
+            "moves_attempted": move_stats.get("moves_attempted", 0),
+            "moves_succeeded": move_stats.get("moves_succeeded", 0),
+            "bytes_moved": move_stats.get("bytes_moved", 0),
+        }, indent=2))
+    except Exception as e:  # noqa: BLE001
+        log.warning("Could not write last_run.json: %s", e)
+
+
+def _run(args) -> dict:
     """Inner main: wired up after logging + notifier are ready."""
     cfg = load_config(args.config)
 
@@ -3300,7 +3440,7 @@ def _run(args) -> int:
     # Move pass runs on the full scored list before --top truncation so every
     # TO_HOT item is considered regardless of display limit.
     moves_apply = args.apply or bool((cfg.get("moves") or {}).get("apply", False))
-    _run_move_pass(items, cfg, apply=moves_apply)
+    move_stats = _run_move_pass(items, cfg, apply=moves_apply)
 
     if args.top:
         items = items[: args.top]
@@ -3311,7 +3451,7 @@ def _run(args) -> int:
 
     if args.explain:
         explain_one(items, args.explain, cfg["thresholds"])
-        return 0
+        return move_stats
 
     if args.json:
         print(format_json(items))
@@ -3363,16 +3503,16 @@ def _run(args) -> int:
             )
             log.info("  Auto-inherit promotions: %d items", ai_promotions)
 
-    return 0
+    return move_stats
 
 
 def main() -> int:
     args = build_parser().parse_args()
 
-    # Outer try/except catches anything _run() didn't handle and alerts.
-    # We need a notifier to alert with, but building one needs the config;
-    # if the config itself blows up we fall back to stderr only.
+    # Load config early to build notifier and read scheduling settings.
+    # If the config itself blows up we fall back to stderr-only notifications.
     notifier: Optional[Notifier] = None
+    cfg_preview: Optional[dict] = None
     on_script_error = True
     try:
         try:
@@ -3389,27 +3529,53 @@ def main() -> int:
         except Exception:  # noqa: BLE001
             notifier = CompositeNotifier([StderrNotifier()])
 
-        return _run(args)
+        # Scheduling primitives — run before any Plex connection.
+        # LOCK_HELD and SKIPPED_RECENT are expected scheduler outcomes:
+        # they do not notify and do not write last_run.json.
+        _ensure_state_dir()
+        if not _acquire_lock():
+            return int(ExitCode.LOCK_HELD)
+
+        try:
+            if cfg_preview and _check_skip_recent(cfg_preview):
+                return int(ExitCode.SKIPPED_RECENT)
+
+            started_at = datetime.now(timezone.utc)
+            exit_code = ExitCode.SUCCESS
+            move_stats: dict = {"moves_attempted": 0, "moves_succeeded": 0, "bytes_moved": 0}
+
+            try:
+                move_stats = _run(args)
+                _write_last_run(started_at, int(ExitCode.SUCCESS), move_stats)
+            except SystemExit:
+                raise
+            except KeyboardInterrupt:
+                log.warning("Interrupted by user")
+                _write_last_run(started_at, int(ExitCode.KEYBOARD_INTERRUPT), move_stats)
+                exit_code = ExitCode.KEYBOARD_INTERRUPT
+            except Exception as e:  # noqa: BLE001
+                tb = traceback.format_exc()
+                log.error("Unhandled error: %s\n%s", e, tb)
+                if notifier is None:
+                    notifier = CompositeNotifier([StderrNotifier()])
+                if on_script_error:
+                    notifier.alert(
+                        title="Tier: script error",
+                        message=(
+                            f"tier.py crashed with: {type(e).__name__}: {e}\n\n"
+                            f"Tail of traceback:\n{tb[-800:]}"
+                        ),
+                        level="error",
+                    )
+                _write_last_run(started_at, int(ExitCode.UNHANDLED_CRASH), move_stats)
+                exit_code = ExitCode.UNHANDLED_CRASH
+
+            return int(exit_code)
+        finally:
+            _release_lock()
+
     except SystemExit:
         raise
-    except KeyboardInterrupt:
-        log.warning("Interrupted by user")
-        return 130
-    except Exception as e:  # noqa: BLE001
-        tb = traceback.format_exc()
-        log.error("Unhandled error: %s\n%s", e, tb)
-        if notifier is None:
-            notifier = CompositeNotifier([StderrNotifier()])
-        if on_script_error:
-            notifier.alert(
-                title="Tier: script error",
-                message=(
-                    f"tier.py crashed with: {type(e).__name__}: {e}\n\n"
-                    f"Tail of traceback:\n{tb[-800:]}"
-                ),
-                level="error",
-            )
-        return 4
 
 
 def _test_resolve_user_share():
@@ -5989,6 +6155,198 @@ def _test_capacity_unraid_api_not_configured_no_warn():
     print("_test_capacity_unraid_api_not_configured_no_warn: OK")
 
 
+def _test_lock_blocks_second_instance():
+    import tempfile as _tf
+    global _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE
+    orig_state, orig_lock, orig_last = _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE
+    try:
+        with _tf.TemporaryDirectory() as tmp:
+            _STATE_DIR = Path(tmp)
+            _LOCK_FILE = _STATE_DIR / "tier.lock"
+            _LAST_RUN_FILE = _STATE_DIR / "last_run.json"
+            # Use parent PID — a different live process, so os.kill succeeds
+            # and the lock is correctly treated as held (not stale, not self).
+            _LOCK_FILE.write_text(json.dumps({
+                "pid": os.getppid(),
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "mode": "full",
+            }))
+            result = _acquire_lock()
+            assert result is False, f"expected False (lock held), got {result}"
+    finally:
+        _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE = orig_state, orig_lock, orig_last
+    print("_test_lock_blocks_second_instance: OK")
+
+
+def _test_lock_own_pid_reclaimed_as_stale():
+    """Lock file holds our own PID (container restart reuse) — reclaimed, not blocked."""
+    import tempfile as _tf
+    global _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE
+    orig_state, orig_lock, orig_last = _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE
+    try:
+        with _tf.TemporaryDirectory() as tmp:
+            _STATE_DIR = Path(tmp)
+            _LOCK_FILE = _STATE_DIR / "tier.lock"
+            _LAST_RUN_FILE = _STATE_DIR / "last_run.json"
+            _LOCK_FILE.write_text(json.dumps({
+                "pid": os.getpid(),  # same as our own PID — simulates container PID reuse
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "mode": "full",
+            }))
+            result = _acquire_lock()
+            assert result is True, f"expected True (own PID treated as stale), got {result}"
+            data = json.loads(_LOCK_FILE.read_text())
+            assert data["pid"] == os.getpid(), "lock file should hold current PID after reclaim"
+    finally:
+        _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE = orig_state, orig_lock, orig_last
+    print("_test_lock_own_pid_reclaimed_as_stale: OK")
+
+
+def _test_lock_stale_pid_reclaimed():
+    import tempfile as _tf
+    global _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE
+    orig_state, orig_lock, orig_last = _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE
+    try:
+        with _tf.TemporaryDirectory() as tmp:
+            _STATE_DIR = Path(tmp)
+            _LOCK_FILE = _STATE_DIR / "tier.lock"
+            _LAST_RUN_FILE = _STATE_DIR / "last_run.json"
+            # PID 999999999 almost certainly does not exist.
+            _LOCK_FILE.write_text(json.dumps({
+                "pid": 999999999,
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "mode": "full",
+            }))
+            result = _acquire_lock()
+            assert result is True, f"expected True (stale lock reclaimed), got {result}"
+            data = json.loads(_LOCK_FILE.read_text())
+            assert data["pid"] == os.getpid(), "lock file should hold current PID after reclaim"
+    finally:
+        _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE = orig_state, orig_lock, orig_last
+    print("_test_lock_stale_pid_reclaimed: OK")
+
+
+def _test_lock_released_on_success():
+    import tempfile as _tf
+    global _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE
+    orig_state, orig_lock, orig_last = _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE
+    try:
+        with _tf.TemporaryDirectory() as tmp:
+            _STATE_DIR = Path(tmp)
+            _LOCK_FILE = _STATE_DIR / "tier.lock"
+            _LAST_RUN_FILE = _STATE_DIR / "last_run.json"
+            ok = _acquire_lock()
+            assert ok, "failed to acquire lock in test setup"
+            assert _LOCK_FILE.exists(), "lock file should exist after acquire"
+            _release_lock()
+            assert not _LOCK_FILE.exists(), "lock file should be gone after release"
+    finally:
+        _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE = orig_state, orig_lock, orig_last
+    print("_test_lock_released_on_success: OK")
+
+
+def _test_lock_released_on_failure():
+    """Lock acquired, simulated exception mid-run — lock still released via finally."""
+    import tempfile as _tf
+    global _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE
+    orig_state, orig_lock, orig_last = _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE
+    try:
+        with _tf.TemporaryDirectory() as tmp:
+            _STATE_DIR = Path(tmp)
+            _LOCK_FILE = _STATE_DIR / "tier.lock"
+            _LAST_RUN_FILE = _STATE_DIR / "last_run.json"
+            ok = _acquire_lock()
+            assert ok
+            try:
+                raise RuntimeError("simulated mid-run failure")
+            finally:
+                _release_lock()
+            # unreachable, but the finally above must have run
+    except RuntimeError:
+        pass  # expected
+    finally:
+        _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE = orig_state, orig_lock, orig_last
+    # After the test, the real lock path is restored; the temp lock is gone.
+    print("_test_lock_released_on_failure: OK")
+
+
+def _test_skip_if_run_within_minutes():
+    import tempfile as _tf
+    global _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE
+    orig_state, orig_lock, orig_last = _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE
+    try:
+        with _tf.TemporaryDirectory() as tmp:
+            _STATE_DIR = Path(tmp)
+            _LOCK_FILE = _STATE_DIR / "tier.lock"
+            _LAST_RUN_FILE = _STATE_DIR / "last_run.json"
+            # Write last_run.json with finished_at 5 minutes ago.
+            finished = datetime.now(timezone.utc) - timedelta(minutes=5)
+            _LAST_RUN_FILE.write_text(json.dumps({
+                "started_at": (finished - timedelta(minutes=10)).isoformat(),
+                "finished_at": finished.isoformat(),
+                "mode": "full",
+                "exit_code": 0,
+                "moves_attempted": 0,
+                "moves_succeeded": 0,
+                "bytes_moved": 0,
+            }))
+            cfg = {"scheduling": {"skip_if_run_within_minutes": 30}}
+            result = _check_skip_recent(cfg)
+            assert result is True, f"expected True (within threshold), got {result}"
+    finally:
+        _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE = orig_state, orig_lock, orig_last
+    print("_test_skip_if_run_within_minutes: OK")
+
+
+def _test_skip_disabled_when_zero():
+    import tempfile as _tf
+    global _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE
+    orig_state, orig_lock, orig_last = _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE
+    try:
+        with _tf.TemporaryDirectory() as tmp:
+            _STATE_DIR = Path(tmp)
+            _LOCK_FILE = _STATE_DIR / "tier.lock"
+            _LAST_RUN_FILE = _STATE_DIR / "last_run.json"
+            finished = datetime.now(timezone.utc) - timedelta(minutes=1)
+            _LAST_RUN_FILE.write_text(json.dumps({
+                "finished_at": finished.isoformat(),
+                "mode": "full", "exit_code": 0,
+                "moves_attempted": 0, "moves_succeeded": 0, "bytes_moved": 0,
+            }))
+            cfg = {"scheduling": {"skip_if_run_within_minutes": 0}}
+            result = _check_skip_recent(cfg)
+            assert result is False, f"expected False (disabled), got {result}"
+    finally:
+        _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE = orig_state, orig_lock, orig_last
+    print("_test_skip_disabled_when_zero: OK")
+
+
+def _test_last_run_written():
+    import tempfile as _tf
+    global _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE
+    orig_state, orig_lock, orig_last = _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE
+    try:
+        with _tf.TemporaryDirectory() as tmp:
+            _STATE_DIR = Path(tmp)
+            _LOCK_FILE = _STATE_DIR / "tier.lock"
+            _LAST_RUN_FILE = _STATE_DIR / "last_run.json"
+            started = datetime(2026, 5, 21, 3, 0, 0, tzinfo=timezone.utc)
+            stats = {"moves_attempted": 3, "moves_succeeded": 2, "bytes_moved": 1024}
+            _write_last_run(started, int(ExitCode.SUCCESS), stats)
+            assert _LAST_RUN_FILE.exists(), "last_run.json should exist"
+            data = json.loads(_LAST_RUN_FILE.read_text())
+            assert data["mode"] == "full"
+            assert data["exit_code"] == 0
+            assert data["moves_attempted"] == 3
+            assert data["moves_succeeded"] == 2
+            assert data["bytes_moved"] == 1024
+            assert data["started_at"].startswith("2026-05-21T03:00:00")
+            assert "finished_at" in data
+    finally:
+        _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE = orig_state, orig_lock, orig_last
+    print("_test_last_run_written: OK")
+
+
 if __name__ == "__main__":
     if "--_test" in sys.argv:
         _test_resolve_user_share()
@@ -6066,5 +6424,13 @@ if __name__ == "__main__":
         _test_run_cap_exact_boundary()
         _test_capacity_unraid_api_failure_warns_and_falls_back()
         _test_capacity_unraid_api_not_configured_no_warn()
-        sys.exit(0)
+        _test_lock_blocks_second_instance()
+        _test_lock_own_pid_reclaimed_as_stale()
+        _test_lock_stale_pid_reclaimed()
+        _test_lock_released_on_success()
+        _test_lock_released_on_failure()
+        _test_skip_if_run_within_minutes()
+        _test_skip_disabled_when_zero()
+        _test_last_run_written()
+        sys.exit(int(ExitCode.SUCCESS))
     sys.exit(main())

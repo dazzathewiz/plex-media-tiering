@@ -51,7 +51,7 @@ CLAUDE.md and GEMINI.md are symlinks to this file.
 | P2.4 | Plex rescan automation — dropped (Unraid user-share union makes it unnecessary for in-union moves) | N/A |
 | P3   | Capacity-aware tiering — hot pool ceiling + promotion budget (OVER_BUDGET_HOT), optional auto-demote, warm per-disk ceiling, --no-promote / --no-demote | Done |
 | P3.5 | Move hardening — run-level I/O budget (max_total_move_gb) | Done |
-| P4   | Scheduling primitives — lock file, structured exit codes, cron docs | Pending |
+| P4.1 | Scheduling primitives — single-instance lock, run-state file, skip_if_run_within_minutes, exit-code contract | Done |
 
 ## Non-obvious design decisions
 
@@ -797,8 +797,7 @@ that path is a separate read-write mount.
 
 `--apply` executes TO_HOT, TO_WARM, and RELOCATE_WARM moves when
 `moves.enabled: true`. All three directions are serialised in a single
-pass. The lock file (P4) is not yet implemented — concurrent runs are
-not prevented.
+pass.
 
 ### `max_total_move_gb` is a run-time budget, not a correctness guard
 
@@ -814,6 +813,52 @@ A per-item size cap (`max_single_move_gb`) was considered and rejected:
 skipping an item because it is large is arbitrary when the pool-fill case
 is already covered by `OVER_BUDGET_HOT`. The run-level budget is the
 useful version of the idea.
+
+### Scheduling model (P4.1)
+
+All scheduling state lives in `/config/state/` (created automatically on
+first run). Two files are written there:
+
++ `tier.lock` — single-instance lock. Acquired before any Plex connection;
+  released in a `finally` block on every exit path (success, crash, or
+  SIGINT). A hard crash is covered by stale-PID reclaim on the next run.
++ `last_run.json` — persisted after every run that actually executes (not
+  `LOCK_HELD` or `SKIPPED_RECENT`). Contains `started_at`, `finished_at`,
+  `mode`, `exit_code`, and move counters.
+
+**Lock stale-PID reclaim.** On startup, if the lock file exists, we read its
+PID and call `os.kill(pid, 0)`. `ProcessLookupError` (ESRCH) means the
+process is dead — reclaim the lock and continue. `PermissionError` (EPERM)
+means the process IS alive but we cannot signal it — treat as held and exit.
+No exception means the process is alive and is not us — genuine concurrent run.
+
+**Container PID-reuse guard.** Docker one-shot containers start the
+entrypoint as PID 1. If a container crashes without releasing the lock, the
+next container also gets PID 1, so `os.kill(1, 0)` would succeed (we ARE
+PID 1) and we would falsely report `LOCK_HELD`. Guard: if `pid == os.getpid()`,
+the lock is from a prior run that reused our PID — reclaim it unconditionally.
+No live process can hold a lock against itself at startup.
+
+**`LOCK_HELD` and `SKIPPED_RECENT` are expected scheduler outcomes, not errors.**
+They deliberately do not fire the error notifier and do not write `last_run.json`.
+A cron operator seeing code 5 or 6 in mail should not investigate — it is normal.
+
+**Exit code 4 (`UNHANDLED_CRASH`) was not reused for `LOCK_HELD`.** A
+scheduler must be able to distinguish "already running" (not an error,
+retry later) from "crashed" (investigate). Reusing 4 would collapse that
+distinction.
+
+**Full exit-code contract:**
+
+| Code | Name | Meaning | Error? |
+| ---- | ---- | ------- | ------ |
+| 0 | `SUCCESS` | Normal completion | No |
+| 1 | `FATAL_CONFIG` | Config file missing / invalid (implicit string exit) | Yes |
+| 2 | `PLEX_ERROR` | Plex unreachable or auth failed | Yes |
+| 4 | `UNHANDLED_CRASH` | Unhandled exception; error notifier fires | Yes |
+| 5 | `LOCK_HELD` | Another instance is running | No |
+| 6 | `SKIPPED_RECENT` | Within `skip_if_run_within_minutes` window | No |
+| 130 | `KEYBOARD_INTERRUPT` | SIGINT | No |
 
 ### Why there is no currently-playing skip
 
