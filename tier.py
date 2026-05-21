@@ -75,6 +75,7 @@ from __future__ import annotations
 import argparse
 import csv
 import enum
+import fcntl
 import glob
 import json
 import logging
@@ -2755,7 +2756,7 @@ def _run_move_pass(items: List["Item"], cfg: dict, apply: bool) -> dict:
     hot_mount = (cfg.get("paths") or {}).get("hot_pool_mount") or ""
     if not hot_mount:
         log.warning("Moves: moves.enabled=true but paths.hot_pool_mount not set — skipping")
-        return
+        return _empty_stats
 
     array_disks = resolve_array_disks(cfg)
 
@@ -3304,6 +3305,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 _LOCK_FILE = _STATE_DIR / "tier.lock"
 _LAST_RUN_FILE = _STATE_DIR / "last_run.json"
+# Open file handle kept alive while the flock is held; None when not locked.
+_lock_fh: Optional[object] = None
 
 
 def _ensure_state_dir() -> None:
@@ -3311,61 +3314,80 @@ def _ensure_state_dir() -> None:
 
 
 def _acquire_lock() -> bool:
-    """Acquire the single-instance lock. Returns True if acquired, False if held.
+    """Acquire a kernel-level exclusive advisory lock via fcntl.flock.
 
-    Lock file contents: {"pid": int, "started_at": ISO8601, "mode": str}.
-    A stale lock (referencing a dead PID) is reclaimed automatically.
+    Uses fcntl.flock(LOCK_EX|LOCK_NB) rather than a PID-liveness check.
+    This is correct across separate Docker containers: each container has
+    its own PID namespace, so os.kill() cannot see another container's
+    process and would wrongly reclaim a live lock.  flock() operates at
+    the kernel VFS layer — /config is a bind-mount of a host-local directory,
+    so the lock is shared by every container that mounts the same host path.
+    The kernel releases the lock automatically when the process or container
+    dies, so stale-lock cleanup is implicit and needs no PID inspection.
 
-    Container PID-reuse guard: Docker one-shot containers always get PID 1
-    for the entrypoint process. If a previous container crashed without
-    releasing the lock, the next container also gets PID 1, so os.kill(1, 0)
-    succeeds (we ARE PID 1). We detect this by checking pid == os.getpid()
-    — no live process can hold a lock against itself at startup.
+    Lock file also stores JSON metadata (pid, started_at, mode) so operators
+    can inspect who holds the lock, but that metadata is informational only.
     """
+    global _lock_fh
+
+    # Snapshot any existing metadata before we (possibly) truncate the file,
+    # so we can log who currently holds the lock on conflict.
+    existing: dict = {}
     if _LOCK_FILE.exists():
         try:
-            data = json.loads(_LOCK_FILE.read_text())
-            pid = int(data.get("pid") or 0)
-            if pid > 0:
-                if pid == os.getpid():
-                    # Our own PID is in the lock file — must be a stale lock
-                    # from a prior container run that reused this PID.
-                    log.warning("Reclaiming stale lock: PID %d matches our own PID (container restart)", pid)
-                else:
-                    try:
-                        os.kill(pid, 0)
-                        # No exception → process exists → genuine concurrent run.
-                        log.error(
-                            "Lock held by PID %d (started %s) — another tier.py instance is running",
-                            pid, data.get("started_at", "?"),
-                        )
-                        return False
-                    except ProcessLookupError:
-                        log.warning("Reclaiming stale lock from dead PID %d", pid)
-                    except PermissionError:
-                        # EPERM: process exists but we cannot signal it — treat as held.
-                        log.error(
-                            "Lock held by PID %d (started %s) — cannot verify (EPERM); "
-                            "remove %s manually if the process is dead",
-                            pid, data.get("started_at", "?"), _LOCK_FILE,
-                        )
-                        return False
-        except Exception as e:  # noqa: BLE001
-            log.warning("Could not read lock file — assuming stale, reclaiming: %s", e)
+            existing = json.loads(_LOCK_FILE.read_text())
+        except Exception:  # noqa: BLE001
+            pass
 
-    _LOCK_FILE.write_text(json.dumps({
-        "pid": os.getpid(),
-        "started_at": datetime.now(timezone.utc).isoformat(),
-        "mode": "full",
-    }))
+    try:
+        fh = open(_LOCK_FILE, "w")  # noqa: WPS515 — intentionally kept open
+    except OSError as e:
+        log.warning("Could not open lock file %s: %s — proceeding without lock", _LOCK_FILE, e)
+        return True
+
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fh.close()
+        log.error(
+            "Lock held (started %s) — another tier.py instance is running",
+            existing.get("started_at", "?"),
+        )
+        return False
+    except Exception as e:  # noqa: BLE001
+        fh.close()
+        log.warning("flock failed: %s — proceeding without lock", e)
+        return True
+
+    # Lock acquired — write metadata and keep the handle open.
+    try:
+        fh.write(json.dumps({
+            "pid": os.getpid(),
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "mode": "full",
+        }))
+        fh.flush()
+    except Exception as e:  # noqa: BLE001
+        log.warning("Could not write lock metadata: %s", e)
+
+    _lock_fh = fh
     return True
 
 
 def _release_lock() -> None:
+    global _lock_fh
+    if _lock_fh is not None:
+        try:
+            fcntl.flock(_lock_fh, fcntl.LOCK_UN)
+            _lock_fh.close()
+        except Exception as e:  # noqa: BLE001
+            log.warning("Could not release lock: %s", e)
+        finally:
+            _lock_fh = None
     try:
         _LOCK_FILE.unlink(missing_ok=True)
     except Exception as e:  # noqa: BLE001
-        log.warning("Could not release lock file: %s", e)
+        log.warning("Could not remove lock file: %s", e)
 
 
 def _check_skip_recent(cfg: dict) -> bool:
@@ -6156,117 +6178,108 @@ def _test_capacity_unraid_api_not_configured_no_warn():
 
 
 def _test_lock_blocks_second_instance():
+    """flock held by another fd → _acquire_lock returns False (BlockingIOError)."""
     import tempfile as _tf
-    global _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE
-    orig_state, orig_lock, orig_last = _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE
+    global _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE, _lock_fh
+    orig_state, orig_lock, orig_last, orig_fh = _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE, _lock_fh
     try:
         with _tf.TemporaryDirectory() as tmp:
             _STATE_DIR = Path(tmp)
             _LOCK_FILE = _STATE_DIR / "tier.lock"
             _LAST_RUN_FILE = _STATE_DIR / "last_run.json"
-            # Use parent PID — a different live process, so os.kill succeeds
-            # and the lock is correctly treated as held (not stale, not self).
-            _LOCK_FILE.write_text(json.dumps({
-                "pid": os.getppid(),
-                "started_at": datetime.now(timezone.utc).isoformat(),
-                "mode": "full",
-            }))
-            result = _acquire_lock()
-            assert result is False, f"expected False (lock held), got {result}"
+            _lock_fh = None
+            # Simulate another instance: open the file and hold LOCK_EX.
+            # flock on the same inode from a second fd (the one _acquire_lock
+            # will open) will block — LOCK_NB turns that into BlockingIOError.
+            holder = open(_LOCK_FILE, "w")
+            holder.write(json.dumps({"started_at": "2026-01-01T00:00:00+00:00"}))
+            holder.flush()
+            fcntl.flock(holder, fcntl.LOCK_EX)
+            try:
+                result = _acquire_lock()
+                assert result is False, f"expected False (flock held), got {result}"
+                assert _lock_fh is None, "_lock_fh must stay None when acquire fails"
+            finally:
+                fcntl.flock(holder, fcntl.LOCK_UN)
+                holder.close()
     finally:
-        _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE = orig_state, orig_lock, orig_last
+        _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE, _lock_fh = orig_state, orig_lock, orig_last, orig_fh
     print("_test_lock_blocks_second_instance: OK")
 
 
-def _test_lock_own_pid_reclaimed_as_stale():
-    """Lock file holds our own PID (container restart reuse) — reclaimed, not blocked."""
+def _test_lock_stale_file_acquired():
+    """Lock file exists but no flock held (crashed prior run) → acquired cleanly."""
     import tempfile as _tf
-    global _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE
-    orig_state, orig_lock, orig_last = _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE
+    global _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE, _lock_fh
+    orig_state, orig_lock, orig_last, orig_fh = _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE, _lock_fh
     try:
         with _tf.TemporaryDirectory() as tmp:
             _STATE_DIR = Path(tmp)
             _LOCK_FILE = _STATE_DIR / "tier.lock"
             _LAST_RUN_FILE = _STATE_DIR / "last_run.json"
-            _LOCK_FILE.write_text(json.dumps({
-                "pid": os.getpid(),  # same as our own PID — simulates container PID reuse
-                "started_at": datetime.now(timezone.utc).isoformat(),
-                "mode": "full",
-            }))
-            result = _acquire_lock()
-            assert result is True, f"expected True (own PID treated as stale), got {result}"
-            data = json.loads(_LOCK_FILE.read_text())
-            assert data["pid"] == os.getpid(), "lock file should hold current PID after reclaim"
-    finally:
-        _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE = orig_state, orig_lock, orig_last
-    print("_test_lock_own_pid_reclaimed_as_stale: OK")
-
-
-def _test_lock_stale_pid_reclaimed():
-    import tempfile as _tf
-    global _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE
-    orig_state, orig_lock, orig_last = _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE
-    try:
-        with _tf.TemporaryDirectory() as tmp:
-            _STATE_DIR = Path(tmp)
-            _LOCK_FILE = _STATE_DIR / "tier.lock"
-            _LAST_RUN_FILE = _STATE_DIR / "last_run.json"
-            # PID 999999999 almost certainly does not exist.
+            _lock_fh = None
+            # Write stale metadata — no process holds a flock on this file.
             _LOCK_FILE.write_text(json.dumps({
                 "pid": 999999999,
-                "started_at": datetime.now(timezone.utc).isoformat(),
+                "started_at": "2026-01-01T00:00:00+00:00",
                 "mode": "full",
             }))
             result = _acquire_lock()
-            assert result is True, f"expected True (stale lock reclaimed), got {result}"
-            data = json.loads(_LOCK_FILE.read_text())
-            assert data["pid"] == os.getpid(), "lock file should hold current PID after reclaim"
+            assert result is True, f"expected True (no flock held), got {result}"
+            assert _lock_fh is not None, "_lock_fh should be set after successful acquire"
+            _release_lock()
     finally:
-        _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE = orig_state, orig_lock, orig_last
-    print("_test_lock_stale_pid_reclaimed: OK")
+        _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE, _lock_fh = orig_state, orig_lock, orig_last, orig_fh
+    print("_test_lock_stale_file_acquired: OK")
 
 
 def _test_lock_released_on_success():
+    """After _release_lock, the file is gone and the flock is freed."""
     import tempfile as _tf
-    global _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE
-    orig_state, orig_lock, orig_last = _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE
+    global _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE, _lock_fh
+    orig_state, orig_lock, orig_last, orig_fh = _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE, _lock_fh
     try:
         with _tf.TemporaryDirectory() as tmp:
             _STATE_DIR = Path(tmp)
             _LOCK_FILE = _STATE_DIR / "tier.lock"
             _LAST_RUN_FILE = _STATE_DIR / "last_run.json"
+            _lock_fh = None
             ok = _acquire_lock()
             assert ok, "failed to acquire lock in test setup"
             assert _LOCK_FILE.exists(), "lock file should exist after acquire"
             _release_lock()
             assert not _LOCK_FILE.exists(), "lock file should be gone after release"
+            assert _lock_fh is None, "_lock_fh should be None after release"
+            # Verify the flock is actually free: we can re-acquire immediately.
+            ok2 = _acquire_lock()
+            assert ok2, "should be able to re-acquire after release"
+            _release_lock()
     finally:
-        _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE = orig_state, orig_lock, orig_last
+        _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE, _lock_fh = orig_state, orig_lock, orig_last, orig_fh
     print("_test_lock_released_on_success: OK")
 
 
 def _test_lock_released_on_failure():
     """Lock acquired, simulated exception mid-run — lock still released via finally."""
     import tempfile as _tf
-    global _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE
-    orig_state, orig_lock, orig_last = _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE
+    global _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE, _lock_fh
+    orig_state, orig_lock, orig_last, orig_fh = _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE, _lock_fh
     try:
         with _tf.TemporaryDirectory() as tmp:
             _STATE_DIR = Path(tmp)
             _LOCK_FILE = _STATE_DIR / "tier.lock"
             _LAST_RUN_FILE = _STATE_DIR / "last_run.json"
+            _lock_fh = None
             ok = _acquire_lock()
             assert ok
             try:
                 raise RuntimeError("simulated mid-run failure")
             finally:
                 _release_lock()
-            # unreachable, but the finally above must have run
     except RuntimeError:
         pass  # expected
     finally:
-        _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE = orig_state, orig_lock, orig_last
-    # After the test, the real lock path is restored; the temp lock is gone.
+        _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE, _lock_fh = orig_state, orig_lock, orig_last, orig_fh
     print("_test_lock_released_on_failure: OK")
 
 
@@ -6425,8 +6438,7 @@ if __name__ == "__main__":
         _test_capacity_unraid_api_failure_warns_and_falls_back()
         _test_capacity_unraid_api_not_configured_no_warn()
         _test_lock_blocks_second_instance()
-        _test_lock_own_pid_reclaimed_as_stale()
-        _test_lock_stale_pid_reclaimed()
+        _test_lock_stale_file_acquired()
         _test_lock_released_on_success()
         _test_lock_released_on_failure()
         _test_skip_if_run_within_minutes()

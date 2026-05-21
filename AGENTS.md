@@ -826,18 +826,19 @@ first run). Two files are written there:
   `LOCK_HELD` or `SKIPPED_RECENT`). Contains `started_at`, `finished_at`,
   `mode`, `exit_code`, and move counters.
 
-**Lock stale-PID reclaim.** On startup, if the lock file exists, we read its
-PID and call `os.kill(pid, 0)`. `ProcessLookupError` (ESRCH) means the
-process is dead — reclaim the lock and continue. `PermissionError` (EPERM)
-means the process IS alive but we cannot signal it — treat as held and exit.
-No exception means the process is alive and is not us — genuine concurrent run.
+**Why `fcntl.flock`, not PID liveness.** An earlier design used
+`os.kill(pid, 0)` to check whether the lock holder was still alive. This
+is broken across Docker containers: each container has its own PID namespace,
+so `os.kill()` cannot see another container's process and would wrongly report
+`ProcessLookupError` for a live lock, letting two containers run simultaneously.
 
-**Container PID-reuse guard.** Docker one-shot containers start the
-entrypoint as PID 1. If a container crashes without releasing the lock, the
-next container also gets PID 1, so `os.kill(1, 0)` would succeed (we ARE
-PID 1) and we would falsely report `LOCK_HELD`. Guard: if `pid == os.getpid()`,
-the lock is from a prior run that reused our PID — reclaim it unconditionally.
-No live process can hold a lock against itself at startup.
+`fcntl.flock(LOCK_EX|LOCK_NB)` is correct: it operates at the kernel VFS
+layer. The `/config` directory is a bind-mount of a host-local directory;
+both containers see the same inode, and the kernel's flock is shared across
+the bind-mount. The kernel releases the flock automatically when the process
+or container dies, so "stale lock from crashed run" is handled implicitly —
+no PID inspection or manual cleanup needed. A `BlockingIOError` from the
+non-blocking attempt is the definitive signal that another instance is live.
 
 **`LOCK_HELD` and `SKIPPED_RECENT` are expected scheduler outcomes, not errors.**
 They deliberately do not fire the error notifier and do not write `last_run.json`.
