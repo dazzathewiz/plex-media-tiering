@@ -2269,6 +2269,12 @@ def _pool_usage_bytes(
         if result is not None:
             log.debug("Capacity: hot pool via Unraid API: total=%d used=%d", *result)
             return result
+        log.warning(
+            "Capacity: Unraid Connect API (capacity.unraid_api_url) was configured but "
+            "returned no usable result — falling back to local detection "
+            "(zpool/kstat/override/statvfs). Tiering continues; see DEBUG for the API "
+            "failure detail."
+        )
 
     # --- Methods 2 & 3: zpool command / /proc/spl kstat ---
     pool_name = _zfs_pool_name_for_mount(mount)
@@ -5891,6 +5897,98 @@ def _test_run_cap_exact_boundary():
     print("_test_run_cap_exact_boundary: OK")
 
 
+def _test_capacity_unraid_api_failure_warns_and_falls_back():
+    """When unraid_api_url is set but _try_unraid_api returns None, a WARNING is emitted
+    and _pool_usage_bytes falls through to the override method."""
+    import logging
+    global _try_unraid_api, _disk_usage
+    orig_api = _try_unraid_api
+    orig_du = _disk_usage
+    captured = []
+
+    class _CapturingHandler(logging.Handler):
+        def emit(self, record):
+            captured.append(record)
+
+    handler = _CapturingHandler()
+    log.addHandler(handler)
+    try:
+        _try_unraid_api = lambda *_, **__: None  # noqa: E731
+
+        GB = 1024 ** 3
+        free_bytes = 60 * GB
+        total_override_gb = 100.0
+        _DU = type("DU", (), {"total": int(total_override_gb * GB), "used": 0, "free": free_bytes})()
+        _disk_usage = lambda *_: _DU  # noqa: E731
+
+        total, used = _pool_usage_bytes(
+            mount="/mnt/hot_pool",
+            total_gb_override=total_override_gb,
+            unraid_api_url="https://unraid.invalid/graphql",
+            unraid_api_key="dummy-key",
+        )
+
+        # (a) fell through to override: total = 100 GiB, used = total - free
+        expected_total = int(total_override_gb * GB)
+        expected_used = max(0, expected_total - free_bytes)
+        assert total == expected_total, f"expected total={expected_total}, got {total}"
+        assert used == expected_used, f"expected used={expected_used}, got {used}"
+
+        # (b) a WARNING containing "unraid_api_url" was emitted
+        warnings = [r for r in captured if r.levelno == logging.WARNING and "unraid_api_url" in r.getMessage()]
+        assert warnings, "expected a WARNING about Unraid API fallback, got none"
+    finally:
+        _try_unraid_api = orig_api
+        _disk_usage = orig_du
+        log.removeHandler(handler)
+
+    print("_test_capacity_unraid_api_failure_warns_and_falls_back: OK")
+
+
+def _test_capacity_unraid_api_not_configured_no_warn():
+    """When unraid_api_url is None, _try_unraid_api is never called and no WARNING fires."""
+    import logging
+    global _try_unraid_api, _disk_usage, _zfs_pool_name_for_mount
+    orig_api = _try_unraid_api
+    orig_du = _disk_usage
+    orig_pool = _zfs_pool_name_for_mount
+    captured = []
+    api_calls = []
+
+    class _CapturingHandler(logging.Handler):
+        def emit(self, record):
+            captured.append(record)
+
+    handler = _CapturingHandler()
+    log.addHandler(handler)
+    try:
+        def _spy_api(*_):
+            api_calls.append(1)
+            return None
+        _try_unraid_api = _spy_api
+        _zfs_pool_name_for_mount = lambda *_: None  # noqa: E731
+
+        GB = 1024 ** 3
+        _DU = type("DU", (), {"total": 100 * GB, "used": 40 * GB, "free": 60 * GB})()
+        _disk_usage = lambda *_: _DU  # noqa: E731
+
+        _pool_usage_bytes(mount="/mnt/hot_pool", unraid_api_url=None)
+
+        # _try_unraid_api must NOT have been called
+        assert not api_calls, f"_try_unraid_api should not be called when url is None, was called {len(api_calls)} times"
+
+        # No WARNING about Unraid API
+        warnings = [r for r in captured if r.levelno == logging.WARNING and "unraid_api_url" in r.getMessage()]
+        assert not warnings, f"expected no Unraid API warning, got: {[r.getMessage() for r in warnings]}"
+    finally:
+        _try_unraid_api = orig_api
+        _disk_usage = orig_du
+        _zfs_pool_name_for_mount = orig_pool
+        log.removeHandler(handler)
+
+    print("_test_capacity_unraid_api_not_configured_no_warn: OK")
+
+
 if __name__ == "__main__":
     if "--_test" in sys.argv:
         _test_resolve_user_share()
@@ -5966,5 +6064,7 @@ if __name__ == "__main__":
         _test_run_cap_zero_disables_cap()
         _test_run_cap_counts_successful_moves_only()
         _test_run_cap_exact_boundary()
+        _test_capacity_unraid_api_failure_warns_and_falls_back()
+        _test_capacity_unraid_api_not_configured_no_warn()
         sys.exit(0)
     sys.exit(main())

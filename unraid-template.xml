@@ -48,6 +48,30 @@
   <DonateLink/>
   <Requires/>
 
+  <!--
+  NETWORKING — read this if Plex runs on a macvlan or ipvlan-L2 Docker network.
+
+  The default <Network>bridge</Network> lets the container reach the Unraid host
+  (needed for the Unraid Connect API capacity option and the Unraid notifier).
+  However, a bridge container CANNOT reach a container on a macvlan/ipvlan-L2
+  network on the same host — you will see ConnectTimeoutError trying to reach Plex.
+
+  Solution: keep bridge as the primary network (for host access), then attach a
+  second interface on the macvlan/ipvlan network Plex is on. Run this once after
+  the container is created (replace br0.X and the IP with your network name and a
+  free IP from its Docker IPAM range):
+
+    docker network connect --ip 192.0.2.32 br0.X plex-media-tiering
+
+  Why bridge stays primary: it keeps the default route via docker0 so the Unraid
+  host (Connect API, notifier) is reachable like any normal bridge container.
+  Why the macvlan/ipvlan leg is secondary: it adds a connected route for the Plex
+  subnet, letting the container reach Plex as a child-to-child peer (permitted).
+  No tiering.yaml changes are needed — routing is automatic once both interfaces exist.
+
+  See README "Deployment & networking" for the full guide, alternatives, and caveats.
+  -->
+
   <!-- Default command: read-only analysis. Edit to add "top 50" etc. for
        trimmed output. P2+ will add the apply flag (DO NOT set this until
        you have eyeballed a dry run). -->
