@@ -289,6 +289,10 @@ capacity:
   # Get an API key: Unraid UI → Settings → Management Access → API Keys → New Key.
   # The URL is your Unraid host IP on port 80 (or 443 if HTTPS is enabled).
   # Advantage: fully automatic, no pool-name config needed in most cases.
+  # Network note: the tiering container must be able to reach the Unraid host to use
+  # this option. If Plex runs on a macvlan/ipvlan-L2 network, a single macvlan/ipvlan
+  # interface cannot reach the host. Use the dual-home pattern described in the README
+  # "Deployment & networking" section, or switch to Option B instead.
   unraid_api_url: null       # e.g. "https://192.168.1.100/graphql"  (must be https)
   unraid_api_key: null       # API key string from the Unraid UI
   unraid_pool_name: null     # ZFS pool name (e.g. "Zfs_media"); auto-matched if null

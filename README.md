@@ -139,6 +139,57 @@ manually revoke devices, or unlink the server. Keep `tiering.yaml` at
 **If the token goes stale:** the script detects it on connect and fires an
 alert (see Notifications below) so you're not flying blind.
 
+## Deployment & networking
+
+**The key question: can the tiering container reach Plex, and (if used) the Unraid Connect API?**
+
+### Simple case — Plex on the default bridge network
+
+No extra steps needed. The container connects to Plex over the bridge the same way any Docker container does.
+
+### Plex on a macvlan or ipvlan-L2 network (same Docker host)
+
+If Plex has its own VLAN via a macvlan or ipvlan-L2 Docker network, the default bridge container **cannot reach it**. macvlan/ipvlan-L2 enforces host-isolation: the Linux kernel blocks traffic between the host's bridge (`docker0`) and a macvlan/ipvlan child interface on the same parent. The symptom is:
+
+```
+ERROR Cannot reach Plex at http://192.0.2.10:32400: ConnectTimeoutError
+```
+
+**If you only need to reach Plex** (no `capacity.unraid_api_url`): put the tiering container on the **same** macvlan/ipvlan network as Plex. child↔child peer traffic is permitted and the timeout goes away.
+
+**If you also use `capacity.unraid_api_url`** (Unraid Connect API): the container must additionally reach the **Unraid host** — which a single macvlan/ipvlan interface *cannot* do (child↔host is blocked). Use the **dual-home** pattern instead:
+
+#### Dual-home recipe (bridge primary + macvlan/ipvlan secondary)
+
+1. Leave the template `<Network>bridge</Network>` unchanged. This keeps the default route via `docker0` so the Unraid host (Connect API, notifier) is reachable like any normal bridge container.
+
+2. After the container is created, attach a second interface on the macvlan/ipvlan network Plex is on:
+
+   ```sh
+   # Replace br0.X with your macvlan/ipvlan network name in Docker,
+   # and 192.0.2.32 with a free IP in that network's Docker IPAM range.
+   docker network connect --ip 192.0.2.32 br0.X plex-media-tiering
+   ```
+
+3. No `tiering.yaml` changes are needed. Linux routing picks the connected route for the Plex subnet (macvlan/ipvlan leg) and uses the bridge default route for everything else (Unraid host, internet).
+
+**Caveat:** this assumes the Unraid management/API IP is on a **different subnet/VLAN than Plex**. If both endpoints share the same VLAN, the Unraid API traffic also routes over the macvlan/ipvlan leg and hits the same host-isolation wall — use a local capacity method instead (see [Hot pool usage detection (ZFS)](#hot-pool-usage-detection-zfs)).
+
+#### Host-isolation affects two features
+
+When the tiering container is on a macvlan/ipvlan-L2 network without dual-homing, two features that call the **Unraid host** will silently degrade or fail:
+
+- **`capacity.unraid_api_url`** — falls back through the capacity chain (zpool → kstat → `hot_pool_total_gb` override → statvfs). A WARNING is logged so the degradation is visible.
+- **`notifications.unraid.enabled`** — the notify script bind-mount path (`/usr/local/emhttp/webGui/scripts/notify`) only exists if the host path is bind-mounted; if the macvlan container can't exec it, notifications fall back to other configured methods or are silently skipped.
+
+#### Avoiding dual-homing entirely
+
+Use a **local** capacity method that doesn't call the host — `zpool` in-container, the `/proc/spl` bind-mount, or `capacity.hot_pool_total_gb` override — then a single macvlan/ipvlan interface is sufficient and no dual-homing is required. See [Hot pool usage detection (ZFS)](#hot-pool-usage-detection-zfs) for setup instructions.
+
+#### Note on Unraid's "Host access to custom networks" toggle
+
+Unraid offers a toggle that lets the host reach containers on custom networks. Under **macvlan** it has a known kernel-panic history; **ipvlan-L2** is the safer mode if you use it. Dual-homing avoids any host-network change entirely and is the preferred approach.
+
 ## Docker Hub + GitHub Actions (publish pipeline)
 
 **Free-tier compatible.** Docker Hub free gives unlimited public repos;

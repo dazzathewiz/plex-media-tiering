@@ -775,6 +775,14 @@ Capacity: warm disk /mnt/disk2 — 7.6 / 8.0 TB (95%)  ← over 90% ceiling
 ```
 This replaces the previous "warm disks all under N% ceiling" summary line.
 
+## Deployment & networking
+
+### macvlan/ipvlan-L2 and the dual-home requirement
+
+When Plex runs on a macvlan or ipvlan-L2 Docker network and the tiering container also uses `capacity.unraid_api_url`, the container must be **dual-homed**: primary network `bridge` (keeps the default route to the Unraid host for the Connect API), plus a second interface on the macvlan/ipvlan network (connected route for the Plex subnet). A single macvlan/ipvlan interface cannot reach both Plex (child↔child, permitted) and the Unraid host (child↔host, blocked by macvlan/ipvlan-L2 kernel isolation) simultaneously.
+
+See the README "Deployment & networking" section for the full recipe, caveats, and the no-dual-home alternative (local capacity methods).
+
 ## Development rules
 
 ### Write only to `/config` at runtime
