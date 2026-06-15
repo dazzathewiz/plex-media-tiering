@@ -318,3 +318,13 @@ capacity:
   # Update this value if you expand the pool (add vdevs / replace drives).
   hot_pool_total_gb: null
   # hot_pool_total_gb: 65536                     # example: 64 TB (64 × 1024 GB)
+
+# Scheduling primitives (P4.1) — makes tier.py safe to run from cron.
+# All state files (lock, last_run.json) live in /config/state/ and are
+# created automatically; no manual setup required.
+scheduling:
+  # Skip this run if the previous run finished within this many minutes.
+  # 0 = disabled (always run). Set to e.g. 50 when a monthly cron and a
+  # manual trigger could fire within the same hour — only the first run
+  # executes, the second exits quietly with code 6 (SKIPPED_RECENT).
+  skip_if_run_within_minutes: 0
