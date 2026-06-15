@@ -82,6 +82,30 @@ library keeps the response bounded and plexapi's pagination works.
 
 Global fallback sweep runs only if every per-section call returned zero.
 
+### `grandparentKey` path parsing in `_ingest_history`
+
+Plex's `/status/sessions/history` endpoint (used by plexapi's
+`plex.history()`) exposes episode events with `grandparentKey` in path
+form (`/library/metadata/<id>`) but **omits `grandparentRatingKey`** —
+it is always `None` on every episode event returned from this endpoint.
+
+Early code in `_ingest_history` tested `grandparentRatingKey is None`
+and skipped the show-level rollup for those events, so the index had
+per-episode entries only — no show-level aggregations. Every
+`collect_series` lookup on `show.ratingKey` missed, triggering the
+per-show fallback `show.history()` call for every series (~208 calls,
+~4 minutes of serial API traffic per run).
+
+Fix: `_parse_grandparent_id(h)` tries `grandparentRatingKey` first; on
+`None` it parses the trailing integer from `grandparentKey`
+(`/library/metadata/12345` → `12345`). Parse failures (non-integer tail,
+unexpected path shape, attribute absent) return `None` and the event is
+skipped cleanly. `_ingest_history` now calls this helper instead of
+checking `grandparentRatingKey` directly.
+
+The `_show_history_fallback` path is unchanged and still fires as a true
+last resort for shows that have genuine ratingKey drift after a rematch.
+
 ### Per-show history fallback for rematched shows
 
 After a Plex rematch or library move, history events can reference a

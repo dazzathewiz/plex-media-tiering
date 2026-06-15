@@ -1170,12 +1170,41 @@ def _clean_title(title: str, year: Optional[int]) -> str:
     return cleaned
 
 
+def _parse_grandparent_id(h) -> Optional[int]:
+    """Return the grandparent ratingKey int from a history event, or None.
+
+    The /status/sessions/history endpoint omits grandparentRatingKey on episode
+    events but always provides grandparentKey in path form (/library/metadata/<id>).
+    We try grandparentRatingKey first (direct int); on None we parse the trailing
+    integer from grandparentKey as the fallback.
+    """
+    grk = getattr(h, "grandparentRatingKey", None)
+    if grk is not None:
+        try:
+            return int(grk)
+        except (TypeError, ValueError):
+            pass
+
+    gk = getattr(h, "grandparentKey", None)
+    if gk is not None:
+        try:
+            tail = gk.rstrip("/").rsplit("/", 1)[-1]
+            return int(tail)
+        except (TypeError, ValueError, IndexError):
+            pass
+
+    return None
+
+
 def _ingest_history(events, index: dict) -> int:
     """Fold a sequence of History objects into the index. Returns event count.
 
     Each event contributes to:
-      - index[ratingKey]             (the movie OR episode itself)
-      - index[grandparentRatingKey]  (the show, for series rollup)
+      - index[ratingKey]    (the movie OR episode itself)
+      - index[grandparent]  (the show, for series rollup — resolved via
+                             grandparentRatingKey when present, or by parsing
+                             the trailing id from grandparentKey, because the
+                             history endpoint omits grandparentRatingKey)
     """
     count = 0
     for h in events:
@@ -1194,12 +1223,8 @@ def _ingest_history(events, index: dict) -> int:
         if viewed_at and (entry["last"] is None or viewed_at > entry["last"]):
             entry["last"] = viewed_at
 
-        grk = getattr(h, "grandparentRatingKey", None)
-        if grk is None:
-            continue
-        try:
-            grk_int = int(grk)
-        except (TypeError, ValueError):
+        grk_int = _parse_grandparent_id(h)
+        if grk_int is None:
             continue
         gentry = index.setdefault(grk_int, {"plays": 0, "last": None})
         gentry["plays"] += 1
@@ -6385,6 +6410,53 @@ def _test_last_run_written_when_run_returns_none():
     print("_test_last_run_written_when_run_returns_none: OK")
 
 
+def _test_ingest_history_grandparent_key_fallback():
+    """grandparentKey path form is parsed when grandparentRatingKey is absent."""
+    from datetime import datetime, timezone
+
+    class FakeEpEvent:
+        ratingKey = 9001
+        viewedAt = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        grandparentKey = "/library/metadata/5555"
+        # grandparentRatingKey intentionally NOT defined as an attribute
+
+    index: dict = {}
+    count = _ingest_history([FakeEpEvent()], index)
+    assert count == 1, f"expected 1 event counted, got {count}"
+    assert 9001 in index, "episode ratingKey should be indexed"
+    assert index[9001]["plays"] == 1
+    assert 5555 in index, "grandparent id parsed from grandparentKey should be indexed"
+    assert index[5555]["plays"] == 1
+    assert index[5555]["last"] == FakeEpEvent.viewedAt
+    print("_test_ingest_history_grandparent_key_fallback: OK")
+
+
+def _test_ingest_history_no_grandparent_skipped_cleanly():
+    """Event with neither grandparentRatingKey nor parseable grandparentKey is skipped without error."""
+    from datetime import datetime, timezone
+
+    class FakeEpEventNone:
+        ratingKey = 7777
+        viewedAt = datetime(2026, 2, 1, tzinfo=timezone.utc)
+        grandparentKey = "/unexpected/path/format"
+        # grandparentRatingKey not present; grandparentKey has no int tail
+
+    class FakeEpEventMissing:
+        ratingKey = 8888
+        viewedAt = datetime(2026, 3, 1, tzinfo=timezone.utc)
+        # neither grandparentRatingKey nor grandparentKey present
+
+    index: dict = {}
+    count = _ingest_history([FakeEpEventNone(), FakeEpEventMissing()], index)
+    assert count == 2, f"expected 2 events counted, got {count}"
+    assert 7777 in index
+    assert 8888 in index
+    # Neither should have produced a grandparent rollup entry
+    for key in list(index.keys()):
+        assert key in (7777, 8888), f"unexpected index key {key}"
+    print("_test_ingest_history_no_grandparent_skipped_cleanly: OK")
+
+
 if __name__ == "__main__":
     if "--_test" in sys.argv:
         _test_resolve_user_share()
@@ -6470,5 +6542,7 @@ if __name__ == "__main__":
         _test_skip_disabled_when_zero()
         _test_last_run_written()
         _test_last_run_written_when_run_returns_none()
+        _test_ingest_history_grandparent_key_fallback()
+        _test_ingest_history_no_grandparent_skipped_cleanly()
         sys.exit(int(ExitCode.SUCCESS))
     sys.exit(main())
