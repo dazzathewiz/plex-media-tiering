@@ -3416,6 +3416,7 @@ def _check_skip_recent(cfg: dict) -> bool:
 
 
 def _write_last_run(started_at: datetime, exit_code: int, move_stats: dict) -> None:
+    move_stats = move_stats or {}
     try:
         _LAST_RUN_FILE.write_text(json.dumps({
             "started_at": started_at.isoformat(),
@@ -3567,7 +3568,7 @@ def main() -> int:
             move_stats: dict = {"moves_attempted": 0, "moves_succeeded": 0, "bytes_moved": 0}
 
             try:
-                move_stats = _run(args)
+                move_stats = _run(args) or move_stats
                 _write_last_run(started_at, int(ExitCode.SUCCESS), move_stats)
             except SystemExit:
                 raise
@@ -6360,6 +6361,30 @@ def _test_last_run_written():
     print("_test_last_run_written: OK")
 
 
+def _test_last_run_written_when_run_returns_none():
+    import tempfile as _tf
+    global _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE
+    orig_state, orig_lock, orig_last = _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE
+    try:
+        with _tf.TemporaryDirectory() as tmp:
+            _STATE_DIR = Path(tmp)
+            _LOCK_FILE = _STATE_DIR / "tier.lock"
+            _LAST_RUN_FILE = _STATE_DIR / "last_run.json"
+            started = datetime(2026, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+            # Simulate _run() returning None (dry-run path).
+            _write_last_run(started, int(ExitCode.SUCCESS), None)
+            assert _LAST_RUN_FILE.exists(), "last_run.json should exist even when move_stats is None"
+            data = json.loads(_LAST_RUN_FILE.read_text())
+            assert data["exit_code"] == 0
+            assert data["moves_attempted"] == 0
+            assert data["moves_succeeded"] == 0
+            assert data["bytes_moved"] == 0
+            assert "finished_at" in data
+    finally:
+        _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE = orig_state, orig_lock, orig_last
+    print("_test_last_run_written_when_run_returns_none: OK")
+
+
 if __name__ == "__main__":
     if "--_test" in sys.argv:
         _test_resolve_user_share()
@@ -6444,5 +6469,6 @@ if __name__ == "__main__":
         _test_skip_if_run_within_minutes()
         _test_skip_disabled_when_zero()
         _test_last_run_written()
+        _test_last_run_written_when_run_returns_none()
         sys.exit(int(ExitCode.SUCCESS))
     sys.exit(main())
