@@ -796,10 +796,25 @@ under **Settings → Management Access → API Keys → New Key**, then set in
 
 ```yaml
 capacity:
-  unraid_api_url: "https://192.168.1.100/graphql"  # must be https — http redirects with 302
+  unraid_api_url: "https://192.0.2.10/graphql"  # must be https — http redirects with 302
   unraid_api_key: "your-api-key-here"
   unraid_pool_name: null   # auto-matched from hot_pool_mount; set explicitly if needed
 ```
+
+**TLS certificate:** Unraid ships a self-signed certificate by default. The API
+call verifies certificates by default, so on a stock Unraid install the call
+fails with `CERTIFICATE_VERIFY_FAILED` and capacity silently falls back to the
+next method. There are two ways to resolve this:
+
+- **Option A1 (recommended): provision a valid certificate.** Enable Unraid
+  Connect SSL under **Settings → Management Access → SSL Certificate** and point
+  `unraid_api_url` at the matching hostname. No extra config key needed.
+- **Option A2: disable verification for this call.** If you control the LAN path
+  to your Unraid server and accept the security trade-off, set
+  `capacity.unraid_api_verify_tls: false` in `tiering.yaml`.
+  A WARNING is logged each run when verification is disabled so it's always
+  visible in run output. This setting only affects the Unraid API capacity call —
+  the Plex connection and all other calls are unaffected.
 
 **Option B — set `hot_pool_total_gb` in `tiering.yaml` (simpler, no API key):**
 Find your pool's total size in GB by running on the **Unraid host**. The

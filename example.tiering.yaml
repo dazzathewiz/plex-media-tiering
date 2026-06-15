@@ -293,9 +293,10 @@ capacity:
   # this option. If Plex runs on a macvlan/ipvlan-L2 network, a single macvlan/ipvlan
   # interface cannot reach the host. Use the dual-home pattern described in the README
   # "Deployment & networking" section, or switch to Option B instead.
-  unraid_api_url: null       # e.g. "https://192.168.1.100/graphql"  (must be https)
+  unraid_api_url: null       # e.g. "https://192.0.2.10/graphql"  (must be https)
   unraid_api_key: null       # API key string from the Unraid UI
   unraid_pool_name: null     # ZFS pool name (e.g. "Zfs_media"); auto-matched if null
+  unraid_api_verify_tls: true  # set false for Unraid's self-signed cert on a trusted LAN; see README
 
   # Option B — manual pool size override.
   # Advantage: no API key needed; works everywhere; requires one-time config.
