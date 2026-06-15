@@ -3405,7 +3405,7 @@ def _check_skip_recent(cfg: dict) -> bool:
         finished_at = datetime.fromisoformat(finished_str)
         elapsed_min = (datetime.now(timezone.utc) - finished_at).total_seconds() / 60
         if elapsed_min < threshold:
-            log.info(
+            log.warning(
                 "Skipping run — last run finished %.1f min ago (threshold: %d min)",
                 elapsed_min, threshold,
             )
