@@ -775,6 +775,8 @@ by the refdbytes issue; `free` is not.
    cache whose `fsSize ≥ statvfs.free`. Requires Unraid 6.12+ and an API key
    (Settings → Management Access → API Keys). HTTPS required; use
    `https://` in `unraid_api_url` — nginx redirects HTTP with a 302.
+   The call verifies TLS by default; toggle with `capacity.unraid_api_verify_tls`
+   (default `true`; set `false` for Unraid's self-signed cert on a trusted LAN).
 2. `_try_zpool_cmd(pool_name)` — runs `zpool list -Hp -o size,alloc`. Works if
    ZFS userspace tools are present in the container. Pool name extracted from
    `/proc/mounts` via `_zfs_pool_name_for_mount`.

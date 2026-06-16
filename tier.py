@@ -84,6 +84,7 @@ import math
 import os
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 import traceback
@@ -284,6 +285,10 @@ DEFAULT_CONFIG = {
         # first ZFS pool returned by the API that is at least as large as
         # statvfs.free is used as the match heuristic.
         "unraid_pool_name": None,
+        # Verify TLS certificate for the Unraid Connect API call. Defaults to
+        # true (secure). Set false to skip verification for Unraid's self-signed
+        # cert on a trusted LAN — Unraid API call only, no other effect.
+        "unraid_api_verify_tls": True,
     },
     # Scheduling primitives (P4.1).
     "scheduling": {
@@ -2193,6 +2198,7 @@ def _try_unraid_api(
     pool_name_filter: Optional[str],
     hot_mount: str = "",
     free_floor_bytes: int = 0,
+    verify_tls: bool = True,
 ) -> Optional[Tuple[int, int]]:
     """Query the Unraid Connect GraphQL API for ZFS pool capacity.
 
@@ -2223,7 +2229,16 @@ def _try_unraid_api(
         )
         if api_key:
             req.add_header("x-api-key", api_key)
-        with urllib.request.urlopen(req, timeout=5) as resp:  # noqa: S310
+        ssl_ctx: Optional[ssl.SSLContext] = None
+        if not verify_tls:
+            log.warning(
+                "Capacity: Unraid API TLS verification DISABLED "
+                "(capacity.unraid_api_verify_tls=false)"
+            )
+            ssl_ctx = ssl.create_default_context()
+            ssl_ctx.check_hostname = False
+            ssl_ctx.verify_mode = ssl.CERT_NONE
+        with urllib.request.urlopen(req, timeout=5, context=ssl_ctx) as resp:  # noqa: S310
             data = json.loads(resp.read())
     except Exception as exc:  # noqa: BLE001
         log.debug("Capacity: Unraid API request failed: %s", exc)
@@ -2289,6 +2304,7 @@ def _pool_usage_bytes(
     unraid_api_url: Optional[str] = None,
     unraid_api_key: Optional[str] = None,
     unraid_pool_name: Optional[str] = None,
+    verify_tls: bool = True,
 ) -> Tuple[int, int]:
     """Return (total_bytes, used_bytes) for the hot pool at mount.
 
@@ -2314,7 +2330,7 @@ def _pool_usage_bytes(
             free_floor = 0
         result = _try_unraid_api(
             unraid_api_url, unraid_api_key, unraid_pool_name,
-            hot_mount=mount, free_floor_bytes=free_floor,
+            hot_mount=mount, free_floor_bytes=free_floor, verify_tls=verify_tls,
         )
         if result is not None:
             log.debug("Capacity: hot pool via Unraid API: total=%d used=%d", *result)
@@ -2652,6 +2668,7 @@ def _apply_capacity_budget(
     unraid_api_url = (cap_cfg.get("unraid_api_url") or "").strip() or None
     unraid_api_key = (cap_cfg.get("unraid_api_key") or "").strip() or None
     unraid_pool_name = (cap_cfg.get("unraid_pool_name") or "").strip() or None
+    unraid_api_verify_tls = bool(cap_cfg.get("unraid_api_verify_tls", True))
     pool_total = pool_used = 0
     if hot_mount:
         pool_total, pool_used = _pool_usage_bytes(
@@ -2660,6 +2677,7 @@ def _apply_capacity_budget(
             unraid_api_url=unraid_api_url,
             unraid_api_key=unraid_api_key,
             unraid_pool_name=unraid_pool_name,
+            verify_tls=unraid_api_verify_tls,
         )
 
     pool_pct = (pool_used / pool_total) if pool_total else 0.0
@@ -6203,6 +6221,83 @@ def _test_capacity_unraid_api_not_configured_no_warn():
     print("_test_capacity_unraid_api_not_configured_no_warn: OK")
 
 
+def _test_unraid_api_verify_tls_false_uses_unverified_context():
+    """verify_tls=False → urlopen receives an SSLContext with CERT_NONE / check_hostname=False."""
+    import logging
+    import urllib.request as _urlreq
+    captured_kwargs: dict = {}
+    captured_warnings: list = []
+
+    class _CapturingHandler(logging.Handler):
+        def emit(self, record):
+            if record.levelno == logging.WARNING:
+                captured_warnings.append(record.getMessage())
+
+    handler = _CapturingHandler()
+    log.addHandler(handler)
+
+    def _fake_urlopen(req, timeout=None, context=None):
+        captured_kwargs["context"] = context
+        # Return a minimal JSON response so _try_unraid_api parses successfully.
+        import io
+        body = b'{"data": {"array": {"caches": []}}}'
+        return io.BytesIO(body)
+
+    orig_urlopen = _urlreq.urlopen
+    _urlreq.urlopen = _fake_urlopen
+    try:
+        _try_unraid_api(
+            "https://unraid.invalid/graphql",
+            api_key="dummy-key",
+            pool_name_filter=None,
+            verify_tls=False,
+        )
+    finally:
+        _urlreq.urlopen = orig_urlopen
+        log.removeHandler(handler)
+
+    ctx = captured_kwargs.get("context")
+    assert ctx is not None, "expected an SSLContext to be passed to urlopen, got None"
+    assert ctx.verify_mode == ssl.CERT_NONE, (
+        f"expected CERT_NONE, got {ctx.verify_mode}"
+    )
+    assert ctx.check_hostname is False, (
+        f"expected check_hostname=False, got {ctx.check_hostname}"
+    )
+    tls_warnings = [w for w in captured_warnings if "unraid_api_verify_tls=false" in w.lower()]
+    assert tls_warnings, f"expected a TLS-disabled WARNING, got: {captured_warnings}"
+    print("_test_unraid_api_verify_tls_false_uses_unverified_context: OK")
+
+
+def _test_unraid_api_verify_tls_true_verifies():
+    """verify_tls=True (default) → urlopen receives None context (stdlib default verification)."""
+    import urllib.request as _urlreq
+    captured_kwargs: dict = {}
+
+    def _fake_urlopen(req, timeout=None, context=None):
+        captured_kwargs["context"] = context
+        import io
+        body = b'{"data": {"array": {"caches": []}}}'
+        return io.BytesIO(body)
+
+    orig_urlopen = _urlreq.urlopen
+    _urlreq.urlopen = _fake_urlopen
+    try:
+        _try_unraid_api(
+            "https://unraid.invalid/graphql",
+            api_key="dummy-key",
+            pool_name_filter=None,
+            verify_tls=True,
+        )
+    finally:
+        _urlreq.urlopen = orig_urlopen
+
+    ctx = captured_kwargs.get("context")
+    # verify_tls=True → no custom context; urllib uses its own secure default.
+    assert ctx is None, f"expected no custom SSLContext, got {ctx}"
+    print("_test_unraid_api_verify_tls_true_verifies: OK")
+
+
 def _test_lock_blocks_second_instance():
     """flock held by another fd → _acquire_lock returns False (BlockingIOError)."""
     import tempfile as _tf
@@ -6534,6 +6629,8 @@ if __name__ == "__main__":
         _test_run_cap_exact_boundary()
         _test_capacity_unraid_api_failure_warns_and_falls_back()
         _test_capacity_unraid_api_not_configured_no_warn()
+        _test_unraid_api_verify_tls_false_uses_unverified_context()
+        _test_unraid_api_verify_tls_true_verifies()
         _test_lock_blocks_second_instance()
         _test_lock_stale_file_acquired()
         _test_lock_released_on_success()
