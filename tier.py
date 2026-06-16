@@ -1347,6 +1347,10 @@ def _count_recent_episode_plays(episodes, history_index: dict, cutoff: Optional[
         last = entry.get("last") if entry else None
         if not last:
             continue
+        # Plex's viewedAt timestamps come back offset-naive; cutoff (derived
+        # from our own isoformat() writes) is always offset-aware. Normalise
+        # before comparing or this raises TypeError on every promote-only run.
+        last = _as_utc(last)
         if cutoff is None or last > cutoff:
             count += 1
     return count
@@ -7144,6 +7148,25 @@ def _test_min_episodes_no_full_run_fallback():
     print("_test_min_episodes_no_full_run_fallback: OK")
 
 
+def _test_count_recent_episode_plays_naive_viewed_at():
+    """Plex's viewedAt comes back offset-naive; cutoff is always offset-aware
+    (built from our own isoformat() writes). Comparing them directly raises
+    TypeError — this regression test pins the _as_utc() normalisation fix."""
+    class FakeEp:
+        def __init__(self, rk):
+            self.ratingKey = rk
+
+    cutoff = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    episodes = [FakeEp(1), FakeEp(2)]
+    history_index = {
+        1: {"plays": 1, "last": datetime(2026, 1, 5)},   # naive, after cutoff
+        2: {"plays": 1, "last": datetime(2025, 1, 1)},   # naive, before cutoff
+    }
+    count = _count_recent_episode_plays(episodes, history_index, cutoff)
+    assert count == 1, f"expected 1 (only episode 1 is after cutoff), got {count}"
+    print("_test_count_recent_episode_plays_naive_viewed_at: OK")
+
+
 def _test_last_full_run_recorded():
     """A full run sets last_full_run_finished_at; a promote-only run carries it forward."""
     import tempfile as _tf
@@ -7278,6 +7301,7 @@ if __name__ == "__main__":
         _test_min_episodes_allows_binge()
         _test_min_episodes_ignores_movies()
         _test_min_episodes_no_full_run_fallback()
+        _test_count_recent_episode_plays_naive_viewed_at()
         _test_last_full_run_recorded()
         sys.exit(int(ExitCode.SUCCESS))
     sys.exit(main())
