@@ -801,16 +801,29 @@ capacity:
   unraid_pool_name: null   # auto-matched from hot_pool_mount; set explicitly if needed
 ```
 
-**TLS certificate:** Unraid ships a self-signed certificate by default. The API
-call verifies certificates by default, so on a stock Unraid install the call
-fails with `CERTIFICATE_VERIFY_FAILED` and capacity silently falls back to the
-next method. There are two ways to resolve this:
+**The hostname must match Unraid's configured SSL vhost — a bare IP will 404.**
+Unraid's nginx only registers the `/graphql` route on the specific hostname
+bound under **Settings → Management Access → SSL/TLS**. Hitting the box by its
+raw LAN IP (or any other hostname that resolves to it) lands on a default
+server block with no API route, returning a plain `404 Not Found` — this has
+nothing to do with certificates and `unraid_api_verify_tls` cannot fix it.
+Always set `unraid_api_url` to the exact hostname shown in that settings page
+(commonly a `*.myunraid.net` address once remote access / Connect is enabled,
+or a custom hostname if you've bound one yourself).
 
-- **Option A1 (recommended): provision a valid certificate.** Enable Unraid
-  Connect SSL under **Settings → Management Access → SSL Certificate** and point
-  `unraid_api_url` at the matching hostname. No extra config key needed.
-- **Option A2: disable verification for this call.** If you control the LAN path
-  to your Unraid server and accept the security trade-off, set
+**TLS certificate:** once you're hitting the right vhost, the next question is
+whether its certificate is trusted. Unraid's own `*.myunraid.net` hostname
+ships with a valid certificate — no extra config needed. A self-signed
+certificate (the default if you bind a custom hostname without your own valid
+cert) fails verification with `CERTIFICATE_VERIFY_FAILED`, and capacity
+silently falls back to the next method. There are two ways to resolve this:
+
+- **Option A1 (recommended): use the valid `*.myunraid.net` hostname**, or
+  provision your own valid certificate for a custom hostname under
+  **Settings → Management Access → SSL/TLS**. No extra config key needed.
+- **Option A2: disable verification for this call.** If you're bound to a
+  custom hostname with a self-signed cert, control the LAN path to your Unraid
+  server, and accept the security trade-off, set
   `capacity.unraid_api_verify_tls: false` in `tiering.yaml`.
   A WARNING is logged each run when verification is disabled so it's always
   visible in run output. This setting only affects the Unraid API capacity call —
