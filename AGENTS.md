@@ -52,6 +52,7 @@ CLAUDE.md and GEMINI.md are symlinks to this file.
 | P3   | Capacity-aware tiering — hot pool ceiling + promotion budget (OVER_BUDGET_HOT), optional auto-demote, warm per-disk ceiling, --no-promote / --no-demote | Done |
 | P3.5 | Move hardening — run-level I/O budget (max_total_move_gb) | Done |
 | P4.1 | Scheduling primitives — single-instance lock, run-state file, skip_if_run_within_minutes, exit-code contract | Done |
+| P4.5 | Promote-only run mode — --mode {full,promote-only,demote-only} over --no-promote/--no-demote (now also covers RELOCATE_WARM); TIER_MODE/TIER_APPLY env + scheduling.default_mode config; min_episodes_for_fast_promote guard | Done |
 
 ## Non-obvious design decisions
 
@@ -887,6 +888,40 @@ distinction.
 | 6 | `SKIPPED_RECENT` | Within `skip_if_run_within_minutes` window | No |
 | 130 | `KEYBOARD_INTERRUPT` | SIGINT | No |
 
+### Run mode (P4.5)
+
+**`--mode` is a cron-ergonomics shortcut over the promote/demote suppression
+flags.** `--mode promote-only` ⇔ `--no-demote`, `--mode demote-only` ⇔
+`--no-promote`, `--mode full` is the default. `--no-demote` suppresses both
+`TO_WARM` and `RELOCATE_WARM` — draining a series off an evicting disk is a
+demotion in cadence terms. `--mode` and the `--no-*` flags are mutually
+exclusive. `min_episodes_for_fast_promote` applies only on promote-only runs
+and only to series: it stops a single-pilot watch from promoting an entire
+multi-season show before the monthly full run has corroborating signal.
+Series filtered this way keep their `TO_HOT` outcome and are reconsidered
+next run — no new outcome constant.
+
+Implementation note: this suppression is layered on top of, not instead of,
+`_apply_capacity_budget`'s existing `no_promote`/`no_demote` params (which
+only affect that pass's own `TO_HOT`→`OVER_BUDGET_HOT` conversion and
+auto-demote trigger — they never touch items that scored `TO_WARM` or
+`RELOCATE_WARM` directly from `_compute_recommendation`/eviction). `--mode`'s
+effective `no_promote`/`no_demote` booleans are passed into `_run_move_pass`
+itself, which is the only place that sees every direction regardless of how
+an item arrived there.
+
+**Every settable behaviour must be reachable without CLI args.** Unraid CA
+template recreates wipe command-line overrides and `docker start` cannot pass
+new args, so any flag that needs to drive a scheduled run must also be
+settable via env var (`TIER_<NAME>`) and, where it makes sense as a baseline,
+via `tiering.yaml`. Precedence is **CLI > env > config > default**. P4.5
+establishes this convention for `--mode` and `--apply` — the two flags that
+scheduled runs cannot live without. **Follow-up:** extend the same env-var
+convention to the remaining CLI flags (`--library`, `--top`, `--sort`, etc.)
+in a separate PR. **Forward-pointer:** a future daemon mode (backlog item #8)
+will eventually subsume host-cron scheduling entirely — when it lands,
+`scheduling.default_mode` becomes the per-job mode key in that scheduler.
+
 ### Why there is no currently-playing skip
 
 The intuitive "don't move a file Plex is reading" guard was considered and
@@ -906,8 +941,9 @@ Plex API calls for zero correctness gain.
 series, every run during the binge would skip it — the item never reaches HOT
 during the window it most deserves promotion. The right response to "someone just
 started watching a WARM show" is fast promotion, not deferral. That capability
-belongs in a daily promote-only cadence with a configurable minimum-episode
-threshold, not in a move-time skip.
+is now the P4.5 daily promote-only cadence (`--mode promote-only` /
+`TIER_MODE=promote-only`) with its `min_episodes_for_fast_promote` guard —
+see "Run mode (P4.5)" above — not a move-time skip.
 
 ### Notifiers must not raise
 

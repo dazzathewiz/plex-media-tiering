@@ -30,6 +30,7 @@ execute; default is dry-run.
 | P3 | Capacity-aware tiering — hot pool fill ceiling, promotion budget, `OVER_BUDGET_HOT` outcome, optional auto-demote of lowest-scoring HOT items, warm per-disk ceiling, `--no-promote` / `--no-demote` flags. | **Done** |
 | P3.5 | Move hardening — run-level I/O budget (`max_total_move_gb`). | **Done** |
 | P4.1 | Scheduling primitives — single-instance lock with stale-PID reclaim, `last_run.json` state file, `skip_if_run_within_minutes` recency guard, formalised exit-code contract. | **Done** |
+| P4.5 | Promote-only run mode — `--mode {full,promote-only,demote-only}` shortcut over `--no-promote`/`--no-demote` (now also covers `RELOCATE_WARM`); `TIER_MODE`/`TIER_APPLY` env vars + `scheduling.default_mode` config so scheduled runs work without CLI args; `min_episodes_for_fast_promote` guard against single-pilot promotions. | **Done** |
 
 ## Install
 
@@ -331,9 +332,110 @@ Community Apps template includes that mount as an "advanced" option.
 ./tier.py --log-level DEBUG
 ./tier.py --log-file /tmp/tier.log
 ./tier.py --quiet           # no console output, file log only
+
+# Run modes (P4.5) — see "Run modes" below
+./tier.py --mode promote-only
+./tier.py --mode demote-only
 ```
 
 `--apply` activates move execution when `moves.enabled: true`. Without it the move pass runs in dry-run mode.
+
+## Run modes (P4.5)
+
+`--mode` controls which move directions execute this run:
+
+| Mode | TO_HOT | TO_WARM | RELOCATE_WARM | Equivalent to |
+|---|---|---|---|---|
+| `full` (default) | ✓ | ✓ | ✓ | neither `--no-promote` nor `--no-demote` |
+| `promote-only` | ✓ | ✗ | ✗ | `--no-demote` |
+| `demote-only` | ✗ | ✓ | ✓ | `--no-promote` |
+
+Suppressed items keep their scored outcome (`TO_WARM`, `RELOCATE_WARM`, etc.)
+and are reconsidered on the next run — nothing is converted to a different
+outcome by `--mode` itself.
+
+`--mode` is a cron-ergonomics shortcut over `--no-promote` / `--no-demote`
+(see [Capacity-aware tiering](#capacity-aware-tiering-p3) for what those do to
+the capacity pass specifically). **`--mode` and `--no-promote`/`--no-demote`
+are mutually exclusive** — combining `--mode promote-only` with `--no-promote`,
+or `--mode demote-only` with `--no-demote`, is a contradiction and exits with
+code 2.
+
+`--no-demote` (and therefore `--mode promote-only`) suppresses `RELOCATE_WARM`
+as well as `TO_WARM` — draining a series off an evicting disk is a demotion in
+cadence terms and has no place in a fast promote-only run.
+
+The intended use is a **daily promote-only pass** alongside the existing
+**monthly full run**: newly-watched WARM media reaches the HOT pool within
+~24h instead of waiting for the next full run, while demotions and disk
+eviction continue to happen only on the full cadence. See "Scheduling on
+Unraid" below for the two deployment patterns.
+
+### Configuration sources
+
+Every flag a scheduled run depends on can be set without CLI args — Unraid CA
+template recreates wipe command-line overrides, and `docker start` cannot pass
+new args. Precedence is the same for both:
+
+**`CLI flag > environment variable > tiering.yaml > built-in default`**
+
+| Behaviour | CLI | Env var | Config key | Default |
+|---|---|---|---|---|
+| Run mode | `--mode` | `TIER_MODE` | `scheduling.default_mode` | `full` |
+| Apply (execute moves) | `--apply` | `TIER_APPLY` | `moves.apply` | `false` |
+
+`TIER_MODE` accepts `full`, `promote-only`, or `demote-only`. `TIER_APPLY`
+accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`). An invalid value
+from either env var exits with code 2 and names the source in the log.
+
+`min_episodes_for_fast_promote` (under `scheduling:`) guards `promote-only`
+runs: a TV series is promoted to HOT only if at least this many distinct
+episodes have been watched since the last **full** run. Movies are never
+affected. This is what makes the daily/monthly split safe — a single-pilot
+watch doesn't promote an entire multi-season show; the monthly full run (which
+doesn't apply this guard) is the corroborating signal. Filtered series keep
+their `TO_HOT` outcome and are logged as `skipped: N episode(s) since last
+full run, need M`. Set to `1` to disable the guard entirely.
+
+`promote-only` runs the same `TO_HOT` pass as a full run, so the
+[hot-pool ceiling budget](#hot-pool-ceiling-and-promotion-budget)
+(`OVER_BUDGET_HOT`) still applies — a near-full pool stops promoting on a
+promote-only run exactly as it would on a full run, rather than overflowing.
+
+### Scheduling on Unraid
+
+**Pattern A — separate CA-template containers, env-pinned mode (preferred).**
+Create two Community Applications containers from the same image, sharing the
+same `/config` volume. `tier-full` has no `TIER_MODE` set (or `TIER_MODE=full`
+explicitly); `tier-promote` has `TIER_MODE=promote-only`. Schedule each via
+User Scripts:
+
+```
+# Monthly full run, 03:00 on the 1st — offset from Unraid parity check
+0 3 1 * * docker start -a tier-full
+
+# Daily promote-only run, 04:30
+30 4 * * * docker start -a tier-promote
+```
+
+Mode survives container recreate because it lives in the CA template's
+environment variables, not on a command line.
+
+**Pattern B — single container, args passed by User Scripts via `docker run`.**
+Simpler image management (one container to maintain), but the mode lives in
+the User Scripts cron entry rather than the CA template GUI:
+
+```
+30 4 * * * docker run --rm <your mounts/env> -e TIER_MODE=promote-only -e TIER_APPLY=true \
+    dazzathewiz/plex-media-tiering:latest
+```
+
+If the monthly full run is still in progress when the daily promote-only run
+fires, the daily run exits immediately with code 5 (`LOCK_HELD`). If they
+finish within a few minutes of each other, `skip_if_run_within_minutes`
+de-duplicates. Recommend running the daily pass in dry-run (no `--apply` /
+`TIER_APPLY=true`) for a week or two before enabling moves, same as any new
+move-executing config change.
 
 ## Scoring
 
@@ -928,12 +1030,16 @@ Capacity: demoted 12 items (520 GB) to TO_WARM to bring pool to 79.6%
 
 | Flag | Effect |
 |---|---|
-| `--no-promote` | Defers all `TO_HOT` items to `OVER_BUDGET_HOT` regardless of budget |
-| `--no-demote` | Skips the auto-demote pass even when the pool is over ceiling |
+| `--no-promote` | Defers all `TO_HOT` items to `OVER_BUDGET_HOT` regardless of budget; suppresses `TO_HOT` execution in the move pass |
+| `--no-demote` | Skips the auto-demote pass even when the pool is over ceiling; suppresses `TO_WARM` **and `RELOCATE_WARM`** execution in the move pass |
 
 Both flags are one-shot per-run overrides. They don't change `tiering.yaml`.
 Each is logged explicitly so dry-run output is unambiguous about why items are
 deferred or not demoted.
+
+As of P4.5, `--mode promote-only` / `--mode demote-only` are equivalent
+shortcuts for `--no-demote` / `--no-promote` respectively — see
+[Run modes](#run-modes-p45).
 
 ## Move hardening (P3.5)
 
@@ -1002,6 +1108,12 @@ Both `LOCK_HELD` and `SKIPPED_RECENT` are **expected** scheduler outcomes.
 Seeing them in cron mail does not indicate a failure and does not trigger
 the error notifier.
 
+`last_run.json` also tracks `last_full_run_finished_at` (P4.5) — the
+timestamp of the most recent successful `full`-mode run. It only advances on
+`full` runs; `promote-only`/`demote-only` runs carry it forward unchanged.
+This is what `min_episodes_for_fast_promote` measures "episodes watched
+since" against — see [Run modes](#run-modes-p45).
+
 ### Cron example
 
 ```
@@ -1009,13 +1121,16 @@ the error notifier.
 0 3 1 * * docker start -a tier
 ```
 
+For running a daily `promote-only` pass alongside the monthly full run, see
+"Scheduling on Unraid" under [Run modes](#run-modes-p45).
+
 ## Exit codes
 
 | Code | Meaning | Error? |
 | --- | --- | --- |
 | 0 | Success | No |
 | 1 | Config error (file missing, token placeholder, empty libraries) | Yes |
-| 2 | Plex unreachable or auth failed | Yes |
+| 2 | Plex unreachable or auth failed; also bad CLI usage (conflicting `--mode`/`--no-promote`/`--no-demote`, or invalid `TIER_MODE`/`TIER_APPLY`) | Yes |
 | 4 | Unhandled runtime error (notification fired if configured) | Yes |
 | 5 | Lock held — another tier.py instance is running | No |
 | 6 | Skipped — previous run finished within `skip_if_run_within_minutes` | No |

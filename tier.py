@@ -55,15 +55,27 @@ Phase status:
                     stale-PID reclaim, persisted run-state (last_run.json),
                     skip_if_run_within_minutes recency guard, formalised
                     exit-code contract.
+  P4.5 (done)       Promote-only run mode — --mode {full,promote-only,
+                    demote-only} as a cron-ergonomics shortcut over
+                    --no-promote/--no-demote (which now also suppresses
+                    RELOCATE_WARM). TIER_MODE env + scheduling.default_mode
+                    config give every CA-template/docker-start deployment a
+                    way to select it without CLI args (precedence: CLI >
+                    env > config > default); TIER_APPLY env mirrors --apply
+                    the same way. min_episodes_for_fast_promote guards
+                    promote-only TO_HOT for series against single-pilot
+                    watches.
 
 Usage:
     tier.py [--config PATH] [--library NAME ...] [--json|--csv PATH]
             [--explain TITLE] [--sort COL] [--top N] [--apply]
+            [--mode {full,promote-only,demote-only}]
 
 Exit codes:
     0  success
     1  configuration error (file missing, token placeholder, empty libraries)
-    2  Plex unreachable or auth failed
+    2  Plex unreachable or auth failed (or bad CLI usage, e.g. conflicting
+       --mode / --no-promote / --no-demote, or invalid TIER_MODE/TIER_APPLY)
     4  unhandled runtime error (error notification fired if configured)
     5  lock held — another tier.py instance is already running
     6  skipped — previous run finished within skip_if_run_within_minutes
@@ -290,12 +302,19 @@ DEFAULT_CONFIG = {
         # cert on a trusted LAN — Unraid API call only, no other effect.
         "unraid_api_verify_tls": True,
     },
-    # Scheduling primitives (P4.1).
+    # Scheduling primitives (P4.1) + run-mode defaults (P4.5).
     "scheduling": {
         # Skip this run if the previous run finished within this many minutes.
         # 0 = disabled. Useful when multiple triggers (cron + manual) can fire
         # close together and you only want one run per window.
         "skip_if_run_within_minutes": 0,
+        # Default run mode when neither --mode nor TIER_MODE is set.
+        # One of: full, promote-only, demote-only.
+        "default_mode": "full",
+        # promote-only runs only: a TV series is promoted to HOT only if at
+        # least this many episodes were watched since the last full run.
+        # Movies are unaffected. 1 disables the guard.
+        "min_episodes_for_fast_promote": 2,
     },
 }
 
@@ -510,6 +529,13 @@ class Item:
     # moves only those files while warm_disk_files stays intact for co-location
     # scoring in _select_warm_destination.  None = use full warm_disk_files.
     relocate_source_override: Optional[Dict[str, List[str]]] = None
+    # --- P4.5 fast-promote guard (series only) ---
+    # Distinct episode ratingKeys with a play event since the cutoff passed to
+    # collect_all() as fast_promote_cutoff (last_full_run_finished_at, or all
+    # history if no full run has ever completed). 0 for movies — the guard
+    # only applies to series. Computed unconditionally at collect time; only
+    # consulted when a promote-only run evaluates the fast-promote guard.
+    recent_episode_plays: int = 0
     # --- for --explain ---
     score_breakdown: dict = field(default_factory=dict)
 
@@ -1297,6 +1323,39 @@ def build_history_index(plex: PlexServer) -> dict:
     return index
 
 
+def _count_recent_episode_plays(episodes, history_index: dict, cutoff: Optional[datetime]) -> int:
+    """Count distinct episodes (by ratingKey) with a play event after `cutoff`.
+
+    Used by P4.5's fast-promote guard: a promote-only run should not promote
+    a multi-season series off a single-pilot watch. `history_index` already
+    holds a per-episode entry (keyed by the episode's own ratingKey, not the
+    show rollup) with a "last" viewed timestamp — see _ingest_history.
+
+    cutoff=None means "no full run has ever completed" — count every episode
+    with ANY recorded play, per the P4.5 spec's no-full-run-yet fallback.
+    """
+    count = 0
+    for ep in episodes:
+        rk = getattr(ep, "ratingKey", None)
+        if rk is None:
+            continue
+        try:
+            rk_int = int(rk)
+        except (TypeError, ValueError):
+            continue
+        entry = history_index.get(rk_int)
+        last = entry.get("last") if entry else None
+        if not last:
+            continue
+        # Plex's viewedAt timestamps come back offset-naive; cutoff (derived
+        # from our own isoformat() writes) is always offset-aware. Normalise
+        # before comparing or this raises TypeError on every promote-only run.
+        last = _as_utc(last)
+        if cutoff is None or last > cutoff:
+            count += 1
+    return count
+
+
 def _show_history_fallback(show) -> tuple[int, Optional[datetime]]:
     """Last-resort per-show history query.
 
@@ -1652,6 +1711,7 @@ def collect_series(
     path_map, hot_mount: str, array_disks: List[str],
     user_share_prefix: str = "",
     recently_active_shows: Optional[set] = None,
+    fast_promote_cutoff: Optional[datetime] = None,
 ) -> Iterable[Item]:
     tier_probing = bool(hot_mount) and bool(array_disks)
 
@@ -1717,6 +1777,10 @@ def collect_series(
             recently_active_shows and rk is not None and rk in recently_active_shows
         )
 
+        recent_episode_plays = _count_recent_episode_plays(
+            episodes, history_index, fast_promote_cutoff,
+        )
+
         # Current tier (P1): majority-bytes rollup across every episode.
         current_tier = "UNKNOWN"
         current_disk: Optional[str] = None
@@ -1752,6 +1816,7 @@ def collect_series(
             outcome="NEUTRAL",  # finalised in post-scoring override pass
             rating_key=rk,
             recently_added=recently_added,
+            recent_episode_plays=recent_episode_plays,
             score_breakdown=breakdown,
         )
 
@@ -1858,7 +1923,10 @@ def _apply_overrides(item: Item, cfg: dict, now: datetime) -> None:
     item.score_breakdown["recommendation"] = rec
 
 
-def collect_all(plex: PlexServer, cfg: dict, filter_libraries) -> List[Item]:
+def collect_all(
+    plex: PlexServer, cfg: dict, filter_libraries,
+    fast_promote_cutoff: Optional[datetime] = None,
+) -> List[Item]:
     now = datetime.now(timezone.utc)
     # Build the history index ONCE per run — it's a single Plex API call
     # and the rest of the loop is pure dict lookups.
@@ -1923,6 +1991,7 @@ def collect_all(plex: PlexServer, cfg: dict, filter_libraries) -> List[Item]:
                     section, name, now, thresholds, history_index,
                     path_map, hot_mount, array_disks, user_share_prefix,
                     recently_active_shows=recently_active_shows,
+                    fast_promote_cutoff=fast_promote_cutoff,
                 )
             )
             items.extend(new_items)
@@ -2781,16 +2850,66 @@ def _apply_capacity_budget(
                 log.warning("Capacity: warm disk %s — could not read usage", disk)
 
 
-def _run_move_pass(items: List["Item"], cfg: dict, apply: bool) -> dict:
+def _apply_fast_promote_guard(items: List[Item], cfg: dict, mode: str) -> set:
+    """P4.5: on promote-only runs, defer a series' TO_HOT unless enough of its
+    episodes have been watched since the last full run.
+
+    Applies only when mode == "promote-only" — full and demote-only runs are
+    unaffected (a single-pilot watch is exactly the signal a monthly full run
+    should corroborate before committing a multi-season promotion). Movies are
+    never affected; the guard only inspects kind == "series" items.
+
+    Returns the set of id(item) to exclude from this run's TO_HOT move queue.
+    The item's outcome is left as TO_HOT — it is simply not executed this run,
+    and is reconsidered on the next run (or unconditionally by the next full
+    run, which does not apply this guard).
+    """
+    skip_ids: set = set()
+    if mode != "promote-only":
+        return skip_ids
+    min_episodes = int((cfg.get("scheduling") or {}).get("min_episodes_for_fast_promote") or 1)
+    if min_episodes <= 1:
+        return skip_ids
+    for it in items:
+        if it.outcome != "TO_HOT" or it.kind != "series":
+            continue
+        if it.recent_episode_plays < min_episodes:
+            skip_ids.add(id(it))
+            log.info(
+                "Moves: [SKIPPED] %s [TO_HOT] — skipped: %d episode(s) since last full run, need %d",
+                it.title_year, it.recent_episode_plays, min_episodes,
+            )
+    return skip_ids
+
+
+def _run_move_pass(
+    items: List["Item"], cfg: dict, apply: bool,
+    no_promote: bool = False, no_demote: bool = False,
+    skip_promote_ids: Optional[set] = None,
+) -> dict:
     """Dry-run or execute moves for TO_HOT, TO_WARM, and RELOCATE_WARM outcomes.
 
     When apply=False: emits [DRY-RUN] log lines for every projected move.
     When apply=True:  executes rsync serially, verifies sizes, optionally
                       deletes the source after successful verification.
 
+    no_promote / no_demote (P4.5): suppress execution of TO_HOT, or of
+    TO_WARM + RELOCATE_WARM, respectively. This is distinct from (and in
+    addition to) _apply_capacity_budget's same-named parameters, which only
+    affect the capacity pass's own TO_HOT->OVER_BUDGET_HOT conversion and
+    auto-demote trigger — they do not touch items that scored TO_WARM or
+    RELOCATE_WARM directly. --no-demote must suppress RELOCATE_WARM too:
+    draining a series off an evicting disk is a demotion in cadence terms.
+    Suppressed items keep their scored outcome and are reconsidered next run.
+
+    skip_promote_ids (P4.5): set of id(item) to exclude from this run's
+    TO_HOT queue (the fast-promote episode-count guard). Outcome is left
+    untouched; the caller has already logged why each one was deferred.
+
     Skips the entire pass if moves.enabled is false in config.
     Returns a dict with moves_attempted, moves_succeeded, bytes_moved.
     """
+    skip_promote_ids = skip_promote_ids or set()
     _empty_stats: dict = {"moves_attempted": 0, "moves_succeeded": 0, "bytes_moved": 0}
     moves_cfg = cfg.get("moves") or {}
     if not moves_cfg.get("enabled"):
@@ -2836,6 +2955,22 @@ def _run_move_pass(items: List["Item"], cfg: dict, apply: bool) -> dict:
             sum(skip_outcomes.values()), parts_str,
         )
 
+    # --- P4.5 mode suppression: no_promote/no_demote stop entire directions
+    # regardless of how the item was scored (capacity budget's same-named
+    # params only affect its own conversion/auto-demote logic, see docstring).
+    if no_promote:
+        n_pending = sum(1 for it in items if it.outcome == "TO_HOT")
+        if n_pending:
+            log.info("Moves: promote suppressed this run — skipping %d TO_HOT item(s)", n_pending)
+    if no_demote:
+        n_warm_pending = sum(1 for it in items if it.outcome == "TO_WARM")
+        n_reloc_pending = sum(1 for it in items if it.outcome == "RELOCATE_WARM")
+        if n_warm_pending or n_reloc_pending:
+            log.info(
+                "Moves: demote suppressed this run — skipping %d TO_WARM + %d RELOCATE_WARM item(s)",
+                n_warm_pending, n_reloc_pending,
+            )
+
     # --- Build per-direction queues ---
 
     # TO_HOT: items with no warm_disk_files are idempotency skips (fully moved
@@ -2843,16 +2978,18 @@ def _run_move_pass(items: List["Item"], cfg: dict, apply: bool) -> dict:
     to_hot_skip = [it for it in items if it.outcome == "TO_HOT" and not it.warm_disk_files]
     to_hot_move: List["Item"] = []
     for it in items:
-        if it.outcome != "TO_HOT":
+        if it.outcome != "TO_HOT" or no_promote:
             continue
         if not it.warm_disk_files:
             continue  # idempotency skip — nothing left on warm
+        if id(it) in skip_promote_ids:
+            continue  # fast-promote episode-count guard — logged by caller
         to_hot_move.append(it)
 
     # TO_WARM: item is on the hot pool; hot_pool_files must be populated.
     to_warm_move: List["Item"] = []
     for it in items:
-        if it.outcome != "TO_WARM":
+        if it.outcome != "TO_WARM" or no_demote:
             continue
         if not it.hot_pool_files:
             log.warning("Moves: [SKIP] %s [TO_WARM] — no hot_pool_files (tier detection inactive?)",
@@ -2863,7 +3000,7 @@ def _run_move_pass(items: List["Item"], cfg: dict, apply: bool) -> dict:
     # RELOCATE_WARM: item is on an evicting disk; warm_disk_files must be populated.
     relocate_move: List["Item"] = []
     for it in items:
-        if it.outcome != "RELOCATE_WARM":
+        if it.outcome != "RELOCATE_WARM" or no_demote:
             continue
         if not it.warm_disk_files:
             log.warning("Moves: [SKIP] %s [RELOCATE_WARM] — no warm_disk_files (tier detection inactive?)",
@@ -3284,6 +3421,74 @@ def explain_one(items: List[Item], needle: str, thresholds: dict) -> None:
 # ---------- Main ----------
 
 
+# ---------- Run mode + env-var config layer (P4.5) ----------
+#
+# Unraid CA template recreates wipe command-line overrides, and `docker start`
+# cannot pass new args — so every behaviour a scheduled run depends on must be
+# reachable without CLI args. Precedence is CLI > env > config > built-in
+# default, established here for --mode/TIER_MODE and --apply/TIER_APPLY.
+# See AGENTS.md "Every settable behaviour must be reachable without CLI args."
+
+_VALID_MODES = ("full", "promote-only", "demote-only")
+_BOOL_TRUE_STRINGS = ("1", "true", "yes", "on")
+_BOOL_FALSE_STRINGS = ("0", "false", "no", "off")
+
+
+def _check_mode_conflicts(args, parser: argparse.ArgumentParser) -> None:
+    """--mode and --no-promote/--no-demote are mutually exclusive on the CLI."""
+    if getattr(args, "mode", None) is None:
+        return
+    if args.mode == "promote-only" and args.no_promote:
+        parser.error("--mode promote-only conflicts with --no-promote")
+    if args.mode == "demote-only" and args.no_demote:
+        parser.error("--mode demote-only conflicts with --no-demote")
+
+
+def _resolve_mode(args, cfg: dict) -> str:
+    """Resolve run mode: CLI --mode > TIER_MODE env > scheduling.default_mode > 'full'."""
+    if getattr(args, "mode", None):
+        return args.mode
+    env_val = os.environ.get("TIER_MODE")
+    if env_val:
+        if env_val not in _VALID_MODES:
+            log.error(
+                "Invalid TIER_MODE=%r from environment (must be one of %s)",
+                env_val, ", ".join(_VALID_MODES),
+            )
+            sys.exit(2)
+        return env_val
+    cfg_val = (cfg.get("scheduling") or {}).get("default_mode")
+    if cfg_val:
+        if cfg_val not in _VALID_MODES:
+            log.error(
+                "Invalid scheduling.default_mode=%r in config (must be one of %s)",
+                cfg_val, ", ".join(_VALID_MODES),
+            )
+            sys.exit(2)
+        return cfg_val
+    return "full"
+
+
+def _resolve_apply(args, cfg: dict) -> bool:
+    """Resolve --apply: CLI --apply > TIER_APPLY env > moves.apply config > False.
+
+    --apply is store_true (no CLI way to force False), so "CLI wins" only
+    applies when it's actually passed; otherwise env, then config, decide.
+    """
+    if args.apply:
+        return True
+    env_val = os.environ.get("TIER_APPLY")
+    if env_val is not None:
+        low = env_val.strip().lower()
+        if low in _BOOL_TRUE_STRINGS:
+            return True
+        if low in _BOOL_FALSE_STRINGS:
+            return False
+        log.error("Invalid TIER_APPLY=%r from environment (expected true/false)", env_val)
+        sys.exit(2)
+    return bool((cfg.get("moves") or {}).get("apply", False))
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="tier.py",
@@ -3327,7 +3532,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--no-demote", action="store_true",
-        help="skip auto-demote pass even if hot pool is over ceiling",
+        help="skip auto-demote pass and suppress TO_WARM + RELOCATE_WARM execution this run",
+    )
+    p.add_argument(
+        "--mode", choices=_VALID_MODES, default=None,
+        help=(
+            "run mode (default: full, or TIER_MODE env, or scheduling.default_mode "
+            "config). promote-only is equivalent to --no-demote; demote-only is "
+            "equivalent to --no-promote. Mutually exclusive with --no-promote/--no-demote."
+        ),
     )
     p.add_argument(
         "--log-file", type=Path, default=None,
@@ -3356,7 +3569,7 @@ def _ensure_state_dir() -> None:
     _STATE_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _acquire_lock() -> bool:
+def _acquire_lock(mode: str = "full") -> bool:
     """Acquire a kernel-level exclusive advisory lock via fcntl.flock.
 
     Uses fcntl.flock(LOCK_EX|LOCK_NB) rather than a PID-liveness check.
@@ -3407,7 +3620,7 @@ def _acquire_lock() -> bool:
         fh.write(json.dumps({
             "pid": os.getpid(),
             "started_at": datetime.now(timezone.utc).isoformat(),
-            "mode": "full",
+            "mode": mode,
         }))
         fh.flush()
     except Exception as e:  # noqa: BLE001
@@ -3458,20 +3671,55 @@ def _check_skip_recent(cfg: dict) -> bool:
     return False
 
 
-def _write_last_run(started_at: datetime, exit_code: int, move_stats: dict) -> None:
+def _write_last_run(
+    started_at: datetime, exit_code: int, move_stats: dict, mode: str = "full",
+) -> None:
     move_stats = move_stats or {}
+
+    # last_full_run_finished_at (P4.5): carried forward from the previous
+    # state file unless THIS run was a successful full run, in which case it
+    # advances to now. promote-only/demote-only runs never set it — only a
+    # full run gives the fast-promote guard a trustworthy reference point.
+    last_full_run_finished_at = None
+    if _LAST_RUN_FILE.exists():
+        try:
+            prev = json.loads(_LAST_RUN_FILE.read_text())
+            last_full_run_finished_at = prev.get("last_full_run_finished_at")
+        except Exception:  # noqa: BLE001
+            pass
+    finished_at = datetime.now(timezone.utc)
+    if mode == "full" and exit_code == int(ExitCode.SUCCESS):
+        last_full_run_finished_at = finished_at.isoformat()
+
     try:
         _LAST_RUN_FILE.write_text(json.dumps({
             "started_at": started_at.isoformat(),
-            "finished_at": datetime.now(timezone.utc).isoformat(),
-            "mode": "full",
+            "finished_at": finished_at.isoformat(),
+            "mode": mode,
             "exit_code": exit_code,
             "moves_attempted": move_stats.get("moves_attempted", 0),
             "moves_succeeded": move_stats.get("moves_succeeded", 0),
             "bytes_moved": move_stats.get("bytes_moved", 0),
+            "last_full_run_finished_at": last_full_run_finished_at,
         }, indent=2))
     except Exception as e:  # noqa: BLE001
         log.warning("Could not write last_run.json: %s", e)
+
+
+def _read_last_full_run_finished_at() -> Optional[datetime]:
+    """Read last_run.json's last_full_run_finished_at for the P4.5 fast-promote
+    guard. None if absent — collect_all() then counts over full history."""
+    if not _LAST_RUN_FILE.exists():
+        return None
+    try:
+        data = json.loads(_LAST_RUN_FILE.read_text())
+        val = data.get("last_full_run_finished_at")
+        if not val:
+            return None
+        return datetime.fromisoformat(val)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Could not read last_full_run_finished_at: %s", e)
+        return None
 
 
 def _run(args) -> dict:
@@ -3488,25 +3736,43 @@ def _run(args) -> dict:
     notifier = build_notifier(cfg)
     ncfg = cfg.get("notifications") or {}
 
-    log.info("tier.py starting — config=%s", args.config)
+    resolved_mode = _resolve_mode(args, cfg)
+    log.info("tier.py starting — config=%s mode=%s", args.config, resolved_mode)
 
     plex = connect_plex(cfg["plex"]["url"], cfg["plex"]["token"], notifier, ncfg)
 
-    items = collect_all(plex, cfg, filter_libraries=args.library)
+    # P4.5: promote-only's fast-promote guard counts episodes watched since
+    # the last full run; None (no full run recorded yet) makes collect_all
+    # count over the entire Plex history index instead of skipping the guard.
+    fast_promote_cutoff = _read_last_full_run_finished_at()
+    items = collect_all(
+        plex, cfg, filter_libraries=args.library,
+        fast_promote_cutoff=fast_promote_cutoff,
+    )
     items = apply_sort(items, args.sort)
+
+    # --mode is a cron-ergonomics shortcut over --no-promote/--no-demote:
+    # promote-only ⇔ --no-demote, demote-only ⇔ --no-promote. CLI flags and
+    # mode are mutually exclusive (enforced in main()), so OR-combining them
+    # here is safe — at most one side is ever actually set.
+    no_promote = bool(getattr(args, "no_promote", False)) or resolved_mode == "demote-only"
+    no_demote = bool(getattr(args, "no_demote", False)) or resolved_mode == "promote-only"
 
     # Capacity pass: apply hot pool budget and optional auto-demote before
     # the move pass so the move queues reflect budget-adjusted outcomes.
-    _apply_capacity_budget(
-        items, cfg,
-        no_promote=getattr(args, "no_promote", False),
-        no_demote=getattr(args, "no_demote", False),
-    )
+    _apply_capacity_budget(items, cfg, no_promote=no_promote, no_demote=no_demote)
+
+    # Fast-promote episode-count guard (promote-only runs only, series only).
+    skip_promote_ids = _apply_fast_promote_guard(items, cfg, resolved_mode)
 
     # Move pass runs on the full scored list before --top truncation so every
     # TO_HOT item is considered regardless of display limit.
-    moves_apply = args.apply or bool((cfg.get("moves") or {}).get("apply", False))
-    move_stats = _run_move_pass(items, cfg, apply=moves_apply)
+    moves_apply = _resolve_apply(args, cfg)
+    move_stats = _run_move_pass(
+        items, cfg, apply=moves_apply,
+        no_promote=no_promote, no_demote=no_demote,
+        skip_promote_ids=skip_promote_ids,
+    )
 
     if args.top:
         items = items[: args.top]
@@ -3573,7 +3839,9 @@ def _run(args) -> dict:
 
 
 def main() -> int:
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
+    _check_mode_conflicts(args, parser)  # exits 2 (bad usage) on conflict
 
     # Load config early to build notifier and read scheduling settings.
     # If the config itself blows up we fall back to stderr-only notifications.
@@ -3595,11 +3863,17 @@ def main() -> int:
         except Exception:  # noqa: BLE001
             notifier = CompositeNotifier([StderrNotifier()])
 
+        # Resolved once here (for lock metadata + last_run.json) and again
+        # inside _run() against its own cfg load — both are pure/side-effect
+        # free given the same args/cfg, so the duplication is harmless and
+        # mirrors the existing double load_config() call in this function.
+        resolved_mode = _resolve_mode(args, cfg_preview or {})
+
         # Scheduling primitives — run before any Plex connection.
         # LOCK_HELD and SKIPPED_RECENT are expected scheduler outcomes:
         # they do not notify and do not write last_run.json.
         _ensure_state_dir()
-        if not _acquire_lock():
+        if not _acquire_lock(mode=resolved_mode):
             return int(ExitCode.LOCK_HELD)
 
         try:
@@ -3612,12 +3886,14 @@ def main() -> int:
 
             try:
                 move_stats = _run(args) or move_stats
-                _write_last_run(started_at, int(ExitCode.SUCCESS), move_stats)
+                _write_last_run(started_at, int(ExitCode.SUCCESS), move_stats, mode=resolved_mode)
             except SystemExit:
                 raise
             except KeyboardInterrupt:
                 log.warning("Interrupted by user")
-                _write_last_run(started_at, int(ExitCode.KEYBOARD_INTERRUPT), move_stats)
+                _write_last_run(
+                    started_at, int(ExitCode.KEYBOARD_INTERRUPT), move_stats, mode=resolved_mode,
+                )
                 exit_code = ExitCode.KEYBOARD_INTERRUPT
             except Exception as e:  # noqa: BLE001
                 tb = traceback.format_exc()
@@ -3633,7 +3909,9 @@ def main() -> int:
                         ),
                         level="error",
                     )
-                _write_last_run(started_at, int(ExitCode.UNHANDLED_CRASH), move_stats)
+                _write_last_run(
+                    started_at, int(ExitCode.UNHANDLED_CRASH), move_stats, mode=resolved_mode,
+                )
                 exit_code = ExitCode.UNHANDLED_CRASH
 
             return int(exit_code)
@@ -6552,6 +6830,373 @@ def _test_ingest_history_no_grandparent_skipped_cleanly():
     print("_test_ingest_history_no_grandparent_skipped_cleanly: OK")
 
 
+def _test_mode_promote_only_skips_demotions():
+    """promote-only: TO_HOT executes; TO_WARM + RELOCATE_WARM are suppressed."""
+    rsync_calls = []
+
+    def _fake_run(cmd, **_):
+        if cmd and cmd[0] == "rsync":
+            rsync_calls.append(cmd)
+        class R:
+            returncode = 0
+            stderr = ""
+        return R()
+
+    to_hot = _make_item(
+        kind="movie", current_tier="WARM",
+        warm_disk_files={"/mnt/disk1": ["/mnt/disk1/Movies/A.mkv"]},
+    )
+    to_hot.outcome = "TO_HOT"
+    to_warm = _make_item(
+        kind="movie", current_tier="HOT",
+        hot_pool_files=["/mnt/zfs_media/Movies/B.mkv"],
+    )
+    to_warm.outcome = "TO_WARM"
+    relocate = _make_item(
+        kind="movie", current_tier="WARM", current_disk="/mnt/disk2",
+        warm_disk_files={"/mnt/disk2": ["/mnt/disk2/Movies/C.mkv"]},
+    )
+    relocate.outcome = "RELOCATE_WARM"
+
+    cfg = {
+        "moves": {
+            "enabled": True, "rsync_options": ["-aH"],
+            "delete_source_after_verify": False, "size_verify": False,
+            "parity_check_blocking": False, "bandwidth_limit_mbps": None,
+        },
+        "paths": {"hot_pool_mount": "/mnt/zfs_media", "array_disks": ["/mnt/disk1", "/mnt/disk2"]},
+    }
+
+    orig = subprocess.run
+    try:
+        subprocess.run = _fake_run
+        _run_move_pass([to_hot, to_warm, relocate], cfg, apply=True, no_demote=True)
+    finally:
+        subprocess.run = orig
+
+    assert len(rsync_calls) == 1, f"expected only TO_HOT to rsync, got {len(rsync_calls)} calls"
+    assert to_warm.outcome == "TO_WARM", "outcome must be unchanged, not converted"
+    assert relocate.outcome == "RELOCATE_WARM", "outcome must be unchanged, not converted"
+    print("_test_mode_promote_only_skips_demotions: OK")
+
+
+def _test_mode_demote_only_skips_promotions():
+    """demote-only: TO_WARM + RELOCATE_WARM execute; TO_HOT is suppressed."""
+    global _disk_free_bytes
+    orig_dfb = _disk_free_bytes
+    rsync_calls = []
+
+    def _fake_run(cmd, **_):
+        if cmd and cmd[0] == "rsync":
+            rsync_calls.append(cmd)
+        class R:
+            returncode = 0
+            stderr = ""
+        return R()
+
+    to_hot = _make_item(
+        kind="movie", current_tier="WARM",
+        warm_disk_files={"/mnt/disk1": ["/mnt/disk1/Movies/A.mkv"]},
+    )
+    to_hot.outcome = "TO_HOT"
+    to_warm = _make_item(
+        kind="movie", current_tier="HOT",
+        hot_pool_files=["/mnt/zfs_media/Movies/B.mkv"],
+    )
+    to_warm.outcome = "TO_WARM"
+    relocate = _make_item(
+        kind="movie", current_tier="WARM", current_disk="/mnt/disk1",
+        warm_disk_files={"/mnt/disk1": ["/mnt/disk1/Movies/C.mkv"]},
+    )
+    relocate.outcome = "RELOCATE_WARM"
+
+    cfg = {
+        "moves": {
+            "enabled": True, "rsync_options": ["-aH"],
+            "delete_source_after_verify": False, "size_verify": False,
+            "parity_check_blocking": False, "bandwidth_limit_mbps": None,
+        },
+        "paths": {"hot_pool_mount": "/mnt/zfs_media", "array_disks": ["/mnt/disk1", "/mnt/disk2"]},
+    }
+
+    orig_run = subprocess.run
+    try:
+        _disk_free_bytes = lambda p: 500 * 1024 ** 3  # noqa: E731
+        subprocess.run = _fake_run
+        _run_move_pass([to_hot, to_warm, relocate], cfg, apply=True, no_promote=True)
+    finally:
+        subprocess.run = orig_run
+        _disk_free_bytes = orig_dfb
+
+    assert len(rsync_calls) == 2, f"expected TO_WARM + RELOCATE_WARM to rsync, got {len(rsync_calls)}"
+    assert to_hot.outcome == "TO_HOT", "outcome must be unchanged, not converted"
+    print("_test_mode_demote_only_skips_promotions: OK")
+
+
+def _test_mode_full_is_default():
+    """No --mode, no TIER_MODE, no scheduling.default_mode -> 'full'."""
+    orig_env = os.environ.pop("TIER_MODE", None)
+    try:
+        args = build_parser().parse_args([])
+        resolved = _resolve_mode(args, {})
+        assert resolved == "full", f"expected full, got {resolved}"
+    finally:
+        if orig_env is not None:
+            os.environ["TIER_MODE"] = orig_env
+    print("_test_mode_full_is_default: OK")
+
+
+def _test_no_demote_now_covers_relocate_warm():
+    """--no-demote (no_demote=True) suppresses RELOCATE_WARM, not just TO_WARM."""
+    rsync_calls = []
+
+    def _fake_run(cmd, **_):
+        if cmd and cmd[0] == "rsync":
+            rsync_calls.append(cmd)
+        class R:
+            returncode = 0
+            stderr = ""
+        return R()
+
+    to_warm = _make_item(
+        kind="movie", current_tier="HOT",
+        hot_pool_files=["/mnt/zfs_media/Movies/B.mkv"],
+    )
+    to_warm.outcome = "TO_WARM"
+    relocate = _make_item(
+        kind="movie", current_tier="WARM", current_disk="/mnt/disk2",
+        warm_disk_files={"/mnt/disk2": ["/mnt/disk2/Movies/C.mkv"]},
+    )
+    relocate.outcome = "RELOCATE_WARM"
+
+    cfg = {
+        "moves": {
+            "enabled": True, "rsync_options": ["-aH"],
+            "delete_source_after_verify": False, "size_verify": False,
+            "parity_check_blocking": False, "bandwidth_limit_mbps": None,
+        },
+        "paths": {"hot_pool_mount": "/mnt/zfs_media", "array_disks": ["/mnt/disk1", "/mnt/disk2"]},
+    }
+
+    orig = subprocess.run
+    try:
+        subprocess.run = _fake_run
+        _run_move_pass([to_warm, relocate], cfg, apply=True, no_demote=True)
+    finally:
+        subprocess.run = orig
+
+    assert not rsync_calls, f"expected zero rsync calls under no_demote, got {len(rsync_calls)}"
+    print("_test_no_demote_now_covers_relocate_warm: OK")
+
+
+def _test_mode_and_no_flag_conflict_errors():
+    """--mode promote-only + --no-promote on the CLI is a bad-usage error (exit 2)."""
+    parser = build_parser()
+    args = parser.parse_args(["--mode", "promote-only", "--no-promote"])
+    try:
+        _check_mode_conflicts(args, parser)
+        raised = False
+        code = None
+    except SystemExit as e:
+        raised = True
+        code = e.code
+    assert raised, "expected SystemExit for conflicting --mode/--no-promote"
+    assert code == 2, f"expected exit code 2, got {code}"
+    print("_test_mode_and_no_flag_conflict_errors: OK")
+
+
+def _test_mode_resolved_from_env():
+    """No CLI --mode, TIER_MODE=promote-only -> resolved mode is promote-only."""
+    orig_env = os.environ.get("TIER_MODE")
+    try:
+        os.environ["TIER_MODE"] = "promote-only"
+        args = build_parser().parse_args([])
+        resolved = _resolve_mode(args, {})
+        assert resolved == "promote-only", f"expected promote-only, got {resolved}"
+    finally:
+        if orig_env is None:
+            os.environ.pop("TIER_MODE", None)
+        else:
+            os.environ["TIER_MODE"] = orig_env
+    print("_test_mode_resolved_from_env: OK")
+
+
+def _test_mode_resolved_from_config_default():
+    """No CLI, no env, scheduling.default_mode=promote-only -> resolved mode is promote-only."""
+    orig_env = os.environ.pop("TIER_MODE", None)
+    try:
+        args = build_parser().parse_args([])
+        cfg = {"scheduling": {"default_mode": "promote-only"}}
+        resolved = _resolve_mode(args, cfg)
+        assert resolved == "promote-only", f"expected promote-only, got {resolved}"
+    finally:
+        if orig_env is not None:
+            os.environ["TIER_MODE"] = orig_env
+    print("_test_mode_resolved_from_config_default: OK")
+
+
+def _test_mode_precedence_cli_over_env():
+    """--mode full + TIER_MODE=promote-only -> CLI wins (full)."""
+    orig_env = os.environ.get("TIER_MODE")
+    try:
+        os.environ["TIER_MODE"] = "promote-only"
+        args = build_parser().parse_args(["--mode", "full"])
+        resolved = _resolve_mode(args, {})
+        assert resolved == "full", f"expected full (CLI wins), got {resolved}"
+    finally:
+        if orig_env is None:
+            os.environ.pop("TIER_MODE", None)
+        else:
+            os.environ["TIER_MODE"] = orig_env
+    print("_test_mode_precedence_cli_over_env: OK")
+
+
+def _test_mode_precedence_env_over_config():
+    """TIER_MODE=full + scheduling.default_mode=promote-only -> env wins (full)."""
+    orig_env = os.environ.get("TIER_MODE")
+    try:
+        os.environ["TIER_MODE"] = "full"
+        args = build_parser().parse_args([])
+        cfg = {"scheduling": {"default_mode": "promote-only"}}
+        resolved = _resolve_mode(args, cfg)
+        assert resolved == "full", f"expected full (env wins), got {resolved}"
+    finally:
+        if orig_env is None:
+            os.environ.pop("TIER_MODE", None)
+        else:
+            os.environ["TIER_MODE"] = orig_env
+    print("_test_mode_precedence_env_over_config: OK")
+
+
+def _test_mode_invalid_env_value_errors():
+    """TIER_MODE=garbage -> bad-usage exit (2), source named in the log."""
+    orig_env = os.environ.get("TIER_MODE")
+    try:
+        os.environ["TIER_MODE"] = "garbage"
+        args = build_parser().parse_args([])
+        try:
+            _resolve_mode(args, {})
+            raised = False
+            code = None
+        except SystemExit as e:
+            raised = True
+            code = e.code
+        assert raised, "expected SystemExit for invalid TIER_MODE"
+        assert code == 2, f"expected exit code 2, got {code}"
+    finally:
+        if orig_env is None:
+            os.environ.pop("TIER_MODE", None)
+        else:
+            os.environ["TIER_MODE"] = orig_env
+    print("_test_mode_invalid_env_value_errors: OK")
+
+
+def _test_apply_resolved_from_env():
+    """No CLI --apply, TIER_APPLY=true -> apply mode resolves to True."""
+    orig_env = os.environ.get("TIER_APPLY")
+    try:
+        os.environ["TIER_APPLY"] = "true"
+        args = build_parser().parse_args([])
+        resolved = _resolve_apply(args, {})
+        assert resolved is True, f"expected True, got {resolved}"
+    finally:
+        if orig_env is None:
+            os.environ.pop("TIER_APPLY", None)
+        else:
+            os.environ["TIER_APPLY"] = orig_env
+    print("_test_apply_resolved_from_env: OK")
+
+
+def _test_min_episodes_blocks_single_pilot():
+    """promote-only, series TO_HOT, 1 episode watched since last full run, threshold 2 -> deferred."""
+    item = _make_item(kind="series", outcome="TO_HOT", recent_episode_plays=1)
+    cfg = {"scheduling": {"min_episodes_for_fast_promote": 2}}
+    skip_ids = _apply_fast_promote_guard([item], cfg, "promote-only")
+    assert id(item) in skip_ids, "single-pilot series should be deferred"
+    assert item.outcome == "TO_HOT", "outcome must stay TO_HOT, not converted"
+    print("_test_min_episodes_blocks_single_pilot: OK")
+
+
+def _test_min_episodes_allows_binge():
+    """promote-only, series TO_HOT, 3 episodes watched since last full run, threshold 2 -> moved."""
+    item = _make_item(kind="series", outcome="TO_HOT", recent_episode_plays=3)
+    cfg = {"scheduling": {"min_episodes_for_fast_promote": 2}}
+    skip_ids = _apply_fast_promote_guard([item], cfg, "promote-only")
+    assert id(item) not in skip_ids, "binge-watched series should not be deferred"
+    print("_test_min_episodes_allows_binge: OK")
+
+
+def _test_min_episodes_ignores_movies():
+    """promote-only, movie TO_HOT -> moved regardless of the episode threshold."""
+    item = _make_item(kind="movie", outcome="TO_HOT", recent_episode_plays=0)
+    cfg = {"scheduling": {"min_episodes_for_fast_promote": 2}}
+    skip_ids = _apply_fast_promote_guard([item], cfg, "promote-only")
+    assert id(item) not in skip_ids, "movies must be unaffected by the episode guard"
+    print("_test_min_episodes_ignores_movies: OK")
+
+
+def _test_min_episodes_no_full_run_fallback():
+    """cutoff=None (no full run ever recorded) -> counts any recorded play, not just recent ones."""
+    class FakeEp:
+        def __init__(self, rk):
+            self.ratingKey = rk
+
+    episodes = [FakeEp(1), FakeEp(2)]
+    history_index = {1: {"plays": 3, "last": datetime(2020, 1, 1, tzinfo=timezone.utc)}}
+    count = _count_recent_episode_plays(episodes, history_index, None)
+    assert count == 1, f"expected 1 (episode 2 has no history entry), got {count}"
+    print("_test_min_episodes_no_full_run_fallback: OK")
+
+
+def _test_count_recent_episode_plays_naive_viewed_at():
+    """Plex's viewedAt comes back offset-naive; cutoff is always offset-aware
+    (built from our own isoformat() writes). Comparing them directly raises
+    TypeError — this regression test pins the _as_utc() normalisation fix."""
+    class FakeEp:
+        def __init__(self, rk):
+            self.ratingKey = rk
+
+    cutoff = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    episodes = [FakeEp(1), FakeEp(2)]
+    history_index = {
+        1: {"plays": 1, "last": datetime(2026, 1, 5)},   # naive, after cutoff
+        2: {"plays": 1, "last": datetime(2025, 1, 1)},   # naive, before cutoff
+    }
+    count = _count_recent_episode_plays(episodes, history_index, cutoff)
+    assert count == 1, f"expected 1 (only episode 1 is after cutoff), got {count}"
+    print("_test_count_recent_episode_plays_naive_viewed_at: OK")
+
+
+def _test_last_full_run_recorded():
+    """A full run sets last_full_run_finished_at; a promote-only run carries it forward."""
+    import tempfile as _tf
+    global _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE
+    orig_state, orig_lock, orig_last = _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE
+    try:
+        with _tf.TemporaryDirectory() as tmp:
+            _STATE_DIR = Path(tmp)
+            _LOCK_FILE = _STATE_DIR / "tier.lock"
+            _LAST_RUN_FILE = _STATE_DIR / "last_run.json"
+
+            started = datetime(2026, 6, 1, 3, 0, 0, tzinfo=timezone.utc)
+            stats = {"moves_attempted": 0, "moves_succeeded": 0, "bytes_moved": 0}
+            _write_last_run(started, int(ExitCode.SUCCESS), stats, mode="full")
+            data = json.loads(_LAST_RUN_FILE.read_text())
+            assert data["last_full_run_finished_at"], "full run must set last_full_run_finished_at"
+            full_finished = data["last_full_run_finished_at"]
+
+            started2 = datetime(2026, 6, 2, 4, 30, 0, tzinfo=timezone.utc)
+            _write_last_run(started2, int(ExitCode.SUCCESS), stats, mode="promote-only")
+            data2 = json.loads(_LAST_RUN_FILE.read_text())
+            assert data2["last_full_run_finished_at"] == full_finished, (
+                "promote-only run must carry last_full_run_finished_at forward unchanged"
+            )
+            assert data2["mode"] == "promote-only"
+    finally:
+        _STATE_DIR, _LOCK_FILE, _LAST_RUN_FILE = orig_state, orig_lock, orig_last
+    print("_test_last_full_run_recorded: OK")
+
+
 if __name__ == "__main__":
     if "--_test" in sys.argv:
         _test_resolve_user_share()
@@ -6641,5 +7286,22 @@ if __name__ == "__main__":
         _test_last_run_written_when_run_returns_none()
         _test_ingest_history_grandparent_key_fallback()
         _test_ingest_history_no_grandparent_skipped_cleanly()
+        _test_mode_promote_only_skips_demotions()
+        _test_mode_demote_only_skips_promotions()
+        _test_mode_full_is_default()
+        _test_no_demote_now_covers_relocate_warm()
+        _test_mode_and_no_flag_conflict_errors()
+        _test_mode_resolved_from_env()
+        _test_mode_resolved_from_config_default()
+        _test_mode_precedence_cli_over_env()
+        _test_mode_precedence_env_over_config()
+        _test_mode_invalid_env_value_errors()
+        _test_apply_resolved_from_env()
+        _test_min_episodes_blocks_single_pilot()
+        _test_min_episodes_allows_binge()
+        _test_min_episodes_ignores_movies()
+        _test_min_episodes_no_full_run_fallback()
+        _test_count_recent_episode_plays_naive_viewed_at()
+        _test_last_full_run_recorded()
         sys.exit(int(ExitCode.SUCCESS))
     sys.exit(main())
