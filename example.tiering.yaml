@@ -329,3 +329,14 @@ scheduling:
   # manual trigger could fire within the same hour — only the first run
   # executes, the second exits quietly with code 6 (SKIPPED_RECENT).
   skip_if_run_within_minutes: 0
+
+  # Default run mode when neither --mode nor TIER_MODE is set.
+  # One of: full, promote-only, demote-only. See README "Run modes".
+  default_mode: full
+  # default_mode: promote-only             # example: daily fast-cadence container
+
+  # On promote-only runs only: a TV series is promoted to HOT only if at least
+  # this many episodes have been watched since the last full run. Filters out
+  # single-pilot watches that shouldn't promote a whole series. Movies are not
+  # affected. Ignored on full and demote-only runs. 1 disables the guard.
+  min_episodes_for_fast_promote: 2
