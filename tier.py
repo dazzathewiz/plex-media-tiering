@@ -213,6 +213,19 @@ DEFAULT_CONFIG = {
         "enabled": False,
         "disks": [],  # disk paths matching paths.array_disks format
     },
+    # Warm-tier write allow-list. Restricts which array disks TO_WARM /
+    # RELOCATE_WARM may write to (and which count for warm capacity and
+    # eviction). Reads are unrestricted: tier detection and TO_HOT still see
+    # every array disk. Unset (null) = every array disk is eligible.
+    "warm": {
+        # Unraid disk names, e.g. ["disk2", "disk4"] -> /mnt/disk2, /mnt/disk4.
+        # An empty list, a non-diskN name or an unmounted disk is a config error.
+        "allowed_disks": None,
+        # STAY_WARM items with files on a disallowed disk are reported as
+        # WARM_ON_DISALLOWED_DISK and left alone. true = plan them as
+        # RELOCATE_WARM onto an allowed disk instead (normal --apply gating).
+        "relocate_from_disallowed": False,
+    },
     # Move executor (P2). Requires --apply to execute; dry-run always when off.
     # enabled: false means the move pass is skipped entirely — no log lines.
     "moves": {
@@ -529,6 +542,10 @@ class Item:
     # moves only those files while warm_disk_files stays intact for co-location
     # scoring in _select_warm_destination.  None = use full warm_disk_files.
     relocate_source_override: Optional[Dict[str, List[str]]] = None
+    # --- warm allow-list (set by _apply_disallowed_disk_pass) ---
+    # Disks outside warm.allowed_disks holding files of a STAY_WARM item, for
+    # WARM_ON_DISALLOWED_DISK reporting (or the opt-in RELOCATE_WARM).
+    disallowed_disks: List[str] = field(default_factory=list)
     # --- P4.5 fast-promote guard (series only) ---
     # Distinct episode ratingKeys with a play event since the cutoff passed to
     # collect_all() as fast_promote_cutoff (last_full_run_finished_at, or all
@@ -620,6 +637,10 @@ def load_config(path: Path) -> dict:
         )
     if not cfg["libraries"]:
         sys.exit("Config error: at least one library must be listed")
+    try:
+        resolve_warm_allowed_disks(cfg)
+    except ValueError as e:
+        sys.exit(f"Config error: {e}")
 
     return cfg
 
@@ -707,11 +728,77 @@ def resolve_array_disks(cfg: dict) -> List[str]:
     return detected
 
 
-def _build_evict_disks(evict_cfg: dict, array_disks: List[str]) -> set:
+# Unraid array disk names accepted by warm.allowed_disks.
+_WARM_DISK_NAME_PATTERN = re.compile(r"^disk\d+$")
+
+
+def _is_mount(path: str) -> bool:
+    """os.path.ismount — module-level for test patching."""
+    return os.path.ismount(path)
+
+
+def resolve_warm_allowed_disks(
+    cfg: dict, array_disks: Optional[List[str]] = None,
+) -> Optional[List[str]]:
+    """Return the warm.allowed_disks allow-list as mount paths, or None if unset.
+
+    Each entry is an Unraid disk name (`diskN`) resolved to `/mnt/diskN`, which
+    must be in the effective array_disks list and actually mounted. Raises
+    ValueError on an empty list, a non-diskN name, or an unknown/unmounted
+    disk; load_config() turns that into a config-error exit at startup.
+    """
+    raw = (cfg.get("warm") or {}).get("allowed_disks")
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or not raw:
+        raise ValueError(
+            "warm.allowed_disks must be a non-empty list of disk names "
+            "(e.g. [disk2, disk4]); omit it to allow every array disk"
+        )
+    if array_disks is None:
+        array_disks = resolve_array_disks(cfg)
+    known = set(array_disks)
+    allowed: List[str] = []
+    for name in raw:
+        n = str(name).strip()
+        if not _WARM_DISK_NAME_PATTERN.match(n):
+            raise ValueError(
+                f"warm.allowed_disks: {name!r} is not an Unraid disk name (expected disk<N>)"
+            )
+        path = f"/mnt/{n}"
+        if path not in known:
+            raise ValueError(
+                f"warm.allowed_disks: {n} ({path}) is not in the effective array_disks list"
+            )
+        if not _is_mount(path):
+            raise ValueError(f"warm.allowed_disks: {n} ({path}) is not mounted")
+        if path not in allowed:
+            allowed.append(path)
+    return allowed
+
+
+def _warm_write_disks(cfg: dict, array_disks: List[str]) -> List[str]:
+    """Return the array disks the warm tier may write to (allow-list applied).
+
+    Unset allow-list → array_disks unchanged. Only governs writes (TO_WARM /
+    RELOCATE_WARM destinations, warm capacity, eviction); tier detection and
+    TO_HOT sources always use the full array_disks list.
+    """
+    allowed = resolve_warm_allowed_disks(cfg, array_disks)
+    if allowed is None:
+        return list(array_disks)
+    return [d for d in array_disks if d in allowed]
+
+
+def _build_evict_disks(
+    evict_cfg: dict, array_disks: List[str],
+    allowed_disks: Optional[List[str]] = None,
+) -> set:
     """Return validated set of evicting disk paths from array_disk_evict config.
 
     Logs a WARNING for any configured disk that isn't in the effective
-    array_disks list (typo, stale path, or disk removed from config).
+    array_disks list (typo, stale path, or disk removed from config), or that
+    is outside warm.allowed_disks when an allow-list is set (allowed_disks).
     Returns an empty set when disabled, when the disks list is empty, or when
     all entries failed validation — in all cases no eviction lines are logged.
     """
@@ -723,13 +810,80 @@ def _build_evict_disks(evict_cfg: dict, array_disks: List[str]) -> set:
     valid_array = set(array_disks)
     result = set()
     for d in raw:
-        if d in valid_array:
-            result.add(d)
-        else:
+        if d not in valid_array:
             log.warning(
                 "Eviction: disk %r not in effective array_disks list — skipping", d
             )
+        elif allowed_disks is not None and d not in allowed_disks:
+            # Draining a disallowed disk would delete from a disk tier.py must
+            # not touch; warm.relocate_from_disallowed is the opt-in for that.
+            log.warning(
+                "Eviction: disk %r not in warm.allowed_disks — skipping", d
+            )
+        else:
+            result.add(d)
     return result
+
+
+def _restrict_relocate_source(it: "Item", source_disks: set) -> None:
+    """Limit a RELOCATE_WARM item's rsync source + delete to files on source_disks.
+
+    warm_disk_files may include files on other (safe) disks. Without this
+    guard the move executor would rsync those files to themselves when
+    co-location picks their disk, size-verify would pass, and the delete would
+    remove them → data loss. When the majority disk is safe (minority case),
+    current_disk is overridden to the source disk with the most bytes so
+    _select_warm_destination excludes it rather than the safe majority disk.
+    """
+    files = {d: it.warm_disk_files[d] for d in it.warm_disk_files if d in source_disks}
+    if not files:
+        return
+    it.relocate_source_override = files
+    if it.current_disk not in source_disks:
+        it.current_disk = max(
+            files.keys(),
+            key=lambda d: sum(os.path.getsize(f) for f in files[d] if os.path.exists(f)),
+        )
+
+
+def _apply_disallowed_disk_pass(
+    items: List["Item"], array_disks: List[str],
+    allowed_disks: List[str], relocate: bool,
+) -> None:
+    """Flag STAY_WARM items with files on disks outside warm.allowed_disks.
+
+    Default: outcome → WARM_ON_DISALLOWED_DISK (reported, never moved).
+    relocate=True (warm.relocate_from_disallowed): outcome → RELOCATE_WARM with
+    the source restricted to the disallowed-disk files, so the normal relocate
+    path moves them onto an allowed disk. Item.disallowed_disks records which
+    disks were involved either way.
+    """
+    disallowed = set(array_disks) - set(allowed_disks)
+    if not disallowed:
+        return
+    outcome = "RELOCATE_WARM" if relocate else "WARM_ON_DISALLOWED_DISK"
+    flagged = 0
+    for it in items:
+        if it.outcome != "STAY_WARM":
+            continue
+        bad = sorted(d for d in it.warm_disk_files if d in disallowed)
+        if not bad:
+            continue
+        it.disallowed_disks = bad
+        it.outcome = outcome
+        if relocate:
+            _restrict_relocate_source(it, set(bad))
+        flagged += 1
+        log.info(
+            "Allow-list: [%s] %s — %d file(s) on disallowed %s",
+            outcome, it.title_year,
+            sum(len(it.warm_disk_files[d]) for d in bad),
+            ", ".join(os.path.basename(d) for d in bad),
+        )
+    log.info(
+        "Allow-list: %d STAY_WARM items on disallowed disks (%s) flagged %s",
+        flagged, ", ".join(sorted(os.path.basename(d) for d in disallowed)), outcome,
+    )
 
 
 def translate_plex_path(plex_path: str, path_map) -> str:
@@ -1960,6 +2114,17 @@ def collect_all(
             hot_mount, len(array_disks),
         )
 
+    # Warm allow-list (validated at startup by load_config). Governs warm
+    # writes only — tier detection above still probes every array disk.
+    allowed_disks = resolve_warm_allowed_disks(cfg, array_disks)
+    if allowed_disks is not None:
+        log.info(
+            "Warm allow-list: writes restricted to %s (%d of %d array disks); "
+            "relocate_from_disallowed=%s",
+            ", ".join(allowed_disks), len(allowed_disks), len(array_disks),
+            bool((cfg.get("warm") or {}).get("relocate_from_disallowed")),
+        )
+
     thresholds = cfg["thresholds"]
     floor_movie_count = 0
     floor_series_count = 0
@@ -2053,7 +2218,7 @@ def collect_all(
     # are flagged RELOCATE_WARM so P2's mover knows to relocate them.
     evict_cfg = cfg.get("array_disk_evict") or {}
     if evict_cfg.get("enabled"):
-        evict_disks = _build_evict_disks(evict_cfg, array_disks)
+        evict_disks = _build_evict_disks(evict_cfg, array_disks, allowed_disks)
         if evict_disks:
             for it in items:
                 if it.current_tier == "WARM":
@@ -2077,38 +2242,23 @@ def collect_all(
                     it.outcome = "RELOCATE_WARM"
                     relocate_count += 1
                     # Always restrict the rsync source to ONLY the evicting-disk
-                    # files.  warm_disk_files may include files from non-evicting
-                    # disks (older seasons of a series whose majority lives on the
-                    # evicting disk).  Without this guard the move executor would:
-                    #   1. rsync non-evicting-disk files to themselves (self-copy
-                    #      when co-location picks that disk as the destination)
-                    #   2. size_verify would PASS (the files are "already there")
-                    #   3. delete would remove them → data loss
-                    evict_files = {
-                        d: it.warm_disk_files[d]
-                        for d in it.warm_disk_files
-                        if d in evict_disks
-                    }
-                    if evict_files:
-                        it.relocate_source_override = evict_files
-                        # Minority-evict only: override current_disk to the
-                        # evicting disk so _select_warm_destination excludes it
-                        # from candidates (not the safe majority disk).
-                        if it.current_disk not in evict_disks:
-                            it.current_disk = max(
-                                evict_files.keys(),
-                                key=lambda d: sum(
-                                    os.path.getsize(f)
-                                    for f in evict_files[d]
-                                    if os.path.exists(f)
-                                ),
-                            )
+                    # files (data-loss guard — see _restrict_relocate_source).
+                    _restrict_relocate_source(it, evict_disks)
                 elif it.outcome in _HOT_OUTCOMES:
                     implicit_hot_count += 1
             log.info(
                 "Eviction: %d items flagged RELOCATE_WARM (TO_HOT path: %d)",
                 relocate_count, implicit_hot_count,
             )
+
+    # Warm allow-list pass: STAY_WARM items with files on disallowed disks are
+    # reported (WARM_ON_DISALLOWED_DISK) or, opt-in, relocated. Runs after
+    # eviction so eviction keeps precedence on allowed disks.
+    if allowed_disks is not None:
+        _apply_disallowed_disk_pass(
+            items, array_disks, allowed_disks,
+            relocate=bool((cfg.get("warm") or {}).get("relocate_from_disallowed")),
+        )
 
     # Straggler cleanup: items whose MAJORITY tier matches their recommendation
     # (STAY) but whose MINORITY bytes are on the wrong tier.  Typical cause:
@@ -2827,8 +2977,15 @@ def _apply_capacity_budget(
     elif no_demote and auto_demote and over_ceiling:
         log.info("Capacity: --no-demote set — auto-demote pass skipped (pool over ceiling)")
 
-    # --- Warm disk per-disk usage ---
-    array_disks = resolve_array_disks(cfg)
+    # --- Warm disk per-disk usage (allow-listed disks only) ---
+    all_array_disks = resolve_array_disks(cfg)
+    array_disks = _warm_write_disks(cfg, all_array_disks)
+    excluded = [d for d in all_array_disks if d not in array_disks]
+    if excluded:
+        log.info(
+            "Capacity: %d warm disk(s) outside warm.allowed_disks not counted (%s)",
+            len(excluded), ", ".join(excluded),
+        )
     if array_disks:
         ceiling_label = int(warm_ceiling_pct * 100)
         for disk in sorted(array_disks):
@@ -2928,13 +3085,17 @@ def _run_move_pass(
     # an evicting disk as the destination (RELOCATE_WARM already excludes its
     # source disk via exclude_disk, but this covers TO_WARM and the non-source
     # evicting disks in a multi-evict scenario).
+    #
+    # Disks outside warm.allowed_disks are never write candidates either; when
+    # the allow-list is unset _warm_write_disks returns array_disks unchanged.
+    write_disks = _warm_write_disks(cfg, array_disks)
     evict_cfg = cfg.get("array_disk_evict") or {}
     _evict_disks_for_write = (
-        _build_evict_disks(evict_cfg, array_disks)
+        _build_evict_disks(evict_cfg, array_disks, resolve_warm_allowed_disks(cfg, array_disks))
         if evict_cfg.get("enabled")
         else set()
     )
-    dest_array_disks = [d for d in array_disks if d not in _evict_disks_for_write]
+    dest_array_disks = [d for d in write_disks if d not in _evict_disks_for_write]
 
     warm_sel_cfg = (moves_cfg.get("warm_disk_selection") or {})
     safety_margin_bytes = int(float(warm_sel_cfg.get("safety_margin_gb") or 50) * 1024 ** 3)
@@ -3248,9 +3409,30 @@ def _run_move_pass(
 _HOT_OUTCOMES = {"SHOULD_BE_HOT", "PIN_HOT", "STAY_HOT", "TO_HOT"}
 # OVER_BUDGET_HOT: item scored TO_HOT but the hot pool budget denied promotion.
 # Counted in WARM projected totals — the item stays on warm this run.
-_WARM_OUTCOMES = {"SHOULD_BE_WARM", "STAY_WARM", "TO_WARM", "RELOCATE_WARM", "OVER_BUDGET_HOT"}
+# WARM_ON_DISALLOWED_DISK: item stays warm but has files on a disk outside
+# warm.allowed_disks; reported only, never moved (unless relocate opt-in).
+_WARM_OUTCOMES = {
+    "SHOULD_BE_WARM", "STAY_WARM", "TO_WARM", "RELOCATE_WARM", "OVER_BUDGET_HOT",
+    "WARM_ON_DISALLOWED_DISK",
+}
 # MIXED_NEUTRAL = item is split 50/50 with no direction to resolve it.
 # Leave under NEUTRAL; P2 takes no action.
+
+
+def _summarise_disallowed(items: List[Item]) -> Dict[str, Tuple[int, float]]:
+    """Per-disk tally of WARM_ON_DISALLOWED_DISK items: {diskN: (count, GB)}.
+
+    An item spanning several disallowed disks counts once per disk.
+    """
+    out: Dict[str, Tuple[int, float]] = {}
+    for it in items:
+        if it.outcome != "WARM_ON_DISALLOWED_DISK":
+            continue
+        for d in it.disallowed_disks:
+            name = os.path.basename(d)
+            n, gb = out.get(name, (0, 0.0))
+            out[name] = (n + 1, gb + it.size_gb)
+    return out
 
 
 def summarise_tiers(items: List[Item]) -> dict:
@@ -3288,6 +3470,13 @@ def summarise_tiers(items: List[Item]) -> dict:
     }
 
 
+def _outcome_label(it: Item) -> str:
+    """Outcome cell for the table; WARM_ON_DISALLOWED_DISK names its disk(s)."""
+    if it.outcome == "WARM_ON_DISALLOWED_DISK" and it.disallowed_disks:
+        return f"{it.outcome} ({', '.join(os.path.basename(d) for d in it.disallowed_disks)})"
+    return it.outcome
+
+
 def format_table(items: List[Item]) -> str:
     if not items:
         return "(no items)\n"
@@ -3315,7 +3504,7 @@ def format_table(items: List[Item]) -> str:
                 _fmt_date(it.last_played),
                 _fmt_date(it.added),
                 f"{it.score:>5.1f}",
-                it.outcome,
+                _outcome_label(it),
             ]
         )
 
@@ -3828,6 +4017,15 @@ def _run(args) -> dict:
                 if it.score_breakdown.get("override") == "collection pin"
             )
             log.info("  Collection-pin promotions: %d items", col_promotions)
+        on_disallowed = _summarise_disallowed(items)
+        if on_disallowed:
+            log.info(
+                "  On disallowed warm disks (WARM_ON_DISALLOWED_DISK): %s",
+                "  ".join(
+                    f"{disk}={n} items ({_fmt_size(gb)})"
+                    for disk, (n, gb) in sorted(on_disallowed.items())
+                ),
+            )
         if (cfg.get("auto_collection_inherit") or {}).get("enabled"):
             ai_promotions = sum(
                 1 for it in items
@@ -7197,6 +7395,253 @@ def _test_last_full_run_recorded():
     print("_test_last_full_run_recorded: OK")
 
 
+# ---------- Warm-disk allow-list tests ----------
+
+def _allow_cfg(allowed=None, relocate=False, evict=None, disks=("/mnt/disk1", "/mnt/disk2", "/mnt/disk3")):
+    """Move-pass cfg with three array disks; allowed=None leaves the allow-list unset."""
+    cfg = {
+        "moves": {
+            "enabled": True, "rsync_options": ["-aH"],
+            "delete_source_after_verify": False, "size_verify": False,
+            "parity_check_blocking": False, "bandwidth_limit_mbps": None,
+            "warm_disk_selection": {"safety_margin_gb": 0},
+        },
+        "paths": {"hot_pool_mount": "/mnt/zfs_media", "array_disks": list(disks)},
+        "warm": {"allowed_disks": allowed, "relocate_from_disallowed": relocate},
+    }
+    if evict:
+        cfg["array_disk_evict"] = {"enabled": True, "disks": list(evict)}
+    return cfg
+
+
+def _allow_run_moves(items, cfg, free_map):
+    """Run an apply-mode move pass with stubbed rsync/free space/mounts; return rsync dst roots."""
+    global _disk_free_bytes, _is_mount
+    orig_dfb, orig_mount, orig_run = _disk_free_bytes, _is_mount, subprocess.run
+    dsts = []
+
+    def _fake_run(cmd, **_):
+        if cmd and cmd[0] == "rsync":
+            dsts.append(cmd[-1].rstrip("/"))
+        class R:
+            returncode = 0
+            stderr = ""
+        return R()
+
+    try:
+        _disk_free_bytes = lambda p: free_map.get(p, 0)  # noqa: E731
+        _is_mount = lambda p: True  # noqa: E731
+        subprocess.run = _fake_run
+        _run_move_pass(items, cfg, apply=True)
+    finally:
+        _disk_free_bytes, _is_mount, subprocess.run = orig_dfb, orig_mount, orig_run
+    return dsts
+
+
+def _test_allow_list_unset_plan_unchanged():
+    """Allow-list unset (absent or null): same write disks, outcomes and destination as before."""
+    import copy
+    disks = ["/mnt/disk1", "/mnt/disk2", "/mnt/disk3"]
+    assert resolve_warm_allowed_disks({"paths": {"array_disks": disks}}) is None
+    assert resolve_warm_allowed_disks(_deep_merge(DEFAULT_CONFIG, {})) is None
+    assert _warm_write_disks({"paths": {"array_disks": disks}}, disks) == disks
+
+    free = {"/mnt/disk1": 100 * 1024 ** 3, "/mnt/disk2": 200 * 1024 ** 3, "/mnt/disk3": 900 * 1024 ** 3}
+    to_warm = _make_item(kind="movie", current_tier="HOT",
+                         hot_pool_files=["/mnt/zfs_media/Movies/A.mkv"])
+    to_warm.outcome = "TO_WARM"
+    stay = _make_item(kind="movie", current_tier="WARM", current_disk="/mnt/disk3",
+                      warm_disk_files={"/mnt/disk3": ["/mnt/disk3/Movies/B.mkv"]})
+    stay.outcome = "STAY_WARM"
+
+    legacy_cfg = _allow_cfg()
+    del legacy_cfg["warm"]  # pre-feature config shape
+    before = copy.deepcopy([to_warm, stay])
+    dsts_legacy = _allow_run_moves([to_warm, stay], legacy_cfg, free)
+    dsts_null = _allow_run_moves([to_warm, stay], _allow_cfg(allowed=None), free)
+    assert dsts_legacy == dsts_null == ["/mnt/disk3"], f"got {dsts_legacy} / {dsts_null}"
+    assert [asdict(i) for i in [to_warm, stay]] == [asdict(i) for i in before], "items mutated"
+    print("_test_allow_list_unset_plan_unchanged: OK")
+
+
+def _test_allow_list_to_warm_picks_only_allowed():
+    """TO_WARM ignores a disallowed disk even when it has the most free space."""
+    item = _make_item(kind="movie", current_tier="HOT",
+                      hot_pool_files=["/mnt/zfs_media/Movies/A.mkv"])
+    item.outcome = "TO_WARM"
+    free = {"/mnt/disk1": 100 * 1024 ** 3, "/mnt/disk2": 200 * 1024 ** 3, "/mnt/disk3": 900 * 1024 ** 3}
+    dsts = _allow_run_moves([item], _allow_cfg(allowed=["disk1", "disk2"]), free)
+    assert dsts == ["/mnt/disk2"], f"expected most-free ALLOWED disk2, got {dsts}"
+    print("_test_allow_list_to_warm_picks_only_allowed: OK")
+
+
+def _test_allow_list_to_warm_all_allowed_full_no_fallback():
+    """Every allowed disk full → no-space failure; never falls back to a disallowed disk."""
+    item = _make_item(kind="movie", current_tier="HOT", size_bytes=50 * 1024 ** 3,
+                      hot_pool_files=["/mnt/zfs_media/Movies/A.mkv"])
+    item.outcome = "TO_WARM"
+    free = {"/mnt/disk1": 1 * 1024 ** 3, "/mnt/disk2": 1 * 1024 ** 3, "/mnt/disk3": 900 * 1024 ** 3}
+    dsts = _allow_run_moves([item], _allow_cfg(allowed=["disk1", "disk2"]), free)
+    assert dsts == [], f"expected no move, got {dsts}"
+    assert item.outcome == "TO_WARM", "outcome must be unchanged"
+    print("_test_allow_list_to_warm_all_allowed_full_no_fallback: OK")
+
+
+def _test_allow_list_relocate_dest_restricted():
+    """RELOCATE_WARM (eviction) only lands on an allowed disk."""
+    item = _make_item(kind="movie", current_tier="WARM", current_disk="/mnt/disk1",
+                      warm_disk_files={"/mnt/disk1": ["/mnt/disk1/Movies/A.mkv"]})
+    item.outcome = "RELOCATE_WARM"
+    free = {"/mnt/disk1": 500 * 1024 ** 3, "/mnt/disk2": 100 * 1024 ** 3, "/mnt/disk3": 900 * 1024 ** 3}
+    cfg = _allow_cfg(allowed=["disk1", "disk2"], evict=["/mnt/disk1"])
+    dsts = _allow_run_moves([item], cfg, free)
+    assert dsts == ["/mnt/disk2"], f"expected allowed disk2, got {dsts}"
+    print("_test_allow_list_relocate_dest_restricted: OK")
+
+
+def _test_allow_list_disallowed_reported_not_moved():
+    """STAY_WARM item on a disallowed disk → WARM_ON_DISALLOWED_DISK, no move by default."""
+    disks = ["/mnt/disk1", "/mnt/disk2", "/mnt/disk3"]
+    item = _make_item(kind="movie", current_tier="WARM", current_disk="/mnt/disk3",
+                      warm_disk_files={"/mnt/disk3": ["/mnt/disk3/Movies/A.mkv"]})
+    item.outcome = "STAY_WARM"
+    ok = _make_item(kind="movie", current_tier="WARM", current_disk="/mnt/disk1",
+                    warm_disk_files={"/mnt/disk1": ["/mnt/disk1/Movies/B.mkv"]})
+    ok.outcome = "STAY_WARM"
+    _apply_disallowed_disk_pass([item, ok], disks, ["/mnt/disk1", "/mnt/disk2"], relocate=False)
+    assert item.outcome == "WARM_ON_DISALLOWED_DISK", f"got {item.outcome}"
+    assert item.disallowed_disks == ["/mnt/disk3"]
+    assert item.relocate_source_override is None
+    assert ok.outcome == "STAY_WARM", "item on an allowed disk must be untouched"
+    assert "WARM_ON_DISALLOWED_DISK" in _WARM_OUTCOMES
+    assert "(disk3)" in format_table([item]), "table must name the disk"
+    assert _summarise_disallowed([item, ok]) == {"disk3": (1, item.size_gb)}
+    free = {d: 900 * 1024 ** 3 for d in disks}
+    assert _allow_run_moves([item, ok], _allow_cfg(allowed=["disk1", "disk2"]), free) == []
+    print("_test_allow_list_disallowed_reported_not_moved: OK")
+
+
+def _test_allow_list_relocate_from_disallowed_opt_in():
+    """relocate_from_disallowed: true → RELOCATE_WARM onto an allowed disk, disallowed files only."""
+    disks = ["/mnt/disk1", "/mnt/disk2", "/mnt/disk3"]
+    item = _make_item(
+        kind="series", current_tier="WARM", current_disk="/mnt/disk3",
+        warm_disk_files={
+            "/mnt/disk3": ["/mnt/disk3/TV/Show/S02E01.mkv"],
+            "/mnt/disk1": ["/mnt/disk1/TV/Show/S01E01.mkv"],
+        },
+    )
+    item.outcome = "STAY_WARM"
+    _apply_disallowed_disk_pass([item], disks, ["/mnt/disk1", "/mnt/disk2"], relocate=True)
+    assert item.outcome == "RELOCATE_WARM", f"got {item.outcome}"
+    assert item.relocate_source_override == {"/mnt/disk3": ["/mnt/disk3/TV/Show/S02E01.mkv"]}, (
+        "source must be restricted to disallowed-disk files"
+    )
+    assert item.current_disk == "/mnt/disk3"
+    free = {"/mnt/disk1": 100 * 1024 ** 3, "/mnt/disk2": 200 * 1024 ** 3, "/mnt/disk3": 900 * 1024 ** 3}
+    dsts = _allow_run_moves([item], _allow_cfg(allowed=["disk1", "disk2"], relocate=True), free)
+    assert len(dsts) == 1 and dsts[0] in ("/mnt/disk1", "/mnt/disk2"), f"got {dsts}"
+    print("_test_allow_list_relocate_from_disallowed_opt_in: OK")
+
+
+def _test_allow_list_capacity_and_eviction_ignore_disallowed():
+    """Warm capacity lines and eviction only consider allowed disks."""
+    import collections
+    global _disk_usage, _is_mount
+    orig_du, orig_mount = _disk_usage, _is_mount
+    Usage = collections.namedtuple("Usage", "total used free")
+    messages = []
+
+    class _CapturingHandler(logging.Handler):
+        def emit(self, record):
+            messages.append(record.getMessage())
+
+    handler = _CapturingHandler()
+    log.addHandler(handler)
+    orig_level = log.level
+    log.setLevel(logging.INFO)
+    try:
+        _disk_usage = lambda p: Usage(1000, 500, 500)  # noqa: E731
+        _is_mount = lambda p: True  # noqa: E731
+        cfg = _allow_cfg(allowed=["disk1", "disk2"])
+        cfg["paths"]["hot_pool_mount"] = ""  # skip hot-pool probing
+        _apply_capacity_budget([], cfg)
+        per_disk = [m for m in messages if m.startswith("Capacity: warm disk ")]
+        assert len(per_disk) == 2 and not any("/mnt/disk3 " in m for m in per_disk), per_disk
+        assert any("not counted (/mnt/disk3)" in m for m in messages), messages
+
+        evict = _build_evict_disks(
+            {"enabled": True, "disks": ["/mnt/disk1", "/mnt/disk3"]},
+            ["/mnt/disk1", "/mnt/disk2", "/mnt/disk3"], ["/mnt/disk1", "/mnt/disk2"],
+        )
+        assert evict == {"/mnt/disk1"}, f"disallowed disk3 must not be evicted, got {evict}"
+        assert _warm_write_disks(cfg, ["/mnt/disk1", "/mnt/disk2", "/mnt/disk3"]) == [
+            "/mnt/disk1", "/mnt/disk2",
+        ]
+    finally:
+        _disk_usage, _is_mount = orig_du, orig_mount
+        log.removeHandler(handler)
+        log.setLevel(orig_level)
+    print("_test_allow_list_capacity_and_eviction_ignore_disallowed: OK")
+
+
+def _test_allow_list_config_validation_exits():
+    """Empty list, bad name and unmounted disk each exit with the config-error code."""
+    import tempfile as _tf
+    global _is_mount
+    orig_mount = _is_mount
+    base = {
+        "plex": {"token": "abc"}, "libraries": [{"name": "Movies"}],
+        "paths": {"array_disks": ["/mnt/disk1", "/mnt/disk2"]},
+    }
+    cases = [
+        ([], "non-empty"),
+        (["disk1", "parity"], "not an Unraid disk name"),
+        (["/mnt/disk1"], "not an Unraid disk name"),
+        (["disk9"], "not in the effective array_disks"),
+        (["disk2"], "not mounted"),
+    ]
+    try:
+        _is_mount = lambda p: p == "/mnt/disk1"  # noqa: E731
+        with _tf.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "tiering.yaml"
+            for allowed, expect in cases:
+                path.write_text(yaml.safe_dump(dict(base, warm={"allowed_disks": allowed})))
+                try:
+                    load_config(path)
+                except SystemExit as e:
+                    # A string sys.exit() exits with status 1 == ExitCode.FATAL_CONFIG.
+                    assert isinstance(e.code, str) and e.code.startswith("Config error:"), e.code
+                    assert expect in e.code, f"{allowed!r}: {e.code}"
+                else:
+                    raise AssertionError(f"{allowed!r} should be a config error")
+            path.write_text(yaml.safe_dump(dict(base, warm={"allowed_disks": ["disk1"]})))
+            cfg = load_config(path)
+            assert resolve_warm_allowed_disks(cfg) == ["/mnt/disk1"]
+    finally:
+        _is_mount = orig_mount
+    print("_test_allow_list_config_validation_exits: OK")
+
+
+def _test_allow_list_naive_plex_datetimes():
+    """Items carrying naive Plex datetimes flow through the allow-list pass and
+    reporting without a naive/aware comparison TypeError."""
+    disks = ["/mnt/disk1", "/mnt/disk2"]
+    item = _make_item(
+        kind="movie", current_tier="WARM", current_disk="/mnt/disk2",
+        added=datetime(2025, 1, 1), last_played=datetime(2026, 1, 5),  # naive, as Plex returns
+        warm_disk_files={"/mnt/disk2": ["/mnt/disk2/Movies/A.mkv"]},
+    )
+    item.outcome = "STAY_WARM"
+    _apply_disallowed_disk_pass([item], disks, ["/mnt/disk1"], relocate=False)
+    assert item.outcome == "WARM_ON_DISALLOWED_DISK"
+    apply_sort([item], "last_played")
+    apply_sort([item], "added")
+    summarise_tiers([item])
+    format_table([item])
+    print("_test_allow_list_naive_plex_datetimes: OK")
+
+
 if __name__ == "__main__":
     if "--_test" in sys.argv:
         _test_resolve_user_share()
@@ -7303,5 +7748,14 @@ if __name__ == "__main__":
         _test_min_episodes_no_full_run_fallback()
         _test_count_recent_episode_plays_naive_viewed_at()
         _test_last_full_run_recorded()
+        _test_allow_list_unset_plan_unchanged()
+        _test_allow_list_to_warm_picks_only_allowed()
+        _test_allow_list_to_warm_all_allowed_full_no_fallback()
+        _test_allow_list_relocate_dest_restricted()
+        _test_allow_list_disallowed_reported_not_moved()
+        _test_allow_list_relocate_from_disallowed_opt_in()
+        _test_allow_list_capacity_and_eviction_ignore_disallowed()
+        _test_allow_list_config_validation_exits()
+        _test_allow_list_naive_plex_datetimes()
         sys.exit(int(ExitCode.SUCCESS))
     sys.exit(main())

@@ -171,6 +171,29 @@ array_disk_evict:
   # - "/mnt/disk7"   # disk developing bad sectors — drain before retirement
   # - "/mnt/disk2"   # cabling issues — drain before debug
 
+# Warm-disk allow-list — restrict which array disks tier.py may WRITE warm
+# media to. Use when only some array disks belong to the warm tier (e.g. the
+# warm tier is mirrored disk-for-disk to another server and the other disks
+# hold unrelated data). Restricts TO_WARM / RELOCATE_WARM destinations, the
+# per-disk warm capacity lines and eviction to these disks. Reads are NOT
+# restricted: tier detection and TO_HOT still see every array disk.
+#
+# Unlike paths.array_disks (which also hides disks from tier detection), a
+# disallowed disk is still read; media found on it is reported as
+# WARM_ON_DISALLOWED_DISK and left alone unless relocate_from_disallowed: true.
+#
+# Values are Unraid disk names (diskN → /mnt/diskN). An empty list, a name
+# that isn't disk<N>, or a disk that isn't mounted stops the run with a config
+# error (exit code 1). Omit allowed_disks (or leave it null) = every array
+# disk is eligible, i.e. the previous behaviour.
+warm:
+  allowed_disks: null
+  # allowed_disks: [disk2, disk4, disk7]
+  # true = plan STAY_WARM items on disallowed disks as RELOCATE_WARM onto an
+  # allowed disk (normal dry-run rules and --apply gating). Only the files on
+  # the disallowed disk(s) are moved.
+  relocate_from_disallowed: false
+
 # Move executor (P2.1) — controls rsync moves from WARM array to HOT pool.
 #
 # Default: enabled=false — the move pass is skipped entirely (no log lines).

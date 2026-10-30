@@ -465,6 +465,7 @@ Outcomes:
 | `MIXED_NEUTRAL` | Files are split exactly 50/50 across tiers with no score-based direction to resolve it. P2 leaves it alone. Very rare. |
 | `RELOCATE_WARM` | On a WARM disk marked for eviction. Score says keep warm, but P2 must move to a different warm disk. See [Disk eviction](#disk-eviction) below. |
 | `OVER_BUDGET_HOT` | Scored high enough for HOT but the hot pool budget was exhausted (or `--no-promote` was set). Item stays warm this run. Counted in projected WARM totals. |
+| `WARM_ON_DISALLOWED_DISK` | Would `STAY_WARM`, but some of its files sit on an array disk outside `warm.allowed_disks`. Reported with the disk name; not moved unless `warm.relocate_from_disallowed: true` (then it is `RELOCATE_WARM`). See [Warm-disk allow-list](#warm-disk-allow-list). Counted in projected WARM totals. |
 
 Tier detection activates automatically when `paths.hot_pool_mount` is set AND
 at least one array disk is known (either listed explicitly in `paths.array_disks`
@@ -675,6 +676,58 @@ appear.
 `RELOCATE_WARM` counts in the projected **WARM** size total in the run
 summary — these items are staying warm, just moving disks within that tier.
 
+## Warm-disk allow-list
+
+By default every array disk is eligible for warm placement. Set
+`warm.allowed_disks` to restrict the warm tier to specific disks — for
+example when the warm tier is mirrored disk-for-disk to a second server and
+the remaining array disks hold unrelated data tier.py must never write to.
+
+```yaml
+warm:
+  allowed_disks: [disk2, disk4, disk7]   # optional; omit = all array disks eligible
+  relocate_from_disallowed: false        # opt-in: move warm media off disallowed disks
+```
+
+Values are Unraid disk names (`diskN`, resolved to `/mnt/diskN`). Each must be
+in the effective `paths.array_disks` list and mounted. An empty list, a name
+that isn't `disk<N>`, or an unmounted disk stops the run with a config error
+(exit code 1). The effective set is logged once per run:
+
+```text
+Warm allow-list: writes restricted to /mnt/disk2, /mnt/disk4, /mnt/disk7 (3 of 8 array disks); relocate_from_disallowed=False
+```
+
+**What it restricts (writes only):**
+
+| Area | With `allowed_disks` set |
+| --- | --- |
+| `TO_WARM` destination | Allowed disks only. If none has room, the move fails with the usual no-space `[FAILED]` line — it never falls back to a disallowed disk. |
+| `RELOCATE_WARM` destination | Allowed disks only, including series co-location. |
+| Warm capacity | Per-disk `Capacity: warm disk …` lines and `warm_per_disk_ceiling_percent` cover allowed disks only. |
+| Disk eviction | `array_disk_evict.disks` entries outside the allow-list are skipped with a `WARNING`. |
+| `TO_HOT` | **Unchanged.** Media is promoted from any array disk, allowed or not. |
+| Tier detection | **Unchanged.** Every array disk is still probed, so media on a disallowed disk is still recognised as WARM. |
+| `--mode` | Unchanged meaning. |
+
+This is the difference from `paths.array_disks`: shrinking `array_disks`
+hides disks from tier detection entirely (their media becomes `UNKNOWN`),
+whereas the allow-list only governs where warm media may be written.
+
+**Media already on a disallowed disk.** An item that would `STAY_WARM` but has
+files on a disallowed disk gets the outcome `WARM_ON_DISALLOWED_DISK` and is
+not moved. The table names the disk (`WARM_ON_DISALLOWED_DISK (disk3)`), each
+item gets an `Allow-list:` log line, and the run summary tallies them per disk:
+
+```text
+  On disallowed warm disks (WARM_ON_DISALLOWED_DISK): disk3=12 items (1.84 TB)  disk5=3 items (210.4 GB)
+```
+
+Set `relocate_from_disallowed: true` to plan those items as `RELOCATE_WARM`
+onto an allowed disk instead. Only the files on the disallowed disk(s) move;
+the normal dry-run output, `moves.enabled`, `--apply`, `--mode` and run-budget
+rules apply. Items heading to HOT (`TO_HOT`) are never reclassified.
+
 ## Tier detection (P1)
 
 Tier detection classifies each item's current physical location — HOT pool
@@ -787,7 +840,8 @@ inactive) are reported but not moved.
 **Warm disk selection** (`TO_WARM` and `RELOCATE_WARM`): tier.py picks the
 destination warm disk using the `co_locate_then_most_free` strategy:
 
-1. Exclude the source disk (RELOCATE_WARM) or no exclusion (TO_WARM).
+1. Exclude the source disk (RELOCATE_WARM) or no exclusion (TO_WARM), plus
+   evicting disks and any disk outside `warm.allowed_disks` (when set).
 2. Filter candidates by free space ≥ item size + `safety_margin_gb`.
 3. Among qualified disks, prefer the one that already holds the most bytes of
    this item (co-location — keeps a series on one spindle for efficient binging).

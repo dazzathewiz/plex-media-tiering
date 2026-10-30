@@ -28,6 +28,7 @@ arch (amd64 + arm64), published to Docker Hub.
 ├── .github/workflows/
 │   └── docker-publish.yml        # multi-arch build, pushes tags + latest
 ├── README.md                     # end-user docs
+├── CHANGELOG.md                  # user-facing changes; add under "Unreleased"
 ├── LICENSE                       # MIT
 └── AGENTS.md                     # this file
 ```
@@ -376,6 +377,28 @@ bytes of the item wins and is stored as `Item.current_disk`. Consequences:
   during the eviction pass. It is `None` for HOT-majority and UNKNOWN items.
 - Do not refactor to "first disk found" or a list of all disks containing
   the item. The majority-bytes winner is intentional.
+
+### Warm-disk allow-list restricts writes only
+
+`warm.allowed_disks` limits the disks the warm tier may **write** to:
+TO_WARM / RELOCATE_WARM destinations (`_warm_write_disks()` feeds
+`_run_move_pass`'s `dest_array_disks`), the per-disk warm capacity lines, and
+eviction (`_build_evict_disks` skips disallowed entries — draining a disk
+deletes from it). Reads are deliberately unrestricted: tier detection,
+`resolve_user_share`, `classify_path` and TO_HOT sources keep using the full
+`resolve_array_disks()` list. Restricting reads would turn media on other disks
+into `UNKNOWN` and silently degrade outcomes — that is what shrinking
+`paths.array_disks` does, and why this is a separate key.
+
+STAY_WARM items with files on a disallowed disk become
+`WARM_ON_DISALLOWED_DISK` (in `_WARM_OUTCOMES`, never queued for a move) so
+operators see what still needs consolidating. `warm.relocate_from_disallowed:
+true` plans them as RELOCATE_WARM instead, reusing the eviction path's
+`_restrict_relocate_source()` data-loss guard so only disallowed-disk files are
+rsynced and deleted. The pass runs after eviction, so eviction keeps
+precedence. Unset allow-list → `_warm_write_disks` returns `array_disks`
+unchanged and the pass never runs. Validation happens in `load_config()` (exit
+code 1) so a typo can't silently widen or empty the warm set.
 
 ### HOT-majority items populate `warm_disk_files` for stragglers
 
