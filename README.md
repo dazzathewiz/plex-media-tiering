@@ -685,13 +685,17 @@ the remaining array disks hold unrelated data tier.py must never write to.
 
 ```yaml
 warm:
-  allowed_disks: [disk2, disk4, disk7]   # optional; omit = all array disks eligible
+  allowed_disks:                         # optional; omit = all array disks eligible
+    - "/mnt/disk2"
+    - "/mnt/disk4"
+    - "/mnt/disk7"
   relocate_from_disallowed: false        # opt-in: move warm media off disallowed disks
 ```
 
-Values are Unraid disk names (`diskN`, resolved to `/mnt/diskN`). Each must be
-in the effective `paths.array_disks` list and mounted. An empty list, a name
-that isn't `disk<N>`, or an unmounted disk stops the run with a config error
+Entries are disk paths in the same format as `paths.array_disks` and
+`array_disk_evict.disks` (a trailing `/` is ignored). Each must be in the
+effective `paths.array_disks` list and mounted. An empty list, a path not in
+that list, or an unmounted disk stops the run with a config error
 (exit code 1). The effective set is logged once per run:
 
 ```text

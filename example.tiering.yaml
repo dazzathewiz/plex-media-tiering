@@ -182,13 +182,17 @@ array_disk_evict:
 # disallowed disk is still read; media found on it is reported as
 # WARM_ON_DISALLOWED_DISK and left alone unless relocate_from_disallowed: true.
 #
-# Values are Unraid disk names (diskN → /mnt/diskN). An empty list, a name
-# that isn't disk<N>, or a disk that isn't mounted stops the run with a config
+# Disk paths must match the format used in paths.array_disks exactly (same as
+# array_disk_evict.disks). An empty list, a path not in the effective
+# array_disks list, or a disk that isn't mounted stops the run with a config
 # error (exit code 1). Omit allowed_disks (or leave it null) = every array
 # disk is eligible, i.e. the previous behaviour.
 warm:
   allowed_disks: null
-  # allowed_disks: [disk2, disk4, disk7]
+  # allowed_disks:
+  #   - "/mnt/disk2"
+  #   - "/mnt/disk4"
+  #   - "/mnt/disk7"
   # true = plan STAY_WARM items on disallowed disks as RELOCATE_WARM onto an
   # allowed disk (normal dry-run rules and --apply gating). Only the files on
   # the disallowed disk(s) are moved.

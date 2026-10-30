@@ -218,8 +218,9 @@ DEFAULT_CONFIG = {
     # eviction). Reads are unrestricted: tier detection and TO_HOT still see
     # every array disk. Unset (null) = every array disk is eligible.
     "warm": {
-        # Unraid disk names, e.g. ["disk2", "disk4"] -> /mnt/disk2, /mnt/disk4.
-        # An empty list, a non-diskN name or an unmounted disk is a config error.
+        # Disk paths matching paths.array_disks format, e.g. ["/mnt/disk2"].
+        # An empty list, a path not in array_disks or an unmounted disk is a
+        # config error.
         "allowed_disks": None,
         # STAY_WARM items with files on a disallowed disk are reported as
         # WARM_ON_DISALLOWED_DISK and left alone. true = plan them as
@@ -728,10 +729,6 @@ def resolve_array_disks(cfg: dict) -> List[str]:
     return detected
 
 
-# Unraid array disk names accepted by warm.allowed_disks.
-_WARM_DISK_NAME_PATTERN = re.compile(r"^disk\d+$")
-
-
 def _is_mount(path: str) -> bool:
     """os.path.ismount — module-level for test patching."""
     return os.path.ismount(path)
@@ -742,36 +739,31 @@ def resolve_warm_allowed_disks(
 ) -> Optional[List[str]]:
     """Return the warm.allowed_disks allow-list as mount paths, or None if unset.
 
-    Each entry is an Unraid disk name (`diskN`) resolved to `/mnt/diskN`, which
-    must be in the effective array_disks list and actually mounted. Raises
-    ValueError on an empty list, a non-diskN name, or an unknown/unmounted
-    disk; load_config() turns that into a config-error exit at startup.
+    Each entry is a disk path in paths.array_disks format (e.g. "/mnt/disk2",
+    trailing slash ignored) that must be in the effective array_disks list and
+    actually mounted. Raises ValueError on an empty list or an unknown/unmounted
+    path; load_config() turns that into a config-error exit at startup.
     """
     raw = (cfg.get("warm") or {}).get("allowed_disks")
     if raw is None:
         return None
     if not isinstance(raw, list) or not raw:
         raise ValueError(
-            "warm.allowed_disks must be a non-empty list of disk names "
-            "(e.g. [disk2, disk4]); omit it to allow every array disk"
+            "warm.allowed_disks must be a non-empty list of disk paths "
+            "(e.g. [/mnt/disk2, /mnt/disk4]); omit it to allow every array disk"
         )
     if array_disks is None:
         array_disks = resolve_array_disks(cfg)
     known = set(array_disks)
     allowed: List[str] = []
-    for name in raw:
-        n = str(name).strip()
-        if not _WARM_DISK_NAME_PATTERN.match(n):
-            raise ValueError(
-                f"warm.allowed_disks: {name!r} is not an Unraid disk name (expected disk<N>)"
-            )
-        path = f"/mnt/{n}"
+    for entry in raw:
+        path = str(entry).strip().rstrip("/")
         if path not in known:
             raise ValueError(
-                f"warm.allowed_disks: {n} ({path}) is not in the effective array_disks list"
+                f"warm.allowed_disks: {entry!r} is not in the effective array_disks list"
             )
         if not _is_mount(path):
-            raise ValueError(f"warm.allowed_disks: {n} ({path}) is not mounted")
+            raise ValueError(f"warm.allowed_disks: {path} is not mounted")
         if path not in allowed:
             allowed.append(path)
     return allowed
@@ -7470,7 +7462,7 @@ def _test_allow_list_to_warm_picks_only_allowed():
                       hot_pool_files=["/mnt/zfs_media/Movies/A.mkv"])
     item.outcome = "TO_WARM"
     free = {"/mnt/disk1": 100 * 1024 ** 3, "/mnt/disk2": 200 * 1024 ** 3, "/mnt/disk3": 900 * 1024 ** 3}
-    dsts = _allow_run_moves([item], _allow_cfg(allowed=["disk1", "disk2"]), free)
+    dsts = _allow_run_moves([item], _allow_cfg(allowed=["/mnt/disk1", "/mnt/disk2"]), free)
     assert dsts == ["/mnt/disk2"], f"expected most-free ALLOWED disk2, got {dsts}"
     print("_test_allow_list_to_warm_picks_only_allowed: OK")
 
@@ -7481,7 +7473,7 @@ def _test_allow_list_to_warm_all_allowed_full_no_fallback():
                       hot_pool_files=["/mnt/zfs_media/Movies/A.mkv"])
     item.outcome = "TO_WARM"
     free = {"/mnt/disk1": 1 * 1024 ** 3, "/mnt/disk2": 1 * 1024 ** 3, "/mnt/disk3": 900 * 1024 ** 3}
-    dsts = _allow_run_moves([item], _allow_cfg(allowed=["disk1", "disk2"]), free)
+    dsts = _allow_run_moves([item], _allow_cfg(allowed=["/mnt/disk1", "/mnt/disk2"]), free)
     assert dsts == [], f"expected no move, got {dsts}"
     assert item.outcome == "TO_WARM", "outcome must be unchanged"
     print("_test_allow_list_to_warm_all_allowed_full_no_fallback: OK")
@@ -7493,7 +7485,7 @@ def _test_allow_list_relocate_dest_restricted():
                       warm_disk_files={"/mnt/disk1": ["/mnt/disk1/Movies/A.mkv"]})
     item.outcome = "RELOCATE_WARM"
     free = {"/mnt/disk1": 500 * 1024 ** 3, "/mnt/disk2": 100 * 1024 ** 3, "/mnt/disk3": 900 * 1024 ** 3}
-    cfg = _allow_cfg(allowed=["disk1", "disk2"], evict=["/mnt/disk1"])
+    cfg = _allow_cfg(allowed=["/mnt/disk1", "/mnt/disk2"], evict=["/mnt/disk1"])
     dsts = _allow_run_moves([item], cfg, free)
     assert dsts == ["/mnt/disk2"], f"expected allowed disk2, got {dsts}"
     print("_test_allow_list_relocate_dest_restricted: OK")
@@ -7517,7 +7509,7 @@ def _test_allow_list_disallowed_reported_not_moved():
     assert "(disk3)" in format_table([item]), "table must name the disk"
     assert _summarise_disallowed([item, ok]) == {"disk3": (1, item.size_gb)}
     free = {d: 900 * 1024 ** 3 for d in disks}
-    assert _allow_run_moves([item, ok], _allow_cfg(allowed=["disk1", "disk2"]), free) == []
+    assert _allow_run_moves([item, ok], _allow_cfg(allowed=["/mnt/disk1", "/mnt/disk2"]), free) == []
     print("_test_allow_list_disallowed_reported_not_moved: OK")
 
 
@@ -7539,7 +7531,7 @@ def _test_allow_list_relocate_from_disallowed_opt_in():
     )
     assert item.current_disk == "/mnt/disk3"
     free = {"/mnt/disk1": 100 * 1024 ** 3, "/mnt/disk2": 200 * 1024 ** 3, "/mnt/disk3": 900 * 1024 ** 3}
-    dsts = _allow_run_moves([item], _allow_cfg(allowed=["disk1", "disk2"], relocate=True), free)
+    dsts = _allow_run_moves([item], _allow_cfg(allowed=["/mnt/disk1", "/mnt/disk2"], relocate=True), free)
     assert len(dsts) == 1 and dsts[0] in ("/mnt/disk1", "/mnt/disk2"), f"got {dsts}"
     print("_test_allow_list_relocate_from_disallowed_opt_in: OK")
 
@@ -7563,7 +7555,7 @@ def _test_allow_list_capacity_and_eviction_ignore_disallowed():
     try:
         _disk_usage = lambda p: Usage(1000, 500, 500)  # noqa: E731
         _is_mount = lambda p: True  # noqa: E731
-        cfg = _allow_cfg(allowed=["disk1", "disk2"])
+        cfg = _allow_cfg(allowed=["/mnt/disk1", "/mnt/disk2"])
         cfg["paths"]["hot_pool_mount"] = ""  # skip hot-pool probing
         _apply_capacity_budget([], cfg)
         per_disk = [m for m in messages if m.startswith("Capacity: warm disk ")]
@@ -7586,7 +7578,7 @@ def _test_allow_list_capacity_and_eviction_ignore_disallowed():
 
 
 def _test_allow_list_config_validation_exits():
-    """Empty list, bad name and unmounted disk each exit with the config-error code."""
+    """Empty list, unknown path and unmounted disk each exit with the config-error code."""
     import tempfile as _tf
     global _is_mount
     orig_mount = _is_mount
@@ -7596,10 +7588,9 @@ def _test_allow_list_config_validation_exits():
     }
     cases = [
         ([], "non-empty"),
-        (["disk1", "parity"], "not an Unraid disk name"),
-        (["/mnt/disk1"], "not an Unraid disk name"),
-        (["disk9"], "not in the effective array_disks"),
-        (["disk2"], "not mounted"),
+        (["/mnt/disk1", "/mnt/disk9"], "not in the effective array_disks"),
+        (["disk1"], "not in the effective array_disks"),  # bare names are not paths
+        (["/mnt/disk2"], "not mounted"),
     ]
     try:
         _is_mount = lambda p: p == "/mnt/disk1"  # noqa: E731
@@ -7615,9 +7606,9 @@ def _test_allow_list_config_validation_exits():
                     assert expect in e.code, f"{allowed!r}: {e.code}"
                 else:
                     raise AssertionError(f"{allowed!r} should be a config error")
-            path.write_text(yaml.safe_dump(dict(base, warm={"allowed_disks": ["disk1"]})))
+            path.write_text(yaml.safe_dump(dict(base, warm={"allowed_disks": ["/mnt/disk1/"]})))
             cfg = load_config(path)
-            assert resolve_warm_allowed_disks(cfg) == ["/mnt/disk1"]
+            assert resolve_warm_allowed_disks(cfg) == ["/mnt/disk1"], "trailing slash normalised"
     finally:
         _is_mount = orig_mount
     print("_test_allow_list_config_validation_exits: OK")
